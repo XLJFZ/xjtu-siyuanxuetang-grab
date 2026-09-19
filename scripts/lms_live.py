@@ -2,7 +2,7 @@
 """lecture_live 直播回放下载。
 
 教室录播不在普通附件体系里，走校外录播系统的独立域名，需要单独一套下载逻辑。
-URL 形如 `https://<录播域名>/api/base/orgs/xjtu/captures/<capture>/videos/<cam>/preview?previewToken=<hex>`。
+回放地址由活动详情直接给出（含一次性的访问凭据参数），本模块只在拿到地址后负责下载。
 
 服务端行为有三点必须遵守，否则会下载出错或误判失败：
 
