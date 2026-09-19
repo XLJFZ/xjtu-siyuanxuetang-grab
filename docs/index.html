@@ -9,6 +9,7 @@
 :root {
   --bg: #fff;
   --bg-soft: #f7f8f9;
+  --bg-code: #f9fafb;
   --fg: #16181d;
   --fg-2: #5b6270;
   --fg-3: #8d94a2;
@@ -20,6 +21,7 @@
   :root {
     --bg: #131519;
     --bg-soft: #1b1e23;
+    --bg-code: #171a1f;
     --fg: #e8eaee;
     --fg-2: #a4abb8;
     --fg-3: #6f7684;
@@ -29,6 +31,7 @@
   }
 }
 * { box-sizing: border-box; }
+html { scroll-behavior: smooth; }
 body {
   margin: 0;
   background: var(--bg);
@@ -36,157 +39,276 @@ body {
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
                "Microsoft YaHei", "Helvetica Neue", Arial, sans-serif;
   font-size: 15px;
-  line-height: 1.7;
+  line-height: 1.75;
   -webkit-font-smoothing: antialiased;
 }
-code, pre {
-  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-}
+code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
 a { color: var(--accent); text-decoration: none; }
 a:hover { text-decoration: underline; text-underline-offset: 3px; }
 
-.w { max-width: 660px; margin: 0 auto; padding: 0 24px; }
-
-/* ---- 首屏 ---- */
-.hero { padding: 72px 0 52px; }
-.hero h1 {
-  margin: 0 0 18px;
-  font-size: 30px;
-  font-weight: 600;
-  line-height: 1.4;
-  letter-spacing: -.5px;
+/* ============ 容器：随视口缩放，有上限 ============ */
+html, body { max-width: 100%; overflow-x: hidden; }
+.wrap {
+  width: auto;
+  max-width: 1180px;
+  margin: 0 auto;
+  padding: 0 28px;
 }
-.hero p {
-  margin: 0 0 28px;
-  font-size: 16px;
+@media (min-width: 1240px) { .wrap { padding: 0 30px; } }
+
+/* ============ 顶栏 ============ */
+.topbar {
+  position: sticky; top: 0; z-index: 10;
+  background: color-mix(in srgb, var(--bg) 90%, transparent);
+  backdrop-filter: saturate(180%) blur(12px);
+  -webkit-backdrop-filter: saturate(180%) blur(12px);
+  border-bottom: 1px solid var(--line);
+}
+.topbar .wrap {
+  height: 58px; display: flex; align-items: center; gap: 11px;
+}
+.tb-name { font-size: 14px; font-weight: 600; letter-spacing: -.1px; }
+.tb-sep { color: var(--line-2); }
+.tb-sub { font-size: 13px; color: var(--fg-3); }
+.tb-links { margin-left: auto; display: flex; gap: 18px; }
+.tb-links a { font-size: 13px; color: var(--fg-2); }
+@media (max-width: 600px) { .tb-sub, .tb-sep { display: none; } }
+
+/* ============ 首屏 ============ */
+.hero { padding: 84px 0 60px; }
+.hero h1 {
+  margin: 0 0 20px;
+  font-size: clamp(28px, 3.4vw, 40px);
+  font-weight: 600;
+  line-height: 1.3;
+  letter-spacing: -.8px;
+}
+.hero > p {
+  margin: 0 0 24px;
+  font-size: clamp(15px, 1.2vw, 17px);
   color: var(--fg-2);
-  max-width: 520px;
+  max-width: 46ch;
 }
 .hero .meta {
-  font-size: 13px;
-  color: var(--fg-3);
-  margin-bottom: 30px;
+  font-size: 13px; color: var(--fg-3);
+  margin-bottom: 32px;
+  display: flex; gap: 10px; flex-wrap: wrap; align-items: center;
 }
-.acts { display: flex; gap: 10px; flex-wrap: wrap; }
+.dot { width: 3px; height: 3px; border-radius: 50%; background: var(--fg-3); }
+.acts { display: flex; gap: 11px; flex-wrap: wrap; }
 .btn {
-  display: inline-block;
-  padding: 9px 18px;
-  border-radius: 8px;
-  font-size: 14px;
-  border: 1px solid var(--line-2);
-  color: var(--fg);
-  transition: background .13s, border-color .13s;
+  display: inline-block; padding: 11px 22px; border-radius: 9px;
+  font-size: 14px; border: 1px solid var(--line-2); color: var(--fg);
+  transition: background .13s, border-color .13s, transform .13s;
 }
-.btn:hover { background: var(--bg-soft); text-decoration: none; border-color: var(--fg-3); }
-.btn.p {
-  background: var(--accent);
-  border-color: var(--accent);
-  color: #fff;
+.btn:hover {
+  background: var(--bg-soft); text-decoration: none;
+  border-color: var(--fg-3); transform: translateY(-1px);
 }
-.btn.p:hover { filter: brightness(1.08); background: var(--accent); }
+.btn.p { background: var(--accent); border-color: var(--accent); color: #fff; }
+.btn.p:hover { filter: brightness(1.07); background: var(--accent); }
 
-/* ---- 板块 ---- */
-.sec { padding: 40px 0; border-top: 1px solid var(--line); }
-.sec h2 {
-  margin: 0 0 8px;
-  font-size: 16px;
-  font-weight: 600;
+/* ============ 内容区：宽屏两栏，窄屏单列 ============ */
+.body-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);   /* 窄屏单列，显式声明 */
+  column-gap: 0;                            /* 单列绝不能有列间距，否则会撑破视口 */
+  row-gap: 0;
+  border-top: 1px solid var(--line);
+  padding: 8px 0 0;
 }
-.sec > p { margin: 0 0 20px; color: var(--fg-2); font-size: 14px; }
+@media (min-width: 1040px) {
+  .body-grid {
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    column-gap: clamp(48px, 5vw, 92px);
+    align-items: start;
+  }
+  /* 右栏左分割线用独立元素画，不用 padding，避免参与宽度计算 */
+  .col-r { border-left: 1px solid var(--line); padding-left: clamp(48px, 5vw, 92px); }
+  .col-l .sec:last-child, .col-r .sec:last-child { border-bottom: 0; }
+}
+
+.sec { padding: 40px 0; border-bottom: 1px solid var(--line); }
+.sec:last-child { border-bottom: 0; }
+.sec h2 {
+  margin: 0 0 10px; font-size: 17px; font-weight: 600;
+  display: flex; align-items: center; gap: 9px;
+}
+.sec h2::before {
+  content: ""; width: 3px; height: 15px; border-radius: 2px;
+  background: var(--accent); flex: 0 0 3px;
+}
+.sec > p { margin: 0 0 20px; color: var(--fg-2); font-size: 14.5px; }
+.sec > p:last-child { margin-bottom: 0; }
 
 pre {
-  margin: 0;
-  background: var(--bg-soft);
-  border: 1px solid var(--line);
-  border-radius: 10px;
-  padding: 16px 18px;
+  margin: 0; background: var(--bg-code);
+  border: 1px solid var(--line); border-radius: 11px;
+  padding: 18px 20px;
   overflow-x: auto;
-  font-size: 13px;
-  line-height: 1.75;
+  -webkit-overflow-scrolling: touch;
+  max-width: 100%;
+  font-size: 13px; line-height: 1.85;
 }
-pre code { background: none; }
+pre code { background: none; display: block; width: max-content; min-width: 100%; }
 .c { color: var(--fg-3); }
 p code, li code {
-  background: var(--bg-soft);
-  border: 1px solid var(--line);
-  padding: 1px 5px;
-  border-radius: 4px;
-  font-size: 13px;
+  background: var(--bg-soft); border: 1px solid var(--line);
+  padding: 1.5px 6px; border-radius: 5px; font-size: 13px;
+  word-break: break-word; overflow-wrap: anywhere;
 }
 
-/* ---- 特点 ---- */
-.feats { display: grid; grid-template-columns: 1fr 1fr; gap: 22px 28px; }
-.feat b { display: block; font-size: 14px; font-weight: 600; margin-bottom: 3px; }
-.feat span { font-size: 13.5px; color: var(--fg-2); }
-
-/* ---- 底 ---- */
-footer {
-  border-top: 1px solid var(--line);
-  padding: 28px 0 56px;
-  font-size: 13px;
-  color: var(--fg-3);
+/* ============ 特点 ============ */
+.feats { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+@media (max-width: 520px) { .feats { grid-template-columns: 1fr; } }
+.feat {
+  border: 1px solid var(--line); border-radius: 11px;
+  padding: 15px 17px; background: var(--bg-code);
+  transition: border-color .13s, transform .13s;
 }
+.feat:hover { border-color: var(--line-2); transform: translateY(-2px); }
+.feat b { display: block; font-size: 13.5px; font-weight: 600; margin-bottom: 4px; }
+.feat span { font-size: 12.8px; color: var(--fg-2); line-height: 1.6; }
+
+/* ============ 常见问题 ============ */
+.faq { display: flex; flex-direction: column; gap: 2px; }
+.faq .q {
+  padding: 14px 0;
+  border-bottom: 1px solid var(--line);
+}
+.faq .q:first-child { padding-top: 4px; }
+.faq .q:last-child { border-bottom: 0; padding-bottom: 0; }
+.faq .q b {
+  display: block; font-size: 13.5px; font-weight: 600; margin-bottom: 4px;
+}
+.faq .q span {
+  display: block; font-size: 13px; color: var(--fg-2); line-height: 1.68;
+}
+
+/* ============ 路径 ============ */
+.paths { border: 1px solid var(--line); border-radius: 11px; overflow: hidden; }
+.paths > div {
+  padding: 12px 16px; border-bottom: 1px solid var(--line);
+}
+.paths > div:last-child { border-bottom: 0; }
+.paths .who {
+  display: block; color: var(--fg-2); font-size: 12px;
+  margin-bottom: 3px; letter-spacing: .2px;
+}
+.paths code {
+  display: block; background: none; border: 0; padding: 0;
+  color: var(--fg); font-size: 12.5px; line-height: 1.55;
+  word-break: break-all; overflow-wrap: anywhere;
+}
+
+/* ============ 底 ============ */
+footer { border-top: 1px solid var(--line); padding: 30px 0 64px; font-size: 13px; color: var(--fg-3); }
+.foot-row { display: flex; gap: 20px; flex-wrap: wrap; align-items: center; }
 footer a { color: var(--fg-2); }
 
-@media (max-width: 560px) {
-  .w { padding: 0 20px; }
-  .hero { padding: 52px 0 40px; }
-  .hero h1 { font-size: 24px; }
-  .feats { grid-template-columns: 1fr; gap: 18px; }
+@media (max-width: 600px) {
+  .wrap { padding: 0 20px; }
+  .hero { padding: 56px 0 44px; }
+  .sec { padding: 34px 0; }
   .btn { flex: 1; text-align: center; }
 }
 </style>
 </head>
 <body>
 
-<div class="w">
+<div class="topbar">
+  <div class="wrap">
+    <span class="tb-name">xjtu-siyuanxuetang-grab</span>
+    <span class="tb-sep">/</span>
+    <span class="tb-sub">思源学堂课程资料抓取</span>
+    <span class="tb-links">
+      <a href="https://github.com/XLJFZ/xjtu-siyuanxuetang-grab">GitHub</a>
+      <a href="https://github.com/XLJFZ/xjtu-siyuanxuetang-grab#readme">文档</a>
+    </span>
+  </div>
+</div>
+
+<div class="wrap">
 
   <div class="hero">
     <h1>把整门课的课件和作业<br>一次性拉到本地</h1>
     <p>西安交大思源学堂 2.0 任意课程，自动走完登录、列清单、下载、按章归类。</p>
-    <div class="meta">Python 3.8+ &nbsp;·&nbsp; MIT &nbsp;·&nbsp; 实测 58 个文件 / 530 MB / 0 失败</div>
+    <div class="meta">
+      <span>Python 3.8+</span><span class="dot"></span>
+      <span>MIT</span><span class="dot"></span>
+      <span>实测 58 个文件 / 530 MB / 0 失败</span>
+    </div>
     <div class="acts">
       <a class="btn p" href="https://github.com/XLJFZ/xjtu-siyuanxuetang-grab/releases/latest">下载</a>
       <a class="btn" href="https://github.com/XLJFZ/xjtu-siyuanxuetang-grab">GitHub</a>
     </div>
   </div>
 
-  <div class="sec">
-    <h2>用法</h2>
-    <p>三步。登录只需做一次，之后反复跑都会自动跳过已下载的文件。</p>
+  <div class="body-grid">
+
+    <div class="col-l">
+      <div class="sec">
+        <h2>用法</h2>
+        <p>三步。登录只需做一次，之后反复跑都会自动跳过已下载的文件。</p>
 <pre><code>pip install playwright
 
 python scripts/lms_login.py --course &lt;课程ID&gt;
 
 python scripts/lms_fetch.py --course &lt;课程ID&gt; --out "./CV" --dry-run
 python scripts/lms_fetch.py --course &lt;课程ID&gt; --out "./CV"</code></pre>
-    <p style="margin-top:16px;margin-bottom:0">加 <code>--organize</code> 就按章分好文件夹。</p>
-  </div>
+        <p style="margin-top:20px">加 <code>--organize</code> 就按章分好文件夹。</p>
+      </div>
 
-  <div class="sec">
-    <h2>特点</h2>
-    <div class="feats">
-      <div class="feat"><b>断点续传</b><span>中断了从断点继续，不重头下</span></div>
-      <div class="feat"><b>自动重试</b><span>超时和 5xx 退避重试</span></div>
-      <div class="feat"><b>按章归类</b><span>认得出六种章号写法</span></div>
-      <div class="feat"><b>可换学校</b><span>指向任意 TronClass 平台</span></div>
+      <div class="sec">
+        <h2>常见问题</h2>
+        <div class="faq">
+          <div class="q">
+            <b>干跑出来的清单不全？</b>
+            <span>课件藏在页面正文里，不在附件字段。脚本已经两个来源都扫了，如果还缺，多半是平台侧无权限（会标 <code>N/A</code>）。</span>
+          </div>
+          <div class="q">
+            <b>登录态多久过期？</b>
+            <span>没有固定时限。下载前会自动探测，过期会明确提示重跑登录。</span>
+          </div>
+          <div class="q">
+            <b>能下别的学校吗？</b>
+            <span>可以。用 <code>--base</code> 指向任意 TronClass 平台。</span>
+          </div>
+        </div>
+      </div>
     </div>
-  </div>
 
-  <div class="sec">
-    <h2>装成 Skill</h2>
-    <p>把文件夹放进对应目录，之后直接跟 AI 说「帮我把这门课的资料下载下来」就行。</p>
-<pre><code>~/.workbuddy/skills/xjtu-siyuanxuetang-grab/
-~/.claude/skills/xjtu-siyuanxuetang-grab/
-~/.codex/skills/xjtu-siyuanxuetang-grab/</code></pre>
-    <p style="margin-top:16px;margin-bottom:0">不装也能用，脚本是独立的命令行工具。</p>
+    <div class="col-r">
+      <div class="sec">
+        <h2>特点</h2>
+        <div class="feats">
+          <div class="feat"><b>断点续传</b><span>中断了从断点继续，不重头下</span></div>
+          <div class="feat"><b>自动重试</b><span>超时和 5xx 退避重试</span></div>
+          <div class="feat"><b>按章归类</b><span>认得出六种章号写法</span></div>
+          <div class="feat"><b>可换学校</b><span>指向任意 TronClass 平台</span></div>
+        </div>
+      </div>
+
+      <div class="sec">
+        <h2>装成 Skill</h2>
+        <p>把文件夹放进对应目录，之后直接跟 AI 说「帮我把这门课的资料下载下来」就行。</p>
+        <div class="paths">
+          <div><span class="who">WorkBuddy</span><code>~/.workbuddy/skills/xjtu-siyuanxuetang-grab/</code></div>
+          <div><span class="who">Claude Code</span><code>~/.claude/skills/xjtu-siyuanxuetang-grab/</code></div>
+          <div><span class="who">Codex</span><code>~/.codex/skills/xjtu-siyuanxuetang-grab/</code></div>
+        </div>
+        <p style="margin-top:18px">不装也能用，脚本是独立的命令行工具。</p>
+      </div>
+    </div>
+
   </div>
 
   <footer>
-    <a href="https://github.com/XLJFZ/xjtu-siyuanxuetang-grab#readme">完整文档</a>
-    &nbsp;·&nbsp;
-    <a href="https://github.com/XLJFZ/xjtu-siyuanxuetang-grab/releases">版本历史</a>
-    &nbsp;·&nbsp; MIT
+    <div class="foot-row">
+      <a href="https://github.com/XLJFZ/xjtu-siyuanxuetang-grab#readme">完整文档</a>
+      <a href="https://github.com/XLJFZ/xjtu-siyuanxuetang-grab/releases">版本历史</a>
+      <span>MIT</span>
+    </div>
   </footer>
 
 </div>
