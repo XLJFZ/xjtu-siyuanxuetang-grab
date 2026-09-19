@@ -1,12 +1,14 @@
 # -*- coding: utf-8 -*-
 """
-思源学堂 2.0 (TronClass) —— 登录一次，把登录态落盘。
-后续所有抓取都不再需要浏览器，直接 lms_fetch.py 跑。
+思源学堂 2.0 —— 登录一次，把登录态落盘。
+后续所有下载都不再需要浏览器，直接 lms_fetch.py 跑。
+
+只处理当前账号有权访问的课程资源。
 
 用法:
-    python lms_login.py --course 33593
-    python lms_login.py --course 33593 --state D:/xxx/state.json
-    python lms_login.py --course 33593 --wait 400
+    python lms_login.py --course <课程ID>
+    python lms_login.py --course <课程ID> --state D:/xxx/state.json
+    python lms_login.py --course <课程ID> --wait 400
 
 环境要求:
     pip install playwright
@@ -25,7 +27,7 @@ from lms_common import BASE, HOST, find_browser, profile_path, require_playwrigh
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--course", required=True, help="课程 ID, 如 33593")
+    ap.add_argument("--course", required=True, help="课程 ID（从课程链接里的 /course/<ID>/ 取）")
     ap.add_argument("--state", default=None, help="登录态输出路径 (默认 ~/.lms-grab/state_<ID>.json)")
     ap.add_argument("--profile", default=None, help="Playwright 持久化 profile 目录")
     ap.add_argument("--wait", type=int, default=300, help="等待手动登录的秒数")
