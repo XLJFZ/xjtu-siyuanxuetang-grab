@@ -56,8 +56,10 @@ def find_src():
     """定位发布源目录。
 
     这个脚本有两种存放位置：
-      A. 仓库同级（维护者工作区）：`_release/release.py`，源在 `_release/xjtu-lms-grab/`
-      B. 仓库内部（随包分发）：  `<repo>/release.py`，源就是脚本自己所在的目录
+      A. 工作区根（当前布局）：`D:\\xjtu-siyuanxuetang-grab\\release.py`，
+         源就是脚本自己所在的目录
+      B. 仓库同级（历史布局）：`<工作区>/_release/release.py`，
+         源在 `<工作区>/_release/xjtu-lms-grab/`
     """
     for cand in (os.path.join(HERE, "xjtu-lms-grab"), HERE):
         if os.path.isfile(os.path.join(cand, "SKILL.md")):
@@ -337,6 +339,9 @@ def push_code(src, branch="main"):
 
     注意：找不到推送脚本时**必须报错退出**，不能静默跳过 ——
     否则会出现「包是新的、仓库代码是旧的」这种最危险的不一致。
+
+    推送范围**必须与打包白名单一致**（INCLUDE）。gh_push_dir 默认是全目录遍历，
+    源目录里任何散落文件都会被推上仓库 —— 踩过：旧的 v1.2.0.zip 就是这样混进去的。
     """
     pusher = os.path.join(HERE, "gh_push_dir.py")
     pusher = os.path.abspath(pusher)
@@ -344,7 +349,8 @@ def push_code(src, branch="main"):
         err("找不到推送脚本 %s" % pusher)
         err("要么把它放回该位置，要么去掉 --push-code 参数")
         raise SystemExit(1)
-    r = subprocess.run([sys.executable, pusher, src, "%s/%s" % (OWNER, REPO), branch],
+    r = subprocess.run([sys.executable, pusher, src, "%s/%s" % (OWNER, REPO),
+                        branch, ",".join(INCLUDE)],
                        capture_output=True, text=True, encoding="utf-8", errors="replace")
     for line in (r.stdout or "").splitlines()[-14:]:
         info(line)
