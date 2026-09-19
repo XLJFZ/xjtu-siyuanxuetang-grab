@@ -8,6 +8,12 @@ cookies*.json
 *.env
 lms_profile/
 */lms-pw-profile/
+# 浏览器 profile 与活动清单默认就落在 ~/.lms-grab，但也可能被 --state /
+# --activities 指到仓库目录里；两者都含个人信息（登录态 / 课程活动列表），
+# 一律排除。
+profile_*/
+profile_*
+activities_*.json
 .lms-grab/
 
 # 运行产物
@@ -49,10 +55,14 @@ desktop.ini
 dist/
 build/
 
-# 例外：workflow 及其脚本以 .txt 形式存放。
-# GitHub 要求 .github/workflows/ 下的文件必须用带 Workflows 权限的 token 推送，
-# 通过 Contents API 会被 403。所以这几个文件以 .txt 随包提供，
-# 由 enable-ci.bat 还原到正确位置。
-!ci.yml.txt
-!release.yml.txt
-!pack.py.txt
+# 维护侧文件 —— 只在本机工作区用，不进仓库、不进 Release 包。
+# （release.py 本身是例外：它随包分发，所以不在下面这组里。）
+_notes/
+gh_push_dir.py
+push_docs.py
+_tmp/
+_local_backup/
+
+# 归档：从旧工作区（CV 课目录下的 _release/）整体搬来的历史痕迹。
+# 纯存放，不参与构建、不参与发布。
+_archive/
