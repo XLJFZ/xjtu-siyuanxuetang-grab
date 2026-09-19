@@ -6,7 +6,8 @@
 
 用于将当前账号**有权访问的课程资料**批量下载到本地，并按照课件、作业、录像等类型进行整理。
 
-支持 AI Skill、Prompt 与独立 Python 脚本三种使用方式。
+支持 AI Skill、Prompt 与独立 Python 脚本三种使用方式，**推荐装成 Skill**——
+装好后一句自然语言即可跑完整个流程。
 
 [![CI](https://github.com/XLJFZ/xjtu-siyuanxuetang-grab/actions/workflows/ci.yml/badge.svg)](https://github.com/XLJFZ/xjtu-siyuanxuetang-grab/actions/workflows/ci.yml)
 ![Python](https://img.shields.io/badge/python-3.8%2B-blue)
@@ -55,13 +56,15 @@
 
 整个流程仍然使用用户本人正常登录后获得的会话状态。
 
-也可以作为 AI Skill 使用——装好以后，你只要说一句：
+**装成 Skill 后**，你只要说一句：
 
 > 帮我把这门课的资料都下载下来，课程链接：`https://lms.xjtu.edu.cn/course/<课程ID>/index`
 
-AI 就会自动走完「登录 → 干跑列清单 → 确认 → 下载 → 归类」的完整流程。
+AI 就会自动走完「登录 → 干跑列清单 → 确认 → 下载 → 归类」的完整流程。安装方式见
+下方[「装成 Skill」](#装成-skill推荐用法)一节。
 
-不装 Skill 也能用——把 [`prompt.md`](prompt.md) 里的那段话贴进对话，配合 `scripts/` 下的脚本手动跑。
+不装 Skill 也能用——把 [`prompt.md`](prompt.md) 里的那段话贴进对话，
+或直接用 `scripts/` 下的脚本命令行跑。
 
 ## 工作流程
 
@@ -82,6 +85,9 @@ AI 就会自动走完「登录 → 干跑列清单 → 确认 → 下载 → 归
 ```
 
 项目不会尝试修改平台权限，也不会绕过服务端对课程资源的访问控制。
+
+**装成 Skill 后，上面的流程由助手驱动**——你只需要在「用户确认」这一步看一眼清单。
+命令行方式则每一步都由你自己触发。
 
 ## 附件来源的实际情况
 
@@ -109,10 +115,19 @@ python scripts/lms_fetch.py --course <ID> --out ./课程资料 --no-video    # �
 
 两类录像的实现差异与注意事项见 [`SKILL.md`](SKILL.md)。
 
-## 安装
+## 装成 Skill（推荐用法）
 
-`SKILL.md` 是通用的 Skill 格式，主流 AI 编程助手都认。把 `xjtu-siyuanxuetang-grab`
-文件夹放进对应助手的 skills 目录即可：
+**推荐把它装成 Skill。** 装好之后不需要记任何命令，直接对 AI 说一句话就能跑完整流程：
+
+> 帮我把这门课的资料都下载下来，课程链接：`https://lms.xjtu.edu.cn/course/<课程ID>/index`
+
+AI 会自动完成「登录 → 干跑列清单 → 等你确认 → 下载 → 按章归类」，并在此过程中遵守
+本项目的使用边界与负载控制策略。
+
+### 安装：把文件夹放进助手的 skills 目录
+
+`SKILL.md` 是通用的 Skill 格式，主流 AI 编程助手都认。把整个
+`xjtu-siyuanxuetang-grab` 文件夹放进对应目录即可：
 
 | 工具 | 放入目录 |
 |---|---|
@@ -126,12 +141,23 @@ Windows:       C:\Users\<你>\.<助手目录>\skills\xjtu-siyuanxuetang-grab\
 macOS / Linux: ~/.<助手目录>/skills/xjtu-siyuanxuetang-grab/
 ```
 
+装好后无需重启会话之外的其他配置，也不需要把命令抄进对话——
+助手匹配到「下载课程资料」这类场景时会自动读取 `SKILL.md` 并按其中的流程执行。
+
 > Skill 是一层很薄的约定：目录下放一份 `SKILL.md`（YAML frontmatter + 正文），
 > 助手匹配到场景时自动读取并执行。任何支持这套约定的工具都能用。
+> `SKILL.md` 里已经写明使用边界（仅访问当前账号有权访问的课程、不并发、不重试权限错误），
+> 所以装成 Skill 后**不会绕过这些约束**。
 
-**不装 Skill 也能用。** 脚本是独立的命令行工具，不依赖任何助手——把仓库 clone 或解压到
-任意位置直接跑即可（用法见下方「快速开始」）。此时 `SKILL.md` 相当于一份操作手册；
-`prompt.md` 则是通用 Prompt，贴进任意对话式 AI 就能让它照着做，不需要它支持 Skill 机制。
+### 不想装 Skill 的两种替代
+
+| 方式 | 做法 | 适合 |
+|---|---|---|
+| **Prompt** | 把 [`prompt.md`](prompt.md) 贴进任意对话式 AI，改掉两处 `【】` | 助手不支持 Skill 机制，或只想临时用一次 |
+| **命令行** | 直接 `python scripts/lms_fetch.py ...`（见下方「快速开始」） | 自己完全控制每一步，或做脚本化/定时任务 |
+
+两种方式都不需要 `SKILL.md` 被助手识别。此时 `SKILL.md` 相当于一份完整的操作手册，
+`prompt.md` 则是可复制的通用 Prompt。
 
 ## 快速开始
 
