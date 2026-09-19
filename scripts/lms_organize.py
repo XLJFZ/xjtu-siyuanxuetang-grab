@@ -152,6 +152,9 @@ def _pick_title(titles):
 
     另外剥掉外层的【】（很多老师习惯写成【第一章】课件），
     否则每个目录名都会带一堆方括号，排序时还会排在一起。
+
+    还会顺手剥掉文件扩展名 —— 调用方常把文件名也传进来当候选，
+    不剥的话目录名会变成「第01章 绪论.pdf」。
     """
     if not titles:
         return ""
@@ -159,6 +162,7 @@ def _pick_title(titles):
     for t in titles:
         if not t:
             continue
+        t = _strip_file_ext(t)
         t = strip_brackets(t)
         for pat in _STRIP_PREFIX:
             t = pat.sub("", t, count=1)
@@ -167,6 +171,14 @@ def _pick_title(titles):
         if t and len(t) > len(best):
             best = t
     return best[:40]
+
+
+# 像扩展名的尾巴，剥掉。与 lms_fetch.split_ext 同思路，但这里不依赖那个模块
+_EXT_TAIL = re.compile(r"\.[A-Za-z][A-Za-z0-9+\-_]{0,11}$")
+
+
+def _strip_file_ext(s):
+    return _EXT_TAIL.sub("", s)
 
 
 _BRACKETS = [("【", "】"), ("[", "]"), ("（", "）"), ("(", ")")]
