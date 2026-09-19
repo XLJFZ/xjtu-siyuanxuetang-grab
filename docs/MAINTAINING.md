@@ -333,8 +333,18 @@ token 就必须先经过 AI 的上下文；而且明文文件对同机器任何�
 | 仓库访问 | 勾选 `xjtu-siyuanxuetang-grab` |
 | 存储库权限 → 内容 | 读取和写入 |
 
-**不需要** `Workflows`（CI 配置是以 `.txt` 形式推的），
-**不需要** `Administration`（改默认分支才用，可忽略）。
+**不需要** `Workflows`（CI 配置是以 `.txt` 形式推的）。
+
+> **`Administration` 不需要，但也「改不了」。** 实测（2026-09-19）：
+> 用只有 `Contents: write` 的细粒度 token 调仓库元数据端点，
+> `PUT /repos/<o>/<r>/topics` 与 `PATCH /repos/<o>/<r>`（改 description / homepage）
+> 都返回 **403 `Resource not accessible by personal access token`**。
+> 读这些端点是通的（GET 返回 200），只有写被拒。
+>
+> 推论：**About 描述、Topics、Homepage 这三项只能在网页上手动改**，
+> 不要试图用脚本推——推代码的 token 天然没有这个权限。
+> 想「让 Skill 定位更显眼」时，唯一可脚本化的位置是 **README 第一屏**
+> （GitHub 会把 README 渲染在文件列表上方，效果接近 About 区域）。
 
 ---
 
@@ -347,3 +357,16 @@ token 就必须先经过 AI 的上下文；而且明文文件对同机器任何�
 | `push_docs.py` | 推 `docs/` 到 GitHub（在维护者工作区里） |
 | `release.py` | 发版本：版本号自检 → 打包 → 校验 → tag → Release → 附件 |
 | `ci.yml.txt` / `release.yml.txt` | CI 配置，用 `enable-ci.bat` 还原启用 |
+| `scripts/lms_selfcheck.py` | 安装后自检；改动它要同步 `tests/test_selfcheck.py` 的 `CORE_SCRIPTS` 断言 |
+
+### 页面内容与两栏配平的联动
+
+页面是左右两栏网格，**两栏高度比要落在 `0.85 ~ 1.15`**（见上文「页面布局的注意事项」）。
+左栏偏长是常态——它放的是使用路径（安装、命令行、录像类型、范围、FAQ），
+右栏只放特点与说明。往左栏加内容时留意这个比值：
+
+- 加内容前先量一次（无头 Edge，见上文那条多档宽度检查）。
+- 比值超出上限说明左栏过长，**优先把能独立成节的说明型内容挪到右栏**，
+  而不是从左栏删信息。挪动比删减安全。
+- 「装完先自检」这节就是这样从左上挪到右栏的：内容是说明性质而非操作步骤，
+  放右栏既配平了两栏，也更符合「右栏讲为什么、左栏讲怎么做」的分工。
