@@ -515,12 +515,11 @@ class TestCollectKinds(Base):
             return R(raw)
 
     def _run_full(self, acts, details, want_video=True):
-        """跑一次真实的 collect()，返回 (keys, n1, n2)，输出静音。"""
+        """跑一次真实的 collect()，返回 (keys, n1, n2, scan_errors)，输出静音。"""
         import contextlib
         op = self._Op(acts, details)
         with contextlib.redirect_stdout(io.StringIO()):
-            keys, n1, n2 = F.collect(op, "1", acts, want_video=want_video)
-        return keys, n1, n2
+            return F.collect(op, "1", acts, want_video=want_video)
 
     def _run(self, acts, details, want_video=True):
         return self._run_full(acts, details, want_video)[0]
@@ -602,7 +601,7 @@ class TestCollectKinds(Base):
                 {"type": "lesson", "title": "L", "uploads": [{"id": 3}]}]
         det = {777: {"data": {"external_live_detail": {"replay_videos": [
             {"camera_id": 1, "camera_type": "encoder", "url": "http://r/x"}]}}}}
-        keys, n1, n2 = self._run_full(acts, det, want_video=True)
+        keys, n1, n2, _scan = self._run_full(acts, det, want_video=True)
 
         self.assertEqual(n1, 1)                     # 来源①：只有 L 的那个附件
         self.assertEqual(n2, 0)                     # 正文内嵌：没有
@@ -615,7 +614,7 @@ class TestCollectKinds(Base):
         acts = [{"id": 5, "type": "page", "title": "第1讲", "uploads": None}]
         det = {5: {"data": {"content":
                             '<img src="/api/uploads/8811"><a href="/api/uploads/8812">'}}}
-        keys, n1, n2 = self._run_full(acts, det, want_video=False)
+        keys, n1, n2, _scan = self._run_full(acts, det, want_video=False)
 
         self.assertEqual(n1, 0)
         self.assertEqual(n2, 2)
@@ -964,17 +963,46 @@ class TestLiveRangeAlignment(Base):
         self.assertEqual(op.calls[-1][0], 0, "缺口后应重下全量")
 
     def test_gap_keeps_part_when_no_retry_left(self):
-        """缺口但已无重试机会时不落盘、保留 .part，由下次运行补下。"""
+        """★ 缺口但已无重试机会时：不落盘、**保留**有效前缀的 .part。
+
+        回归背景：旧实现在这里先 os.remove(tmp) 再 return kept_part=False，
+        把已经正确下载的前 100000 字节白白丢掉 —— 用户下次只能从零开始。
+        正确行为：这次响应不作数，但原有前缀仍然有效，必须留住。
+        """
         import lms_live
         total = 300000
         path = os.path.join(self.tmp, "gap2.mp4")
         self._part_with_bytes(path, 100000)
+        before = open(path + ".part", "rb").read()
 
         op = self._Op(total, serve_from=150000)
         res = lms_live.download(op, "http://r/x", path, retries=1, quiet=True)
 
         self.assertFalse(res["ok"])
         self.assertFalse(os.path.exists(path), "残缺文件不许落盘")
+        self.assertTrue(os.path.exists(path + ".part"),
+                        "有效前缀不能因为最后一次失败而被删掉")
+        self.assertTrue(res.get("kept_part"), "应如实报告保留了 .part")
+        # .part 不能被这次错误响应污染
+        with open(path + ".part", "rb") as f:
+            self.assertEqual(f.read(), before)
+        self.assertEqual(os.path.getsize(path + ".part"), 100000)
+
+    def test_gap_discards_part_when_retry_left(self):
+        """还有重试机会时仍然丢掉残片 —— 否则下一轮会继续撞同一个缺口。"""
+        import lms_live
+        total = 300000
+        path = os.path.join(self.tmp, "gap3.mp4")
+        self._part_with_bytes(path, 100000)
+
+        op = self._Op(total, serve_from=150000)
+        res = lms_live.download(op, "http://r/x", path, retries=2, quiet=True)
+
+        self.assertTrue(res["ok"], res.get("err"))
+        with open(path, "rb") as f:
+            self.assertEqual(f.read(),
+                             bytes([(i % 251) for i in range(total)]))
+        self.assertFalse(os.path.exists(path + ".part"), "成功后不该留 .part")
 
     def test_normal_resume_unchanged(self):
         """start == offset 的正常续传不能被上面的逻辑误伤。"""
@@ -1150,6 +1178,52 @@ class TestExistingFileCompleteness(Base):
         ok, _, exp = F.already_complete(p, 0)
         self.assertTrue(ok)
         self.assertIsNone(exp)
+
+    def test_getsize_oserror_is_treated_incomplete(self):
+        """★ os.path.getsize 抛 OSError 时不能被当成已完成。
+
+        失败处理的方向必须保守：
+
+        - **绝不能判为「完整」**：那等于把一个大小未知 / 状态不确定的文件
+          当成已下载而永久跳过 —— 这正是本项目一直在修的那类 silent failure。
+          保守判 false，最坏结果只是重下一次几十 MB。
+        - **也绝不能写成 `except: return True`**：那是把「这次 stat 没成功」
+          伪装成「上次已经下好了」，和把 500 当成 404 是同一种错误。
+        """
+        import unittest.mock as mock
+        p = os.path.join(self.tmp, "e.bin")
+        with open(p, "wb") as f:
+            f.write(b"x" * 1000)
+        with mock.patch("os.path.getsize", side_effect=OSError(5, "I/O error")):
+            ok, local, exp = F.already_complete(p, 1000)
+        self.assertFalse(ok, "stat 失败的文件不能被判为完整")
+        self.assertEqual(local, 0, "本地大小未知时应返回 0，不能编一个数")
+        self.assertEqual(exp, 1000, "期望大小仍要返回，供上层打日志")
+
+    def test_getsize_oserror_without_declared_size(self):
+        """拿不到声明大小时同样保守 —— exp 返回 None 而不是臆造。"""
+        import unittest.mock as mock
+        p = os.path.join(self.tmp, "f.bin")
+        with open(p, "wb") as f:
+            f.write(b"x" * 5000)
+        with mock.patch("os.path.getsize", side_effect=OSError(13, "denied")):
+            ok, local, exp = F.already_complete(p, 0)
+        self.assertFalse(ok)
+        self.assertEqual(local, 0)
+        self.assertIsNone(exp)
+
+    def test_oserror_or_missing_file_same_direction(self):
+        """文件不存在与 stat 失败必须是同一个方向，不能一个 false 一个 true。"""
+        import unittest.mock as mock
+        p = os.path.join(self.tmp, "g.bin")
+        with open(p, "wb") as f:
+            f.write(b"x" * 1000)
+        missing = F.already_complete(os.path.join(self.tmp, "nope.bin"), 1000)
+        with mock.patch("os.path.getsize", side_effect=OSError(2, "gone")):
+            errored = F.already_complete(p, 1000)
+        self.assertFalse(missing[0])
+        self.assertFalse(errored[0])
+        self.assertEqual(missing[0], errored[0])
 
     def test_missing_file(self):
         ok, local, _ = F.already_complete(os.path.join(self.tmp, "nope.bin"), 100)
@@ -1402,6 +1476,558 @@ class TestMetaErrorPropagation(Base):
         self.assertTrue(items[1]["error"])
         self.assertFalse(items[1]["unavailable"], "500 不该被当成不可达")
         self.assertEqual(items[1]["err_kind"], F.ERR_TRANSIENT)
+
+
+# ---------------------------------------------------------------- 扫描阶段
+
+class TestCollectScanFailure(Base):
+    """collect() 的扫描失败必须记账 —— 这是最后一个 silent failure。
+
+    回归背景：扫描 page 正文 / lecture_live 详情时是 `except Exception:
+    print(…); continue`。一个 page 活动连着 500/500/timeout 时，它正文里的
+    5 个 PDF 既不进 plan、也不进 fail、也不在清单里出现，程序照样 exit 0 ——
+    「扫描失败」被当成「这门课本来就没有资源」。
+    """
+
+    class _Op:
+        """按 url 分发：列表请求返回活动，详情请求按 aid 吐结果。
+
+        details 的值可以是 dict（正常详情）、Exception（直接抛）、
+        或 bytes（原样当响应体，用来模拟「返回 HTML 而不是 JSON」）。
+        """
+
+        def __init__(self, acts, details):
+            self.acts = acts
+            self.details = details
+
+        def open(self, url, timeout=None, data=None):
+            if "/activities?" in url:
+                payload = {"activities": self.acts}
+            else:
+                aid = int(url.split("/activities/")[1].split("?")[0])
+                item = self.details.get(aid, {})
+                if isinstance(item, Exception):
+                    raise item
+                if isinstance(item, bytes):
+                    return FakeResponse(item)
+                payload = item
+            raw = json.dumps(payload).encode("utf-8")
+            return FakeResponse(raw)
+
+    def _collect(self, acts, details, want_video=True):
+        import contextlib
+        op = self._Op(acts, details)
+        buf = io.StringIO()
+        old_sleep = F.time.sleep
+        F.time.sleep = lambda _s: None       # 别让退避把测试拖慢
+        try:
+            with contextlib.redirect_stdout(buf):
+                with contextlib.redirect_stderr(buf):
+                    keys, _n1, _n2, errs = F.collect(op, "1", acts,
+                                                     want_video=want_video)
+        finally:
+            F.time.sleep = old_sleep
+        return keys, errs
+
+    def _page_acts(self):
+        return [{"id": 5, "type": "page", "title": "第1章", "uploads": None}]
+
+    def test_page_detail_500_is_scan_failure(self):
+        """★ 核心回归：page 详情反复 500 → 必须记为失败，不能静默跳过。"""
+        acts = self._page_acts()
+        keys, errs = self._collect(acts, {5: http_err(500)})
+        self.assertEqual(keys, [], "详情没取到，正文里的附件自然也没发现")
+        self.assertEqual(len(errs), 1)
+        self.assertEqual(errs[0]["stage"], "page_detail")
+        self.assertEqual(errs[0]["activity_id"], 5)
+        self.assertEqual(errs[0]["kind"], F.ERR_TRANSIENT)
+
+    def test_page_detail_timeout_is_scan_failure(self):
+        acts = self._page_acts()
+        keys, errs = self._collect(acts, {5: socket.timeout("timed out")})
+        self.assertEqual(keys, [])
+        self.assertEqual(errs[0]["kind"], F.ERR_TRANSIENT)
+        self.assertIn("timeout", errs[0]["error"].lower())
+
+    def test_page_detail_bad_json_is_scan_failure(self):
+        """返回 200 但 body 不是 JSON —— 同样算扫描失败。"""
+        acts = self._page_acts()
+        keys, errs = self._collect(acts, {5: b"<html>oops</html>"})
+        self.assertEqual(keys, [])
+        self.assertEqual(errs[0]["kind"], F.ERR_TRANSIENT)
+
+    def test_page_detail_403_is_unavailable(self):
+        """403 / 404 是平台确实不给 —— 按既定规则处理，不算失败。"""
+        for code in (403, 404):
+            acts = self._page_acts()
+            keys, errs = self._collect(acts, {5: http_err(code)})
+            self.assertEqual(keys, [])
+            self.assertEqual(len(errs), 1)
+            self.assertEqual(errs[0]["kind"], F.ERR_UNAVAILABLE)
+
+    def test_page_detail_401_is_auth_failure(self):
+        acts = self._page_acts()
+        _keys, errs = self._collect(acts, {5: http_err(401)})
+        self.assertEqual(errs[0]["kind"], F.ERR_AUTH)
+
+    def test_page_detail_ok_has_no_error(self):
+        """详情正常时不该凭空产生扫描错误。"""
+        acts = self._page_acts()
+        detail = {"data": {"content": '<a href="/api/uploads/8811">'}}
+        keys, errs = self._collect(acts, {5: detail})
+        self.assertEqual(errs, [])
+        self.assertEqual(keys, [("课件", "第1章", 8811)])
+
+    def test_live_detail_500_is_scan_failure(self):
+        acts = [{"id": 777, "type": "lecture_live", "title": "9-19 第一场",
+                 "uploads": []}]
+        keys, errs = self._collect(acts, {777: http_err(500)})
+        self.assertEqual(keys, [])
+        self.assertEqual(len(errs), 1)
+        self.assertEqual(errs[0]["stage"], "lecture_live_detail")
+        self.assertEqual(errs[0]["activity_id"], 777)
+        self.assertEqual(errs[0]["kind"], F.ERR_TRANSIENT)
+
+    def test_live_detail_timeout_is_scan_failure(self):
+        acts = [{"id": 777, "type": "lecture_live", "title": "L", "uploads": []}]
+        keys, errs = self._collect(acts, {777: socket.timeout("timed out")})
+        self.assertEqual(keys, [])
+        self.assertEqual(errs[0]["stage"], "lecture_live_detail")
+        self.assertEqual(errs[0]["kind"], F.ERR_TRANSIENT)
+
+    def test_live_detail_401_is_auth_failure(self):
+        acts = [{"id": 777, "type": "lecture_live", "title": "L", "uploads": []}]
+        _keys, errs = self._collect(acts, {777: http_err(401)})
+        self.assertEqual(errs[0]["stage"], "lecture_live_detail")
+        self.assertEqual(errs[0]["kind"], F.ERR_AUTH)
+
+
+class TestScanErrorItems(Base):
+    """扫描错误转成的清单条目 —— 决定它会不会进 fail / manifest / 退出码。"""
+
+    def _items_for(self, stage, kind_err):
+        errs = [{"stage": stage, "activity_id": 123, "activity": "第1章",
+                 "kind": kind_err, "error": "HTTP 500"}]
+        return F.scan_error_items(errs)
+
+    def test_transient_scan_error_is_fail_item(self):
+        items = self._items_for("page_detail", F.ERR_TRANSIENT)
+        self.assertEqual(len(items), 1)
+        it = items[0]
+        self.assertTrue(it["error"])
+        self.assertFalse(it["unavailable"])
+        self.assertEqual(F.item_status(it), F.STATUS_FAIL)
+        row = F.error_row(1, it)
+        self.assertEqual(row["status"], "fail")
+        self.assertEqual(row["err_kind"], F.ERR_TRANSIENT)
+        self.assertIn("扫描失败", row["error"])
+
+    def test_unavailable_scan_error_is_na_item(self):
+        items = self._items_for("page_detail", F.ERR_UNAVAILABLE)
+        it = items[0]
+        self.assertTrue(it["unavailable"])
+        self.assertEqual(F.item_status(it), F.STATUS_NA)
+
+    def test_live_stage_maps_to_replay_kind(self):
+        items = self._items_for("lecture_live_detail", F.ERR_TRANSIENT)
+        self.assertEqual(items[0]["kind"], "回放")
+
+    def test_scan_items_never_take_part_in_collisions(self):
+        """扫描失败的条目不占位，否则会挤掉真实的同名文件。"""
+        items = self._items_for("page_detail", F.ERR_TRANSIENT)
+        scanit = items[0]
+        scanit["name"] = "x.pdf"
+        plan = [{"kind": "课件", "activity": "第1章", "name": "x.pdf",
+                 "uid": 1}] + items
+        _, n = F.resolve_collisions(plan, FakeArgs())
+        self.assertEqual(n, 0)
+
+
+# ---------------------------------------------------------------- 状态语义
+
+class TestItemStatus(Base):
+    """三种模式共用的错误分类 —— 以前 --list-only 把所有错误拍成 N/A。"""
+
+    def test_unavailable_is_na(self):
+        for code in (403, 404):
+            it = {"err_kind": F.classify_http(code)["kind"]}
+            self.assertEqual(F.item_status(it), "na")
+
+    def test_auth_is_fail(self):
+        it = {"err_kind": F.ERR_AUTH}
+        self.assertEqual(F.item_status(it), "fail")
+
+    def test_transient_is_fail(self):
+        it = {"err_kind": F.ERR_TRANSIENT}
+        self.assertEqual(F.item_status(it), "fail")
+
+    def test_missing_kind_is_fail(self):
+        """出错条目没有 err_kind 时判 FAIL —— 宁可误报也不静默吞掉。"""
+        self.assertEqual(F.item_status({"error": True}), "fail")
+
+    def test_count_fail_ignores_na(self):
+        rows = [{"status": "fail"}, {"status": "na"}, {"status": "ok"},
+                {"status": "fail"}]
+        self.assertEqual(F.count_fail(rows), 2)
+
+    def test_error_row_keeps_diagnostics(self):
+        it = {"kind": "课件", "activity": "第1章", "uid": 9,
+              "err_kind": F.ERR_TRANSIENT, "err_msg": "HTTP 500"}
+        row = F.error_row(3, it)
+        self.assertEqual(row["i"], 3)
+        self.assertEqual(row["status"], "fail")
+        self.assertEqual(row["err_kind"], F.ERR_TRANSIENT)
+        self.assertEqual(row["error"], "HTTP 500")
+
+
+def _make_state(tmp):
+    """给 main() 用的一小份登录态。"""
+    p = os.path.join(tmp, "st.json")
+    with open(p, "w", encoding="utf-8") as f:
+        json.dump({"version": 1, "host": "x.edu.cn",
+                   "cookies": [{"name": "sid", "value": "1",
+                                "domain": "x.edu.cn"}]}, f)
+    return p
+
+
+class MainOpener:
+    """给 main() 用的假 opener：活动列表 / 活动详情 / upload 元信息三种请求。
+
+    details / uploads 的值可以是 dict（正常响应）、Exception（直接抛）、
+    或 bytes（原样 body，模拟「返回 HTML 而不是 JSON」）。
+    """
+
+    def __init__(self, acts, details=None, uploads=None):
+        self.acts = acts
+        self.details = details or {}
+        self.uploads = uploads or {}
+
+    def open(self, url, timeout=None, data=None):
+        if "/activities?" in url:
+            return FakeResponse(json.dumps({"activities": self.acts}).encode())
+        if "/uploads/" in url:
+            uid = int(url.split("/uploads/")[1].split("?")[0])
+            item = self.uploads.get(uid, {"name": "u%d.pdf" % uid, "size": 10})
+            if isinstance(item, Exception):
+                raise item
+            return FakeResponse(json.dumps(item).encode())
+        aid = int(url.split("/activities/")[1].split("?")[0])
+        item = self.details.get(aid, {"data": {}})
+        if isinstance(item, Exception):
+            raise item
+        if isinstance(item, bytes):
+            return FakeResponse(item)
+        return FakeResponse(json.dumps(item).encode())
+
+
+def run_main(tmp, op, argv_tail):
+    """真跑一次 main()，返回 (退出码, 全部输出)。"""
+    import contextlib
+    old_open, old_sleep = F.opener, F.time.sleep
+    old_base, old_host = F.BASE, F.HOST
+    F.opener = lambda _p: op
+    F.time.sleep = lambda _s: None
+    out = os.path.join(tmp, "OUT")
+    sys.argv = ["lms_fetch", "--course", "1", "--out", out,
+                "--state", _make_state(tmp), "--base", "https://x.edu.cn",
+                "--no-verify"] + argv_tail
+    buf = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(buf):
+            with contextlib.redirect_stderr(buf):
+                rc = F.main()
+    finally:
+        F.opener = old_open
+        F.time.sleep = old_sleep
+        F.BASE, F.HOST = old_base, old_host      # main() 会改这两个全局
+    return rc, buf.getvalue()
+
+
+class TestListOnly(Base):
+    """--list-only 的退出码与状态 —— 以前无论接口怎么炸都固定返回 0。"""
+
+    ACTS = [{"id": 5, "type": "page", "title": "第1章", "uploads": None},
+            {"id": 6, "type": "lesson", "title": "第2章",
+             "uploads": [{"id": 900}]}]
+
+    def _run(self, upload_result):
+        out = os.path.join(self.tmp, "m.json")
+        rc, buf = run_main(self.tmp, MainOpener(self.ACTS,
+                                                uploads={900: upload_result}),
+                           ["--list-only", out])
+        with open(out, encoding="utf-8") as f:
+            rows = json.load(f)["files"]
+        return rc, rows, buf
+
+    def test_403_is_na_and_exit_0(self):
+        rc, rows, _out = self._run(http_err(403))
+        self.assertEqual(rc, F.RC_OK, "403 是平台没给，不算失败")
+        self.assertEqual(rows[0]["status"], "na")
+        self.assertEqual(rows[0]["err_kind"], F.ERR_UNAVAILABLE)
+
+    def test_404_is_na_and_exit_0(self):
+        rc, rows, _out = self._run(http_err(404))
+        self.assertEqual(rc, F.RC_OK)
+        self.assertEqual(rows[0]["status"], "na")
+
+    def test_500_is_fail_and_exit_partial(self):
+        """★ 核心回归：接口 500 时 --list-only 不能报成功。"""
+        rc, rows, _out = self._run(http_err(500))
+        self.assertEqual(rc, F.RC_PARTIAL, "500 必须让退出码非 0")
+        self.assertEqual(rows[0]["status"], "fail")
+        self.assertEqual(rows[0]["err_kind"], F.ERR_TRANSIENT)
+
+    def test_timeout_is_fail_and_exit_partial(self):
+        rc, rows, _out = self._run(socket.timeout("timed out"))
+        self.assertEqual(rc, F.RC_PARTIAL)
+        self.assertEqual(rows[0]["status"], "fail")
+
+    def test_401_is_fail_and_exit_partial(self):
+        rc, rows, out = self._run(http_err(401))
+        self.assertEqual(rc, F.RC_PARTIAL)
+        self.assertEqual(rows[0]["status"], "fail")
+        self.assertEqual(rows[0]["err_kind"], F.ERR_AUTH)
+        self.assertIn("重新登录", out, "401 要给出重新登录的提示")
+
+    def test_ok_is_plan_and_exit_0(self):
+        rc, rows, _out = self._run({"name": "a.pdf", "size": 10})
+        self.assertEqual(rc, F.RC_OK)
+        self.assertEqual(rows[0]["status"], "plan")
+
+    def test_truncated_local_file_is_not_exists(self):
+        """★ 清单里的 exists 必须与主流程同一个判据（already_complete）。
+
+        以前 build_rows 只判 os.path.exists，于是本地截断文件在清单里是
+        exists、在主流程里却要 REDO —— 两种视图对不上。
+        """
+        _, rows, _out = self._run({"name": "第2章讲义.pdf", "size": 100000})
+        target = rows[0]
+        dest = F.dest_for(target["kind"], target["activity"],
+                          target["name"],
+                          FakeArgs(out=os.path.join(self.tmp, "OUT")))
+        path = os.path.join(dest, target["name"])
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as f:
+            f.write(b"x" * 1000)                # 明显截断
+
+        rc, rows2, _out2 = self._run({"name": "第2章讲义.pdf", "size": 100000})
+        self.assertEqual(rc, F.RC_OK)
+        row = [r for r in rows2 if r.get("name") == "第2章讲义.pdf"][0]
+        self.assertNotEqual(row["status"], "exists",
+                            "截断文件不能被清单当成已存在")
+        self.assertEqual(row["status"], "plan")
+
+
+class TestMainScanFailure(Base):
+    """★ 最关键的一条：扫描失败不能让程序 exit 0。
+
+    场景：一个 page 活动的详情接口连着失败，正文里其实挂着 5 个 PDF。
+    以前的结果是「打印一行详情失败 → continue → 最后 fail=0、exit 0」，
+    资源没被发现被当成了「这门课没有资源」。
+    """
+
+    ACTS = [{"id": 5, "type": "page", "title": "第1章 绪论", "uploads": None}]
+
+    def _run(self, page_result, tail):
+        return run_main(self.tmp, MainOpener(self.ACTS, details={5: page_result}),
+                        tail)
+
+    def test_dry_run_transient_scan_error_exits_partial(self):
+        rc, out = self._run(http_err(500), ["--dry-run"])
+        self.assertEqual(rc, F.RC_PARTIAL,
+                         "扫描阶段出错必须让退出码非 0")
+        self.assertIn("fail=1", out)
+        self.assertIn("扫描阶段", out)
+
+    def test_dry_run_timeout_scan_error_exits_partial(self):
+        rc, out = self._run(socket.timeout("timed out"), ["--dry-run"])
+        self.assertEqual(rc, F.RC_PARTIAL)
+        self.assertIn("fail=1", out)
+
+    def test_dry_run_401_scan_error_exits_partial_with_hint(self):
+        rc, out = self._run(http_err(401), ["--dry-run"])
+        self.assertEqual(rc, F.RC_PARTIAL)
+        self.assertIn("重新登录", out, "401 要给出重新登录的提示")
+
+    def test_dry_run_404_scan_error_is_na(self):
+        """404 是平台确实没给 —— 记一笔 N/A，但不算失败。"""
+        rc, out = self._run(http_err(404), ["--dry-run"])
+        self.assertEqual(rc, F.RC_OK, "404 不该让退出码变非 0")
+        self.assertIn("扫描阶段", out)
+        self.assertIn("N/A", out)
+        self.assertIn("fail=0", out)
+
+    def test_scan_error_lands_in_manifest(self):
+        """扫描失败必须写进 manifest，否则事后无从核对。"""
+        mf = os.path.join(self.tmp, "m.csv")
+        rc, _out = self._run(http_err(500), ["--dry-run", "--manifest", mf])
+        self.assertEqual(rc, F.RC_PARTIAL)
+        with open(mf, encoding="utf-8-sig") as f:
+            body = f.read()
+        self.assertIn("fail", body)
+        self.assertIn("transient", body, "CSV 必须带上 err_kind")
+        self.assertIn("page_detail", body, "CSV 必须带上出错的阶段")
+
+        mj = os.path.join(self.tmp, "m.json")
+        rc, _out = self._run(http_err(500),
+                             ["--dry-run", "--manifest", mj])
+        self.assertEqual(rc, F.RC_PARTIAL)
+        with open(mj, encoding="utf-8") as f:
+            rows = json.load(f)["files"]
+        self.assertEqual(rows[0]["status"], "fail")
+        self.assertEqual(rows[0]["err_kind"], F.ERR_TRANSIENT)
+        self.assertEqual(rows[0]["stage"], "page_detail")
+
+    def test_scan_ok_still_exits_zero(self):
+        """回归保护：详情正常时不能凭空报失败。"""
+        detail = {"data": {"content": '<a href="/api/uploads/8811">'}}
+        rc, out = self._run(detail, ["--dry-run"])
+        self.assertEqual(rc, F.RC_OK, out)
+        self.assertNotIn("扫描阶段", out)
+
+
+class TestCompleteTolerance(Base):
+    """下载判据与增量判据必须一致 —— 回放允许 8% 自然短读。
+
+    回归背景：`lms_live.download()` 认定 944000/1000000 是成功，
+    但下一轮 `already_complete()` 要求严格相等，又把它判成要重下 ——
+    同一个文件在两套判据下反复横跳。
+    """
+
+    def _file(self, n):
+        p = os.path.join(self.tmp, "f.bin")
+        with open(p, "wb") as f:
+            f.write(b"x" * n)
+        return p
+
+    def test_attachment_needs_exact_size(self):
+        """普通附件仍然是严格判等 —— 不能给 PDF 放 8% 容差。"""
+        p = self._file(944)
+        ok, local, exp = F.already_complete(p, 1000)
+        self.assertFalse(ok, "普通附件 944/1000 必须判为不完整")
+        self.assertEqual(local, 944)
+        self.assertEqual(exp, 1000)
+
+    def test_replay_tolerates_short_read(self):
+        """回放 944/1000 少 5.6%，落在 SHORT_TOLERANCE 内 → 算完整。"""
+        import lms_live
+        p = self._file(944)
+        ok, _local, _exp = F.already_complete(
+            p, 1000, tolerance=lms_live.SHORT_TOLERANCE)
+        self.assertTrue(ok)
+
+    def test_replay_beyond_tolerance_is_incomplete(self):
+        import lms_live
+        p = self._file(800)
+        ok, _local, _exp = F.already_complete(
+            p, 1000, tolerance=lms_live.SHORT_TOLERANCE)
+        self.assertFalse(ok, "少 20% 超出容差，必须重下")
+
+    def test_local_larger_than_expected_is_incomplete(self):
+        """比声明还大 → 不完整，无论容差多少。"""
+        import lms_live
+        p = self._file(1200)
+        for tol in (0.0, lms_live.SHORT_TOLERANCE, 5.0):
+            ok, _l, _e = F.already_complete(p, 1000, tolerance=tol)
+            self.assertFalse(ok, "tolerance=%s 时不该判为完整" % tol)
+
+    def test_tolerance_boundary_value(self):
+        """正好等于容差 → 完整（与 lms_live 的 `<` 判定保持方向一致）。"""
+        import lms_live
+        boundary = int(1000 * (1 - lms_live.SHORT_TOLERANCE))
+        p = self._file(boundary)
+        ok, _l, _e = F.already_complete(
+            p, 1000, tolerance=lms_live.SHORT_TOLERANCE)
+        self.assertTrue(ok)
+        ok2, _l2, _e2 = F.already_complete(
+            self._file(boundary - 1), 1000,
+            tolerance=lms_live.SHORT_TOLERANCE)
+        self.assertFalse(ok2)
+
+    def test_complete_tolerance_per_kind(self):
+        """每个 kind 的容差取值：回放跟 lms_live 一致，其余为 0。"""
+        import lms_live
+        self.assertEqual(F.complete_tolerance("回放"),
+                         lms_live.SHORT_TOLERANCE)
+        for kind in ("课件", "作业", "录像"):
+            self.assertEqual(F.complete_tolerance(kind), 0.0)
+
+    def test_bad_tolerance_falls_back_to_zero(self):
+        p = self._file(999)
+        ok, _l, _e = F.already_complete(p, 1000, tolerance="junk")
+        self.assertFalse(ok)
+
+    def test_getsize_oserror_under_replay_tolerance(self):
+        """回放分支（带容差）同样不能被 OSError 带着走向「已完成」。"""
+        import unittest.mock as mock
+        import lms_live
+        p = self._file(999)
+        with mock.patch("os.path.getsize", side_effect=OSError(121, "semaphore")):
+            ok, local, exp = F.already_complete(
+                p, 1000, tolerance=lms_live.SHORT_TOLERANCE)
+        self.assertFalse(ok)
+        self.assertEqual(local, 0)
+        self.assertEqual(exp, 1000)
+
+
+class TestSevenZipCollision(Base):
+    """`.7z` 撞路径时不能把扩展名改坏。
+
+    回归背景：`split_ext()` 要求扩展名以字母开头，`.7z` 不满足，
+    于是 `Project 2.7z` 被整体当成主干，冲突改名得到 `Project 2.7z~123`：
+    扩展名坏了、`is_project_pkg()` 认不出项目包、`dest_for()` 从 项目/
+    掉回 作业/。
+    """
+
+    def test_split_ext_recognizes_7z(self):
+        self.assertEqual(F.split_ext("Project 2.7z"), ("Project 2", ".7z"))
+        self.assertEqual(F.split_ext("a.rar"), ("a", ".rar"))
+
+    def test_split_ext_still_rejects_version_tails(self):
+        """修复不能过度：`第1.2节讲义` / `3.5 英寸` 仍不该被切。"""
+        self.assertEqual(F.split_ext("第1.2节讲义"), ("第1.2节讲义", ""))
+        self.assertEqual(F.split_ext("报告 v1.0"), ("报告 v1.0", ""))
+
+    def test_two_project_archives_keep_ext_and_dir(self):
+        """★ 核心回归：两个同名 `Project 2.7z` 都要保住 .7z 和 项目/。"""
+        args = FakeArgs(split_projects=True)
+        items = [
+            {"kind": "作业", "activity": "大作业", "name": "Project 2.7z",
+             "uid": 101, "size": 10},
+            {"kind": "作业", "activity": "大作业", "name": "Project 2.7z",
+             "uid": 102, "size": 10},
+        ]
+        got, n = F.resolve_collisions(items, args)
+        self.assertEqual(n, 1)
+        names = [it["name"] for it in got]
+        self.assertEqual(len(set(names)), 2, "两个条目必须是两个不同文件名")
+        for nm in names:
+            self.assertTrue(nm.endswith(".7z"), "扩展名被改坏了: %r" % nm)
+            self.assertTrue(F.is_project_pkg(nm),
+                            "改名后认不出是项目包: %r" % nm)
+            d = F.dest_for("作业", "大作业", nm, args)
+            self.assertEqual(d, os.path.join("OUT", "项目", "大作业"),
+                             "改名后落盘目录变了: %r" % d)
+
+    def test_exact_expected_name(self):
+        items = [
+            {"kind": "作业", "activity": "A", "name": "Project 2.7z", "uid": 1},
+            {"kind": "作业", "activity": "A", "name": "Project 2.7z", "uid": 123},
+        ]
+        got, _n = F.resolve_collisions(items, FakeArgs(split_projects=True))
+        self.assertEqual(got[0]["name"], "Project 2.7z")
+        self.assertEqual(got[1]["name"], "Project 2~123.7z")
+
+    def test_other_archive_exts_survive(self):
+        """顺带确认几种常见扩展名在改名后都还在。"""
+        for nm, uid, tail in (("a.zip", 7, ".zip"), ("b.rar", 8, ".rar"),
+                              ("c.pdf", 9, ".pdf"), ("d.pptx", 10, ".pptx"),
+                              ("e.docx", 11, ".docx"), ("f.mp4", 12, ".mp4")):
+            items = [{"kind": "课件", "activity": "A", "name": nm, "uid": 1},
+                     {"kind": "课件", "activity": "A", "name": nm, "uid": uid}]
+            got, _n = F.resolve_collisions(items, FakeArgs())
+            self.assertTrue(got[1]["name"].endswith(tail),
+                            "%s 改名后丢了扩展名: %r" % (nm, got[1]["name"]))
 
 
 if __name__ == "__main__":
