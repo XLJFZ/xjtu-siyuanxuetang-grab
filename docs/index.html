@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>xjtu-siyuanxuetang-grab</title>
-<meta name="description" content="把西安交大思源学堂 2.0 任意课程的课件、作业一次性拉到本地。">
+<meta name="description" content="把西安交大思源学堂 2.0 任意课程的课件、作业、课堂录像一次性拉到本地。">
 <style>
 :root {
   --bg: #fff;
@@ -231,12 +231,12 @@ footer a { color: var(--fg-2); }
 <div class="wrap">
 
   <div class="hero">
-    <h1>把整门课的课件和作业<br>一次性拉到本地</h1>
-    <p>西安交大思源学堂 2.0 任意课程，自动走完登录、列清单、下载、按章归类。</p>
+    <h1>把整门课的课件、作业和录像<br>一次性拉到本地</h1>
+    <p>西安交大思源学堂 2.0 任意课程，自动走完登录、列清单、下载、按章归类。课堂录像与直播回放一并支持。</p>
     <div class="meta">
       <span>Python 3.8+</span><span class="dot"></span>
       <span>MIT</span><span class="dot"></span>
-      <span>实测 58 个文件 / 530 MB / 0 失败</span>
+      <span>断点续传 · 双机位回放</span>
     </div>
     <div class="acts">
       <a class="btn p" href="https://github.com/XLJFZ/xjtu-siyuanxuetang-grab/releases/latest">下载</a>
@@ -256,7 +256,23 @@ python scripts/lms_login.py --course &lt;课程ID&gt;
 
 python scripts/lms_fetch.py --course &lt;课程ID&gt; --out "./CV" --dry-run
 python scripts/lms_fetch.py --course &lt;课程ID&gt; --out "./CV"</code></pre>
-        <p style="margin-top:20px">加 <code>--organize</code> 就按章分好文件夹。</p>
+        <p style="margin-top:20px">加 <code>--organize</code> 就按章分好文件夹。录像动辄几百 MB，只要讲义就加 <code>--no-video</code>。</p>
+      </div>
+
+      <div class="sec">
+        <h2>录像有两种</h2>
+        <p>名字里都带「视频」，但承载方式完全不同，脚本两类都能下。</p>
+        <div class="paths">
+          <div>
+            <span class="who">课堂录像 · online_video</span>
+            <code>就是普通附件，和课件同一个端点，几十 MB</code>
+          </div>
+          <div>
+            <span class="who">直播回放 · lecture_live</span>
+            <code>独立流媒体系统，单节 350–440 MB，支持断点续传与双机位</code>
+          </div>
+        </div>
+        <p style="margin-top:18px">回放默认只下「屏幕录制」机位；加 <code>--all-cameras</code> 连教师机位一起下。</p>
       </div>
 
       <div class="sec">
@@ -274,6 +290,14 @@ python scripts/lms_fetch.py --course &lt;课程ID&gt; --out "./CV"</code></pre>
             <b>能下别的学校吗？</b>
             <span>可以。用 <code>--base</code> 指向任意 TronClass 平台。</span>
           </div>
+          <div class="q">
+            <b>回放下载中途报错怎么办？</b>
+            <span>直接重跑，从断点继续。回放限流返回的 <code>403</code> 会被自动识别成限流并退避重试，不是登录态过期。</span>
+          </div>
+          <div class="q">
+            <b>同一天上了好几节课，会覆盖吗？</b>
+            <span>不会。文件名带本地时间戳，同名的多节课会各自留存。</span>
+          </div>
         </div>
       </div>
     </div>
@@ -286,12 +310,14 @@ python scripts/lms_fetch.py --course &lt;课程ID&gt; --out "./CV"</code></pre>
           <div class="feat"><b>自动重试</b><span>超时和 5xx 退避重试</span></div>
           <div class="feat"><b>按章归类</b><span>认得出六种章号写法</span></div>
           <div class="feat"><b>可换学校</b><span>指向任意 TronClass 平台</span></div>
+          <div class="feat"><b>课件·作业·录像·回放</b><span>四类自动分流到各自目录</span></div>
+          <div class="feat"><b>多机位命名</b><span>带本地时间戳，同名课程不会互相覆盖</span></div>
         </div>
       </div>
 
       <div class="sec">
         <h2>装成 Skill</h2>
-        <p>把文件夹放进对应目录，之后直接跟 AI 说「帮我把这门课的资料下载下来」就行。</p>
+        <p>把文件夹放进对应目录，之后直接跟 AI 说「帮我把这门课的课件和录像都下载下来」就行。</p>
         <div class="paths">
           <div><span class="who">WorkBuddy</span><code>~/.workbuddy/skills/xjtu-siyuanxuetang-grab/</code></div>
           <div><span class="who">Claude Code</span><code>~/.claude/skills/xjtu-siyuanxuetang-grab/</code></div>
