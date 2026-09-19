@@ -9,11 +9,20 @@
 支持 AI Skill、Prompt 与独立 Python 脚本三种使用方式，**推荐装成 Skill**——
 装好后一句自然语言即可跑完整个流程。
 
+`xjtu-lms-grab` Skill · WorkBuddy / Claude Code / Codex · 说「下载这门课的课件」即可触发
+
 [![CI](https://github.com/XLJFZ/xjtu-siyuanxuetang-grab/actions/workflows/ci.yml/badge.svg)](https://github.com/XLJFZ/xjtu-siyuanxuetang-grab/actions/workflows/ci.yml)
 ![Python](https://img.shields.io/badge/python-3.8%2B-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
 </div>
+
+---
+
+> **这是一个 AI Skill。** 仓库根目录的 `SKILL.md` 就是入口——把整个文件夹放进助手的
+> skills 目录即可，之后对助手说一句话就能跑完「登录 → 列清单 → 下载 → 归类」。
+> 装好后先跑一次 `python scripts/lms_selfcheck.py --course <课程ID>` 确认环境。
+> 不想装 Skill 也有 Prompt 与命令行两条替代路径，见下方[「装成 Skill」](#装成-skill推荐用法)。
 
 ---
 
@@ -149,6 +158,56 @@ macOS / Linux: ~/.<助手目录>/skills/xjtu-siyuanxuetang-grab/
 > `SKILL.md` 里已经写明使用边界（仅访问当前账号有权访问的课程、不并发、不重试权限错误），
 > 所以装成 Skill 后**不会绕过这些约束**。
 
+### 装好后先自检一次
+
+拿到课程 ID 后，**第一次使用前先跑一次自检**。它把「环境没装好」和
+「平台没给权限」这两类问题分开了——不然后者常常伪装成前者，反之亦然。
+
+```bash
+python scripts/lms_selfcheck.py --course <课程ID>
+```
+
+默认**只做离线检查**，不碰服务端：
+
+| 检查项 | 说明 |
+|---|---|
+| Python 版本 | 是否满足 3.8+ |
+| 脚本完整性 | 4 个核心脚本是否齐全、能否真的 import 进来 |
+| playwright | 未安装只报**警告**——它只影响登录那一步 |
+| 浏览器 | 自动探测 Edge / Chrome，找不到会提示三种解决方式 |
+| 缓存目录 | 登录态存放位置是否可写 |
+| 登录态 | 是否存在、是不是一份形状合法的 storage_state |
+| 浏览器 profile | 是否已生成（第二次免登录的关键） |
+
+加 `--online` 才会额外打一次接口，确认登录态在服务端仍然有效。
+
+输出按 `✓ 通过` / `! 警告` / `✗ 失败` 分三级，**每个不正常项都直接给出可复制的修复命令**：
+
+```text
+==========================================================
+  自检结果
+==========================================================
+  ✓ Python 版本                    3.13.14
+  ✓ 脚本完整性                      4 个核心脚本齐全且可导入
+  ! playwright                     未安装（仅影响登录这一步）
+  ✓ 浏览器                          msedge.exe
+  ✓ 缓存目录                        ~/.lms-grab
+  ! 登录态                          还没有 state_<课程ID>.json
+
+  需要处理:
+    - playwright: pip install playwright
+    - 登录态: python scripts/lms_login.py --course <课程ID>
+
+  4 项通过 / 2 项警告 / 0 项失败
+  结论: 核心可用，警告项按需处理。
+```
+
+退出码 `0` 表示没有失败项，`1` 表示有——可以串进脚本或 CI。
+**看到 `✗` 就先修完再往下走**，否则登录/下载阶段的报错会指向错误的方向。
+
+> 登录态检查能区分五种情况：文件不存在 / 文件损坏 / `cookies` 为空（登录流程没走完）/
+> cookie 域不匹配 / 正常。这几种的修法不同，所以不合并成一句「登录态有问题」。
+
 ### 不想装 Skill 的两种替代
 
 | 方式 | 做法 | 适合 |
@@ -165,15 +224,21 @@ macOS / Linux: ~/.<助手目录>/skills/xjtu-siyuanxuetang-grab/
 # 1. 装依赖（只有登录脚本需要 playwright）
 pip install playwright
 
-# 2. 登录一次（弹浏览器，手动过统一身份认证，登录态落盘）
+# 2. 自检一次，确认环境没问题（默认离线，不碰服务端）
+python scripts/lms_selfcheck.py --course <课程ID>
+
+# 3. 登录一次（弹浏览器，手动过统一身份认证，登录态落盘）
 python scripts/lms_login.py --course <课程ID>
 
-# 3. 干跑，先看清单再决定
+# 4. 干跑，先看清单再决定
 python scripts/lms_fetch.py --course <课程ID> --out "./课程资料" --dry-run
 
-# 4. 正式下载（幂等，可反复跑做增量补件）
+# 5. 正式下载（幂等，可反复跑做增量补件）
 python scripts/lms_fetch.py --course <课程ID> --out "./课程资料"
 ```
+
+第 2 步不是可选项。它把「环境没装好」和「平台没给权限」区分开——
+跳过它的话，这两类问题的报错会互相伪装，排查很费时间。
 
 **想要开箱就是分好章的结构？** 加个 `--organize`：
 
@@ -246,12 +311,14 @@ python scripts/lms_fetch.py --course <课程ID> --out "./课程资料" --no-vide
 | `SKILL.md` | Skill 正文：流程、资源类型、注意事项 |
 | `prompt.md` | 可直接贴进对话的 Prompt，改掉两处 `【】` 即可 |
 | `scripts/lms_common.py` | 公共配置——**唯一**含机器相关逻辑的文件 |
+| `scripts/lms_selfcheck.py` | 安装后自检：环境 / 依赖 / 浏览器 / 登录态形状 |
 | `scripts/lms_login.py` | 登录：Playwright 持久化 profile，登录态落盘 JSON |
 | `scripts/lms_fetch.py` | 下载主体：列清单 / 下载 / 归类，支持续传、重试、干跑与增量 |
 | `scripts/lms_organize.py` | 章节解析：中文数字转换、多写法匹配、假章号排除 |
 | `scripts/lms_live.py` | 直播回放下载：串行请求、按响应长度校正偏移 |
 | `tests/test_organize.py` | 章节解析离线自测，22 个用例 |
 | `tests/test_fetch.py` | 下载逻辑离线自测，64 个用例（用假 opener 模拟服务端） |
+| `tests/test_selfcheck.py` | 自检逻辑离线自测，20 个用例 |
 | `ci.yml.txt` | CI 配置，用 `enable-ci.bat` 启用 |
 | `release.yml.txt` | 打 tag 自动发版的 Actions 配置 |
 | `pack.py.txt` | Release 工作流用的打包脚本 |
@@ -326,19 +393,20 @@ python scripts/lms_fetch.py --course <课程ID> --out "./课程资料" --no-vide
 ```bash
 python tests/test_organize.py     # 22 个用例
 python tests/test_fetch.py        # 64 个用例
+python tests/test_selfcheck.py    # 20 个用例
 ```
 
 | 文件 | 覆盖 |
 |---|---|
 | `test_organize.py` | 中文数字转换、括号剥离、六种章节写法、假章号排除、目录名去重、目录名不带扩展名 |
 | `test_fetch.py` | 下载成功/重试/403 不重试/5xx 重试/空响应/HTML 响应/sha256 不符/etag 不符、断点续传四场景、文件名安全、归类路径、清单导出、多来源计数、回放短读判定 |
+| `test_selfcheck.py` | 登录态五种状态判定、检查级别（警告 vs 失败）、退出码、默认不联网、自检清单与 `scripts/` 实际文件一致 |
 
 `test_fetch.py` 用假 opener 脚本化服务端行为，所以能测「第一次超时第二次成功」这类
 真实环境里很难复现的路径。
 
 CI 在 push / PR 时自动跑三平台 × 三个 Python 版本，外加一步隐私自检——
 确认仓库里没有误提交登录态、脚本里没有残留本机绝对路径。
-
 ### 启用 CI（可选）
 
 **先说结论：不启用也完全能用。** 发布走本地方案（见下）就够了，
@@ -410,7 +478,7 @@ python release.py --version 1.1.0 --title "下载可靠性" --yes       # 正式
 1. **版本号自检** —— tag 已存在就报错退出。已发布的版本内容不可变，要改就发新版本号。
    （这条是踩过坑换来的：v1.0.0 曾被原地覆盖过。）
 2. **包体校验** —— 上传前解压到临时目录，确认关键文件齐全、没混进登录态、
-   离线测试能过（两个测试文件，共 86 个用例；用例数由测试自己报出，并与
+   离线测试能过（三个测试文件，共 106 个用例；用例数由测试自己报出，并与
    静态扫描的 `def test_` 数量交叉核对，对不上就告警）。校验不过就不发。
 3. **打包白名单** —— 用 `INCLUDE` 显式列出该打进去的东西，新文件必须手动加；
    另有体积上限兜底，防止课程资料误入。
@@ -478,6 +546,7 @@ git tag v1.1.0 && git push origin v1.1.0
 
 | 版本 | 变更 |
 |---|---|
+| v1.3.0 | 新增 `scripts/lms_selfcheck.py` 安装后自检（环境 / 依赖 / 浏览器 / 登录态形状，默认离线，`--online` 可选探测登录态）；登录态判定抽成 `lms_common.describe_state()`，区分「文件不存在 / 损坏 / cookies 为空 / 域不匹配 / 正常」五种状态；离线测试扩到 106 个（新增 `tests/test_selfcheck.py` 20 个）；`release.py` 包体校验与 `ci.yml.txt` / `release.yml.txt` 同步到三个测试文件；README 顶部补 Skill 定位说明（仓库元数据端点需 `Administration` 权限，改不了 topics，改在 README 第一屏） |
 | v1.2.1 | 修 `collect()` 的来源②计数（原先用总数相减，把直播回放误算成「正文内嵌」）；`release.py` 包体校验改为上报测试实际执行的用例数并与静态扫描交叉核对；抽取 `download()` 中重复四次的失败处理块；回放下载新增短读判定（对比 `Content-Length`，超阈值告警并写入清单）；README 用例数与文件清单同步 |
 | v1.2.0 | 直播回放下载（`lms_live.py`）；修同一天多个 `lecture_live` 活动 title 相同导致回放互相覆盖的丢数据 bug（文件名加入本地时间戳与机位）；离线测试扩到 79 个 |
 | v1.1.0 | 下载可靠性：断点续传、自动重试、sha256 校验、etag 交叉验证、登录态探测、进度条、`--list-only` / `--manifest`、语义化退出码；修长文件名丢扩展名；测试扩到 60 个 |
