@@ -101,12 +101,42 @@ with urllib.request.urlopen(req, timeout=30) as r:
 
 第一次请求可能拿到 CDN 缓存的**旧版本**，重试一两次即可。
 
-也可以用 API 查构建状态（需要 token）：
+想确认部署时间，看响应头比看内容更直接：
 
 ```bash
-GET /repos/XLJFZ/xjtu-siyuanxuetang-grab/pages         # status: built
-GET /repos/XLJFZ/xjtu-siyuanxuetang-grab/pages/builds  # 逐条构建记录
+curl -sI https://xljfz.github.io/xjtu-siyuanxuetang-grab/
+# Last-Modified 应晚于你最后一次 commit 的时间
 ```
+
+#### ⚠️ 构建历史里的 `errored` 多半是假警报
+
+用 API 查构建记录时，会看到这种输出：
+
+```
+a1bdaf10  building  2026-09-19T13:39:27
+c8ca2765  errored   2026-09-19T13:39:22
+e2d1677e  errored   2026-09-19T13:39:18
+```
+
+**连推多个 commit 时，前面几条必然是 `errored`——这是正常现象，不是部署失败。**
+
+原因：Pages 同时只跑一个构建。新 commit 一进来，正在跑的那次会被中止，
+记录上就落成 `errored`。它**不代表内容有问题**，只代表"这次构建被后来的取代了"。
+GitHub 不会特意标注"被取代"，所以看起来像失败。
+
+判断真实状态看这三条，不用纠结历史记录：
+
+| 看什么 | 期望值 |
+|---|---|
+| 响应头 `Last-Modified` | 晚于最后一次 commit 时间 |
+| 线上文件 sha256 | 与本地逐字节一致 |
+| 最后一条构建记录 | 最终变成 `built` |
+
+**别被 `errored` 牵着去排查内容**——先比对 sha256，一致就说明已经生效了。
+
+> 附注：查 Pages 配置的 `GET /repos/<owner>/<repo>/pages` 有时会返回 **404**，
+> 哪怕站点实际在正常运行。这是 token 权限范围的问题（该端点需要 `Pages` 读权限），
+> 不是"站点被删了"。**以线上实测为准，不要以这个端点为准。**
 
 ### 页面布局的注意事项
 
@@ -226,6 +256,7 @@ token 就必须先经过 AI 的上下文；而且明文文件对同机器任何�
 | 文件 | 用途 |
 |---|---|
 | `docs/index.html` | 文档站页面，改它就够了 |
+| `docs/MAINTAINING.md` | 本文件，站点的维护说明 |
 | `push_docs.py` | 推 `docs/` 到 GitHub（在维护者工作区里） |
 | `release.py` | 发版本：版本号自检 → 打包 → 校验 → tag → Release → 附件 |
 | `ci.yml.txt` / `release.yml.txt` | CI 配置，用 `enable-ci.bat` 还原启用 |
