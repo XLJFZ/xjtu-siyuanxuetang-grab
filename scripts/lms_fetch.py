@@ -1,21 +1,21 @@
 # -*- coding: utf-8 -*-
 """
-思源学堂 2.0 (TronClass) —— 批量下载课程附件（课件 + 作业 + 项目压缩包 + 录像）
+思源学堂 2.0 —— 批量下载课程附件（课件 + 作业 + 项目压缩包 + 录像）
 
-附件有三类来源，只看 uploads 字段会漏掉一大半:
-  ① 活动 JSON 的 uploads 数组（含 online_video 类型的课堂录像）
-  ② page 类型活动正文 data.content 里内嵌的 /api/uploads/<id>   ← 课件 PDF 全在这里
-  ③ lecture_live 类型活动的回放（走 rms-v5 另一套域名，见下）
+只处理当前账号有权访问的课程资源。
 
-下载端点: GET /api/uploads/<id>/blob     元信息: GET /api/uploads/<id>
+附件有三类来源，只看附件字段会漏掉一大半:
+  ① 活动数据里的附件数组（含 online_video 类型的课堂录像）
+  ② page 类型活动正文里内嵌的附件链接          ← 课件 PDF 全在这里
+  ③ lecture_live 类型活动的回放（走校外录播系统，见下）
 
 用法:
-    python lms_fetch.py --course 33593 --out "./CV" --dry-run
-    python lms_fetch.py --course 33593 --out "./CV"
-    python lms_fetch.py --course 33593 --out ./CV --organize
-    python lms_fetch.py --course 33593 --out ./CV --list-only manifest.json
-    python lms_fetch.py --course 33593 --out ./CV --exclude "2020|2021|2022"
-    python lms_fetch.py --course 33593 --out ./CV --no-video        # 只要文档，不要录像
+    python lms_fetch.py --course <课程ID> --out "./课程资料" --dry-run
+    python lms_fetch.py --course <课程ID> --out "./课程资料"
+    python lms_fetch.py --course <课程ID> --out "./课程资料" --organize
+    python lms_fetch.py --course <课程ID> --out "./课程资料" --list-only manifest.json
+    python lms_fetch.py --course <课程ID> --out "./课程资料" --exclude "2020|2021|2022"
+    python lms_fetch.py --course <课程ID> --out "./课程资料" --no-video   # 只要文档，不要录像
 
 目录结构（默认 activity 布局）:
     <out>/{课件,作业,录像}/<活动标题>/<文件名>
@@ -179,13 +179,13 @@ def collect(op, course, activities=None, want_video=True):
         课件   —— 讲义 / PDF / 附件
         作业   —— homework 类型活动带的文件
         录像   —— online_video 类型活动的课堂录像
-        回放   —— lecture_live 类型活动的直播回放（走 rms-v5，另一套端点）
+        回放   —— lecture_live 类型活动的直播回放（走校外录播系统，另一套端点）
 
-    前三类走相同的 uploads 机制（GET /api/uploads/<id>/blob），实测支持 Range，
+    前三类走相同的附件下载机制，平台支持分片请求，
     断点续传 / etag 校验原样可用。第四类要单独实现，详见 lms_live.py。
 
     第四类的 upload_id 位放的是「活动 id」，不是 upload id —— 它根本不是附件。
-    下载时按 kind 分流，不会走到 uploads 端点上去。
+    下载时按 kind 分流，不会走到附件端点上去。
 
     两个计数都是「进 plan 的去重增量」，来源③（回放）不计入其中，
     想拿回放条数请按 kind == "回放" 数。用 len(keys) 相减推来源②会把回放算进去。
@@ -283,9 +283,8 @@ def dest_for(kind, act, name, args):
 def _etag_size(etag):
     """从 etag 里提取文件大小。
 
-    思源学堂的 etag 形如 `"698e9012-cb2ec"`，后半段是文件大小的十六进制
-    （0xcb2ec == 832236 == content-length）。可用作「文件是否变了」的判据。
-    解析不出来返回 None。
+    平台返回的 etag 形如 `"<hex>-<hex>"`，后半段是文件大小的十六进制。
+    可用作「文件是否变了」的判据。解析不出来返回 None。
     """
     if not etag:
         return None
@@ -674,9 +673,9 @@ def expand_items(op, keys, args):
         if not args.all_cameras:
             reps = [r for r in reps if r["camera_type"] == "encoder"] or reps[:1]
 
-        # ★ 同一天的多个 lecture_live 活动 title 完全相同（实测一门课 4 节
-        # 都叫「2026-09-19-计算机视觉与模式识别」），只靠 title 命名会互相
-        # 覆盖。start_time 是唯一能区分它们的字段（在活动详情顶层），必须进文件名。
+        # ★ 同一天的多个 lecture_live 活动 title 完全相同（实际遇到过标题
+        # 一致的多个活动），只靠 title 命名会互相覆盖。start_time 是唯一能
+        # 区分它们的字段（在活动详情顶层），必须进文件名。
         stamp = lms_live.start_stamp(d)
 
         for r in reps:
