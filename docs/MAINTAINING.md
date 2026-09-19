@@ -338,9 +338,14 @@ token 就必须先经过 AI 的上下文；而且明文文件对同机器任何�
 **`.github/workflows/` 下的文件例外**（2026-09-19 起 workflow 已直接放进仓库）：
 推它们需要 **`Workflows: write`** 权限，只有 `Contents: write` 时 Contents API
 会 403。`gh_push_dir.py` 遇到这种情况会**跳过这些文件并明确列出剩余清单**（退出码 0），
-此时在网页端 *Add file → Upload files* 手动上传
-`.github/workflows/ci.yml`、`.github/workflows/release.yml`、`.github/scripts/pack.py`
-即可；或者换带 workflows 权限的 token。日常改代码不需要每次都推 workflows 文件。
+此时在网页端 *Add file → Upload files* 手动上传，或换带 workflows 权限的 token。
+日常改代码不需要每次都推 workflows 文件。
+
+> **细粒度 token 编辑权限后，token 字符串不变。** 实测（2026-09-20）：
+> 给已有 token 在网页上补勾「Workflows → 读取和写入」并保存后，
+> **原 token 直接就能推 `.github/workflows/`**，不需要重新生成、不需要换字符串。
+> 2026-09-20 用这个方式把 `ci.yml` / `release.yml` 推上了远端。
+> （注意「选择账户权限」页面全是账户级权限，与推代码无关，别在那里勾。）
 
 > **`Administration` 不需要，但也「改不了」。** 实测（2026-09-19）：
 > 用只有 `Contents: write` 的细粒度 token 调仓库元数据端点，
@@ -352,6 +357,47 @@ token 就必须先经过 AI 的上下文；而且明文文件对同机器任何�
 > 不要试图用脚本推——推代码的 token 天然没有这个权限。
 > 想「让 Skill 定位更显眼」时，唯一可脚本化的位置是 **README 第一屏**
 > （GitHub 会把 README 渲染在文件列表上方，效果接近 About 区域）。
+
+---
+
+## GitHub Actions 的实测坑（2026-09-20 首跑后整理）
+
+CI 于 2026-09-20 首次真实运行，当前状态：**全绿 10/10**（3 平台 × 3 Python + 隐私自检）。
+以下是首跑踩出来的，改 workflow 或脚本输出前先读：
+
+### 坑一：Windows runner 的 stdout 是 cp1252，中文输出会崩
+
+GitHub 的 `windows-latest` runner 终端编码是 **cp1252**，脚本 `--help` 输出中文
+（argparse 的 help 文本就是中文）会抛 `UnicodeEncodeError`，表现为
+「Check CLI help works」一步挂掉——且只有 Windows 挂，mac / ubuntu 全绿，
+三个 Python 版本全挂，非常有迷惑性。本地复现不了是因为开发终端是 GBK 且
+调试时常设 `PYTHONIOENCODING=utf-8`。
+
+修复在两处，**都别删**：
+
+1. `scripts/lms_common.py` 顶层对 `stdout` / `stderr` 做
+   `reconfigure(errors="replace")`——编码错误降级为替换符而不是崩溃，
+   不改编码本身（本地 GBK 终端显示不受影响）。
+2. `ci.yml` 的 test job 与 `release.yml` 的 verify job 设
+   `env: PYTHONIOENCODING: utf-8` + `PYTHONUTF8: "1"`。
+
+新脚本只要 import 了 `lms_common` 就自动受保护；**不经过 lms_common 的脚本**
+（如 CI 用的 `.github/scripts/pack.py`）要么避免中文输出，要么自己加同样的防护。
+
+### 坑二：`gh_push_dir.py` 只增改、不删除
+
+它对每个文件做 GET → PUT，**不会删除远端已有文件**。本地删掉的文件
+（如 v1.4.0 删掉的 `ci.yml.txt` 等四个模板）会一直残留在远端 main 上。
+清理方式：`DELETE /repos/<o>/<r>/contents/<path>`，body 带
+`{"sha": <该文件当前sha>, "branch": "main"}`。删除后记得复核远端根目录。
+
+### 坑三：CI 触发是按 commit 的
+
+`on: push: branches: [main]` 对**每个 commit** 都触发。`gh_push_dir.py`
+逐文件提交，推一批文件会产生多个 commit、多个 CI run——看到一排 run 别慌，
+**只看 head sha 对应（最新）那条的结论**，前面的中途 run 可以无视。
+另外 `release.yml` 靠「推 `v*` tag」触发，本机 git 推不了 tag，
+发版仍走 `release.py` 本地方案（方式 A）。
 
 ---
 
