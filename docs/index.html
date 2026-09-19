@@ -1,0 +1,195 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>xjtu-siyuanxuetang-grab</title>
+<meta name="description" content="把西安交大思源学堂 2.0 任意课程的课件、作业一次性拉到本地。">
+<style>
+:root {
+  --bg: #fff;
+  --bg-soft: #f7f8f9;
+  --fg: #16181d;
+  --fg-2: #5b6270;
+  --fg-3: #8d94a2;
+  --line: #e6e8ec;
+  --line-2: #d2d6dd;
+  --accent: #2f6fd0;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #131519;
+    --bg-soft: #1b1e23;
+    --fg: #e8eaee;
+    --fg-2: #a4abb8;
+    --fg-3: #6f7684;
+    --line: #292d34;
+    --line-2: #3b4049;
+    --accent: #6ea6f2;
+  }
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+               "Microsoft YaHei", "Helvetica Neue", Arial, sans-serif;
+  font-size: 15px;
+  line-height: 1.7;
+  -webkit-font-smoothing: antialiased;
+}
+code, pre {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; text-underline-offset: 3px; }
+
+.w { max-width: 660px; margin: 0 auto; padding: 0 24px; }
+
+/* ---- 首屏 ---- */
+.hero { padding: 72px 0 52px; }
+.hero h1 {
+  margin: 0 0 18px;
+  font-size: 30px;
+  font-weight: 600;
+  line-height: 1.4;
+  letter-spacing: -.5px;
+}
+.hero p {
+  margin: 0 0 28px;
+  font-size: 16px;
+  color: var(--fg-2);
+  max-width: 520px;
+}
+.hero .meta {
+  font-size: 13px;
+  color: var(--fg-3);
+  margin-bottom: 30px;
+}
+.acts { display: flex; gap: 10px; flex-wrap: wrap; }
+.btn {
+  display: inline-block;
+  padding: 9px 18px;
+  border-radius: 8px;
+  font-size: 14px;
+  border: 1px solid var(--line-2);
+  color: var(--fg);
+  transition: background .13s, border-color .13s;
+}
+.btn:hover { background: var(--bg-soft); text-decoration: none; border-color: var(--fg-3); }
+.btn.p {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+.btn.p:hover { filter: brightness(1.08); background: var(--accent); }
+
+/* ---- 板块 ---- */
+.sec { padding: 40px 0; border-top: 1px solid var(--line); }
+.sec h2 {
+  margin: 0 0 8px;
+  font-size: 16px;
+  font-weight: 600;
+}
+.sec > p { margin: 0 0 20px; color: var(--fg-2); font-size: 14px; }
+
+pre {
+  margin: 0;
+  background: var(--bg-soft);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 16px 18px;
+  overflow-x: auto;
+  font-size: 13px;
+  line-height: 1.75;
+}
+pre code { background: none; }
+.c { color: var(--fg-3); }
+p code, li code {
+  background: var(--bg-soft);
+  border: 1px solid var(--line);
+  padding: 1px 5px;
+  border-radius: 4px;
+  font-size: 13px;
+}
+
+/* ---- 特点 ---- */
+.feats { display: grid; grid-template-columns: 1fr 1fr; gap: 22px 28px; }
+.feat b { display: block; font-size: 14px; font-weight: 600; margin-bottom: 3px; }
+.feat span { font-size: 13.5px; color: var(--fg-2); }
+
+/* ---- 底 ---- */
+footer {
+  border-top: 1px solid var(--line);
+  padding: 28px 0 56px;
+  font-size: 13px;
+  color: var(--fg-3);
+}
+footer a { color: var(--fg-2); }
+
+@media (max-width: 560px) {
+  .w { padding: 0 20px; }
+  .hero { padding: 52px 0 40px; }
+  .hero h1 { font-size: 24px; }
+  .feats { grid-template-columns: 1fr; gap: 18px; }
+  .btn { flex: 1; text-align: center; }
+}
+</style>
+</head>
+<body>
+
+<div class="w">
+
+  <div class="hero">
+    <h1>把整门课的课件和作业<br>一次性拉到本地</h1>
+    <p>西安交大思源学堂 2.0 任意课程，自动走完登录、列清单、下载、按章归类。</p>
+    <div class="meta">Python 3.8+ &nbsp;·&nbsp; MIT &nbsp;·&nbsp; 实测 58 个文件 / 530 MB / 0 失败</div>
+    <div class="acts">
+      <a class="btn p" href="https://github.com/XLJFZ/xjtu-siyuanxuetang-grab/releases/latest">下载</a>
+      <a class="btn" href="https://github.com/XLJFZ/xjtu-siyuanxuetang-grab">GitHub</a>
+    </div>
+  </div>
+
+  <div class="sec">
+    <h2>用法</h2>
+    <p>三步。登录只需做一次，之后反复跑都会自动跳过已下载的文件。</p>
+<pre><code>pip install playwright
+
+python scripts/lms_login.py --course &lt;课程ID&gt;
+
+python scripts/lms_fetch.py --course &lt;课程ID&gt; --out "./CV" --dry-run
+python scripts/lms_fetch.py --course &lt;课程ID&gt; --out "./CV"</code></pre>
+    <p style="margin-top:16px;margin-bottom:0">加 <code>--organize</code> 就按章分好文件夹。</p>
+  </div>
+
+  <div class="sec">
+    <h2>特点</h2>
+    <div class="feats">
+      <div class="feat"><b>断点续传</b><span>中断了从断点继续，不重头下</span></div>
+      <div class="feat"><b>自动重试</b><span>超时和 5xx 退避重试</span></div>
+      <div class="feat"><b>按章归类</b><span>认得出六种章号写法</span></div>
+      <div class="feat"><b>可换学校</b><span>指向任意 TronClass 平台</span></div>
+    </div>
+  </div>
+
+  <div class="sec">
+    <h2>装成 Skill</h2>
+    <p>把文件夹放进对应目录，之后直接跟 AI 说「帮我把这门课的资料下载下来」就行。</p>
+<pre><code>~/.workbuddy/skills/xjtu-siyuanxuetang-grab/
+~/.claude/skills/xjtu-siyuanxuetang-grab/
+~/.codex/skills/xjtu-siyuanxuetang-grab/</code></pre>
+    <p style="margin-top:16px;margin-bottom:0">不装也能用，脚本是独立的命令行工具。</p>
+  </div>
+
+  <footer>
+    <a href="https://github.com/XLJFZ/xjtu-siyuanxuetang-grab#readme">完整文档</a>
+    &nbsp;·&nbsp;
+    <a href="https://github.com/XLJFZ/xjtu-siyuanxuetang-grab/releases">版本历史</a>
+    &nbsp;·&nbsp; MIT
+  </footer>
+
+</div>
+
+</body>
+</html>
