@@ -35,14 +35,27 @@ AI 就会自动走完「登录 → 干跑列清单 → 确认 → 下载 → 归
 
 ## 安装
 
-把 `xjtu-siyuanxuetang-grab` 文件夹放进 Skill 目录：
+`SKILL.md` 是通用的 Skill 格式，主流 AI 编程助手都认。把 `xjtu-siyuanxuetang-grab`
+文件夹放进对应助手的 skills 目录即可：
+
+| 工具 | 放入目录 |
+|---|---|
+| WorkBuddy | `~/.workbuddy/skills/xjtu-siyuanxuetang-grab/` |
+| Claude Code | `~/.claude/skills/xjtu-siyuanxuetang-grab/` |
+| Codex | `~/.codex/skills/xjtu-siyuanxuetang-grab/` |
+| 其他 | 该助手约定的 skills / prompts 目录 |
 
 ```
-Windows:      C:\Users\<你>\.workbuddy\skills\xjtu-siyuanxuetang-grab\
-macOS / Linux: ~/.workbuddy/skills/xjtu-siyuanxuetang-grab/
+Windows:       C:\Users\<你>\.<助手目录>\skills\xjtu-siyuanxuetang-grab\
+macOS / Linux: ~/.<助手目录>/skills/xjtu-siyuanxuetang-grab/
 ```
 
-> Skill 是本仓库所用 AI 助手（WorkBuddy / Claude Code 类工具）的扩展机制：目录下放一份 `SKILL.md`，助手在匹配到场景时会自动读取并执行。
+> Skill 是一层很薄的约定：目录下放一份 `SKILL.md`（YAML frontmatter + 正文），
+> 助手匹配到场景时自动读取并执行。任何支持这套约定的工具都能用。
+
+**不装 Skill 也能用。** 脚本是独立的命令行工具，不依赖任何助手——把仓库 clone 或解压到
+任意位置直接跑即可（用法见下方「快速开始」）。此时 `SKILL.md` 相当于一份操作手册；
+`prompt.md` 则是通用 Prompt，贴进任意对话式 AI 就能让它照着做，不需要它支持 Skill 机制。
 
 ## 快速开始
 
