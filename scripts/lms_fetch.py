@@ -1,10 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-思源学堂 2.0 (TronClass) —— 批量下载课程附件（课件 + 作业 + 项目压缩包）
+思源学堂 2.0 (TronClass) —— 批量下载课程附件（课件 + 作业 + 项目压缩包 + 录像）
 
-附件有两类来源，只看 uploads 字段会漏掉一大半:
-  ① 活动 JSON 的 uploads 数组
+附件有三类来源，只看 uploads 字段会漏掉一大半:
+  ① 活动 JSON 的 uploads 数组（含 online_video 类型的课堂录像）
   ② page 类型活动正文 data.content 里内嵌的 /api/uploads/<id>   ← 课件 PDF 全在这里
+  ③ lecture_live 类型活动的回放（走 rms-v5 另一套域名，见下）
 
 下载端点: GET /api/uploads/<id>/blob     元信息: GET /api/uploads/<id>
 
@@ -14,10 +15,11 @@
     python lms_fetch.py --course 33593 --out ./CV --organize
     python lms_fetch.py --course 33593 --out ./CV --list-only manifest.json
     python lms_fetch.py --course 33593 --out ./CV --exclude "2020|2021|2022"
+    python lms_fetch.py --course 33593 --out ./CV --no-video        # 只要文档，不要录像
 
 目录结构（默认 activity 布局）:
-    <out>/{课件,作业}/<活动标题>/<文件名>
-加 --organize 后自动按章归并:
+    <out>/{课件,作业,录像}/<活动标题>/<文件名>
+加 --organize 后文档部分自动按章归并（录像不受影响，仍按活动分目录）:
     <out>/课件/第01章 绪论/<文件名>
     <out>/课件/其他/<文件名>          ← 认不出章号的
 加 --split-projects 后 zip 项目包单独走:
@@ -41,6 +43,7 @@ from urllib.parse import urlparse, quote
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from lms_common import BASE, HOST, state_path
 from lms_organize import parse_chapter, chapter_dir
+import lms_live
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36 Edg/153.0.0.0")
@@ -169,8 +172,21 @@ def api_ok(op):
 
 # ---------------------------------------------------------------- 收集
 
-def collect(op, course, activities=None):
-    """返回 ([(kind, 活动标题, upload_id)], 来源①数量)"""
+def collect(op, course, activities=None, want_video=True):
+    """返回 ([(kind, 活动标题, upload_id)], 来源①数量)
+
+    kind 取值:
+        课件   —— 讲义 / PDF / 附件
+        作业   —— homework 类型活动带的文件
+        录像   —— online_video 类型活动的课堂录像
+        回放   —— lecture_live 类型活动的直播回放（走 rms-v5，另一套端点）
+
+    前三类走相同的 uploads 机制（GET /api/uploads/<id>/blob），实测支持 Range，
+    断点续传 / etag 校验原样可用。第四类要单独实现，详见 lms_live.py。
+
+    第四类的 upload_id 位放的是「活动 id」，不是 upload id —— 它根本不是附件。
+    下载时按 kind 分流，不会走到 uploads 端点上去。
+    """
     if activities is None:
         activities = get_json(op, "%s/api/courses/%s/activities?sub_course_id=0"
                               % (BASE, course))["activities"]
@@ -179,10 +195,24 @@ def collect(op, course, activities=None):
     def add(kind, act, uid):
         plan.setdefault((kind, safe(act), int(uid)), None)
 
+    def kind_of(a):
+        """按活动类型决定归属目录。online_video / lecture_live 各自单开一类。"""
+        t = a.get("type")
+        if t == "homework":
+            return "作业"
+        if t == "online_video":
+            return "录像" if want_video else None
+        if t == "lecture_live":
+            return "回放" if want_video else None
+        return "课件"
+
     # 来源 ①
     for a in activities:
+        k = kind_of(a)
+        if k is None:
+            continue
         for u in (a.get("uploads") or []):
-            add("作业" if a.get("type") == "homework" else "课件", a.get("title"), u["id"])
+            add(k, a.get("title"), u["id"])
     n1 = len(plan)
 
     # 来源 ②
@@ -197,6 +227,26 @@ def collect(op, course, activities=None):
         blob = json.dumps(d.get("data") or {}, ensure_ascii=False)
         for uid in set(re.findall(r"/api/uploads/(\d+)", blob)):
             add("课件", a.get("title"), uid)
+
+    # 来源 ③：lecture_live 回放。replay_videos 只在活动详情里有，列表接口拿不到。
+    if want_video:
+        lives = [x for x in activities if x.get("type") == "lecture_live"]
+        if lives:
+            print("  (回放: 扫了 %d 个 lecture_live 活动)" % len(lives))
+        for a in lives:
+            aid = a.get("id")
+            if not aid:
+                continue                        # 残缺数据，跳过而不是崩
+            try:
+                d = get_json(op, "%s/api/activities/%s?sub_course_id=0" % (BASE, aid))
+            except Exception as e:
+                print("  回放详情失败 %s: %s" % (aid, str(e)[:50]))
+                continue
+            reps = lms_live.parse_replay(d)
+            if not reps:
+                continue
+            # uid 用负数存活动 id —— 它不是 upload，走不了 uploads 端点
+            add("回放", a.get("title"), -(int(aid)))
     return sorted(plan.keys()), n1
 
 
@@ -211,7 +261,8 @@ def dest_for(kind, act, name, args):
     """决定落盘目录"""
     if args.split_projects and PROJ_HINT.search(name) and name.lower().endswith(".zip"):
         return os.path.join(args.out, "项目", act)
-    if args.organize:
+    # 录像与回放不参与按章归并：标题基本认不出章号，套下来只会全进「其他」
+    if args.organize and kind not in ("录像", "回放"):
         ch = parse_chapter(act, name)
         if ch is None:
             return os.path.join(args.out, kind, "其他")
@@ -418,6 +469,10 @@ def main():
                     help="自动按章整理: 课件/第01章 xxx/ ；识别不到章号的放 其他/")
     ap.add_argument("--split-projects", action="store_true",
                     help="把项目压缩包单独放进 项目/ 目录")
+    ap.add_argument("--no-video", action="store_true",
+                    help="跳过课堂录像与直播回放（录像往往几百 MB）")
+    ap.add_argument("--all-cameras", action="store_true",
+                    help="直播回放默认只下「屏幕录制」机位，加此项连「教师机位」一起下")
     ap.add_argument("--list-only", default=None, metavar="FILE",
                     help="只列清单不下载，结果写入 FILE（.json 或 .csv）")
     ap.add_argument("--retries", type=int, default=3, help="单个文件重试次数，默认 3")
@@ -458,32 +513,46 @@ def main():
         acts = json.load(open(args.activities, encoding="utf-8")).get("activities")
 
     print("扫描课程 %s ..." % args.course)
-    keys, n1 = collect(op, args.course, acts)
+    keys, n1 = collect(op, args.course, acts, want_video=not args.no_video)
     print("  来源① uploads 字段: %d" % n1)
     print("  来源② 正文内嵌:     %d" % (len(keys) - n1))
+    n_vid = sum(1 for k in keys if k[0] == "录像")
+    n_live = sum(1 for k in keys if k[0] == "回放")
+    if n_vid:
+        print("  其中课堂录像:       %d" % n_vid)
+    if n_live:
+        print("  其中直播回放:       %d 个活动" % n_live)
     print("  去重后共 %d 个附件" % len(keys))
 
     excl = re.compile(args.exclude) if args.exclude else None
 
+    # ---- 把回放条目展开成实际文件条目 ----
+    # 回放的一个活动有 2 路机位，要展开成 2 个下载项；
+    # 其余 kind 的 uid 就是 upload id，直接用。
+    items, live_err = expand_items(op, keys, args)
+
     # ---- 只列清单 ----
     if args.list_only:
-        rows = build_rows(op, keys, excl, args, quiet=args.quiet)
+        rows = build_rows(op, items, excl, args, quiet=args.quiet)
         write_manifest(args.list_only, rows)
         print("清单已写入 %s（%d 条）" % (args.list_only, len(rows)))
         return RC_OK
 
     ok = fail = skip = 0
     rows = []
-    for i, (kind, act, uid) in enumerate(keys, 1):
-        m = meta(op, uid)
-        if not m:
-            print("[%2d] N/A   upload %s (平台侧无权限或已删除, 跳过)" % (i, uid))
+    for i, it in enumerate(items, 1):
+        kind = it["kind"]
+        act = it["activity"]
+        name = it["name"]
+        size = it.get("size") or 0
+
+        if it.get("error"):
+            print("[%2d] N/A   %s (平台侧无权限或已删除, 跳过)" % (i, it.get("uid")))
             skip += 1
-            rows.append({"i": i, "kind": kind, "activity": act, "uid": uid,
+            rows.append({"i": i, "kind": kind, "activity": act, "uid": it.get("uid"),
                          "status": "na"})
             continue
-        name = safe(m.get("name") or ("upload_%s" % uid))
-        size = m.get("size") or 0
+
         if excl and excl.search(name):
             print("[%2d] EXCLUDE %s" % (i, name))
             skip += 1
@@ -507,21 +576,30 @@ def main():
             if args.verbose:
                 print("[%2d] PLAN  %-4s %-30s -> %s" % (i, kind, name[:28], rel))
             else:
-                print("[%2d] PLAN  %-9s %-28s %-44s %8.1fKB"
-                      % (i, kind, act[:26], name[:42], size / 1024))
+                print("[%2d] PLAN  %-9s %-28s %-40s %10s"
+                      % (i, kind, act[:26], name[:38], human_size(size)))
             rows.append({"i": i, "kind": kind, "activity": act, "name": name,
                          "size": size, "dir": rel, "status": "plan"})
             continue
 
         if not args.quiet:
-            print("[%2d] GET   %-4s %-30s %8.1fKB%s"
-                  % (i, kind, name[:28], size / 1024, "" if is_tty() else ""))
-        res = download(op, uid, path, size, retries=args.retries, quiet=args.quiet)
+            print("[%2d] GET   %-4s %-30s %10s" % (i, kind, name[:28], human_size(size)))
+
+        if kind == "回放":
+            res = lms_live.download(op, it["url"], path, expect=size,
+                                    retries=args.retries, quiet=args.quiet)
+        else:
+            res = download(op, it["uid"], path, size,
+                           retries=args.retries, quiet=args.quiet)
+
         if res["ok"]:
             mark = "  (重试%d次)" % res["retried"] if res.get("retried") else ""
             if res.get("exp_sha"):
                 mark += "  sha256✓"
-            print("[%2d] OK    %8.1fKB  %s%s" % (i, res["size"] / 1024, name[:40], mark))
+            if kind == "回放":
+                mark += "  (无官方哈希)"
+            print("[%2d] OK    %10s  %s%s"
+                  % (i, human_size(res["size"]), name[:40], mark))
             ok += 1
             rows.append({"i": i, "kind": kind, "activity": act, "name": name,
                          "size": res["size"], "dir": rel, "status": "ok",
@@ -543,22 +621,81 @@ def main():
     return RC_PARTIAL if fail else RC_OK
 
 
-def build_rows(op, keys, excl, args, quiet=False):
-    """--list-only 用：把附件元信息整理成行"""
+def expand_items(op, keys, args):
+    """把 collect() 的 (kind, act, uid) 展开成可下载条目。
+
+    - 普通附件：uid 就是 upload id，取一次元信息拿文件名和大小
+    - 回放（uid 是负数）：每个负数对应一个 lecture_live 活动，展开成多路机位
+
+    返回 (items, errors)。每个 item 形如
+        {kind, activity, name, uid, size, url?, error?}
+    """
+    items = []
+    for kind, act, uid in keys:
+        if kind != "回放":
+            m = meta(op, uid)
+            if not m:
+                items.append({"kind": kind, "activity": act, "uid": uid,
+                              "name": "upload_%s" % uid, "error": True})
+                continue
+            items.append({
+                "kind": kind, "activity": act, "uid": uid,
+                "name": safe(m.get("name") or ("upload_%s" % uid)),
+                "size": m.get("size") or 0,
+            })
+            continue
+
+        # 回放：uid 存的是活动 id 的负数
+        act_id = -uid
+        try:
+            d = get_json(op, "%s/api/activities/%s?sub_course_id=0" % (BASE, act_id))
+        except Exception as e:
+            print("  回放详情失败 %s: %s" % (act_id, str(e)[:50]))
+            items.append({"kind": kind, "activity": act, "uid": act_id,
+                          "name": "%s-回放" % act, "error": True})
+            continue
+
+        reps = lms_live.parse_replay(d)
+        if not reps:
+            continue
+        if not args.all_cameras:
+            reps = [r for r in reps if r["camera_type"] == "encoder"] or reps[:1]
+
+        # ★ 同一天的多个 lecture_live 活动 title 完全相同（实测一门课 4 节
+        # 都叫「2026-09-19-计算机视觉与模式识别」），只靠 title 命名会互相
+        # 覆盖。start_time 是唯一能区分它们的字段（在活动详情顶层），必须进文件名。
+        stamp = lms_live.start_stamp(d)
+
+        for r in reps:
+            p = lms_live.probe(op, r["url"])
+            name = lms_live.safe_name(act, r["camera_type"], stamp=stamp)
+            items.append({
+                "kind": kind, "activity": act, "uid": act_id,
+                "name": name, "size": p.get("size") or 0,
+                "url": r["url"], "camera": r["camera_type"],
+                "error": None if p.get("ok") else True,
+            })
+    return items, None
+
+
+def build_rows(op, items, excl, args, quiet=False):
+    """--list-only 用：把条目整理成行"""
     rows = []
-    for i, (kind, act, uid) in enumerate(keys, 1):
-        m = meta(op, uid)
-        if not m:
-            rows.append({"i": i, "kind": kind, "activity": act, "uid": uid,
+    for i, it in enumerate(items, 1):
+        kind = it["kind"]
+        act = it["activity"]
+        name = it["name"]
+        size = it.get("size") or 0
+        if it.get("error"):
+            rows.append({"i": i, "kind": kind, "activity": act, "uid": it.get("uid"),
                          "status": "na"})
             if not quiet:
-                print("[%2d] N/A   upload %s" % (i, uid))
+                print("[%2d] N/A   %s" % (i, it.get("uid")))
             continue
-        name = safe(m.get("name") or ("upload_%s" % uid))
-        size = m.get("size") or 0
         dest = dest_for(kind, act, name, args)
-        row = {"i": i, "kind": kind, "activity": act, "uid": uid, "name": name,
-               "size": size, "dir": os.path.relpath(dest, args.out),
+        row = {"i": i, "kind": kind, "activity": act, "uid": it.get("uid"),
+               "name": name, "size": size,
+               "dir": os.path.relpath(dest, args.out),
                "ext": split_ext(name)[1].lstrip(".")}
         if excl and excl.search(name):
             row["status"] = "excluded"
@@ -568,7 +705,8 @@ def build_rows(op, keys, excl, args, quiet=False):
             row["status"] = "plan"
         rows.append(row)
         if not quiet:
-            print("[%2d] %-7s %-30s %10s" % (i, row["status"], name[:28], human_size(size)))
+            print("[%2d] %-7s %-4s %-30s %10s"
+                  % (i, row["status"], kind, name[:28], human_size(size)))
     return rows
 
 
