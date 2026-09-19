@@ -458,7 +458,7 @@ python release.py --version 1.1.0 --title "下载可靠性" --yes       # 正式
 1. **版本号自检** —— tag 已存在就报错退出。已发布的版本内容不可变，要改就发新版本号。
    （这条是踩过坑换来的：v1.0.0 曾被原地覆盖过。）
 2. **包体校验** —— 上传前解压到临时目录，确认关键文件齐全、没混进登录态、
-   离线测试能过（三个测试文件，共 163 个用例；用例数由测试自己报出，并与
+   离线测试能过（三个测试文件，共 212 个用例；用例数由测试自己报出，并与
    静态扫描的 `def test_` 数量交叉核对，对不上就告警）。校验不过就不发。
 3. **打包白名单** —— 用 `INCLUDE` 显式列出该打进去的东西，新文件必须手动加；
    另有体积上限兜底，防止课程资料误入。
@@ -502,18 +502,18 @@ workflow 配置已直接放在仓库里（`.github/workflows/ci.yml`、`.github/
 
 ## 测试矩阵与覆盖明细
 
-全部离线，不需要网络与登录态，共 **163 个用例**：
+全部离线，不需要网络与登录态，共 **212 个用例**：
 
 ```bash
 python tests/test_organize.py     # 22 个用例
-python tests/test_fetch.py        # 121 个用例
+python tests/test_fetch.py        # 170 个用例
 python tests/test_selfcheck.py    # 20 个用例
 ```
 
 | 文件 | 覆盖 |
 |---|---|
 | `test_organize.py` | 中文数字转换、括号剥离、六种章节写法、假章号排除、目录名去重、目录名不带扩展名 |
-| `test_fetch.py` | 下载成功/重试/403 不重试/5xx 重试/空响应/HTML 响应/sha256 不符/etag 不符、断点续传与 Range 对齐四情形（正常/忽略/向前扩大/缺口）、回放短读判定（轻度过、严重失败、保留 `.part`）、元信息错误分类（403/404→N/A，401→登录态，5xx/超时/坏 JSON→FAIL）、已有文件大小比对、新旧登录态格式兼容、Cookie 安全属性还原、文件名安全（含 Windows 保留名）、路径冲突消解、项目包判定、CSV 公式注入防护、时间戳固定 UTC+8（跨时区一致）、清单导出、多来源计数 |
+| `test_fetch.py` | 下载成功/重试/403 不重试/5xx 重试/空响应/HTML 响应/sha256 不符/etag 不符、断点续传与 Range 对齐四情形（正常/忽略/向前扩大/缺口，含最后一次缺口保留 `.part`）、回放短读判定（轻度过、严重失败、保留 `.part`）、元信息错误分类（403/404→N/A，401→登录态，5xx/超时/坏 JSON→FAIL）、**扫描阶段失败记账**（page / lecture_live 详情的 500/超时/坏 JSON/403/404/401）、`item_status()` 统一状态语义、`--list-only` 退出码（真跑 `main()`）、已有文件大小比对与短读容差（回放 8% vs 普通附件 0%）、`.7z` 冲突改名保扩展名与项目包判定、新旧登录态格式兼容、Cookie 安全属性还原、文件名安全（含 Windows 保留名）、路径冲突消解、项目包判定、CSV 公式注入防护、时间戳固定 UTC+8（跨时区一致）、清单导出（`stage` / `err_kind` 入 CSV）、多来源计数 |
 | `test_selfcheck.py` | 登录态五种状态判定、检查级别（警告 vs 失败）、退出码、默认不联网、自检清单与 `scripts/` 实际文件一致 |
 
 `test_fetch.py` 用 **假 opener**（`FakeOpener` / `RangeFakeOpener` / `FakeResponse` /
@@ -537,6 +537,7 @@ README 只留最近两版，历史在这里：
 
 | 版本 | 变更 |
 |---|---|
+| v1.4.1 | 收尾几处 silent failure 与一致性问题：`collect()` 返回 `scan_errors` 并转成清单条目（扫描失败进 FAIL / manifest / 退出码）；抽出 `item_status()` 统一 `--list-only` / `--dry-run` / 正式下载的错误语义，`--list-only` 不再固定返回 0；`already_complete()` 增加 `tolerance`，回放与下载侧共用 `SHORT_TOLERANCE`；回放续传缺口在最后一次重试时保留有效 `.part`；`split_ext()` 放行 `.7z` 等数字开头扩展名；`already_complete()` 对 `os.path.getsize` 的 OSError 做保守兜底；清单增加 `stage` / `err_kind`；离线测试扩到 212 个 |
 | v1.2.1 | 修 `collect()` 的来源②计数（原先用总数相减，把直播回放误算成「正文内嵌」）；`release.py` 包体校验改为上报测试实际执行的用例数并与静态扫描交叉核对；抽取 `download()` 中重复四次的失败处理块；回放下载新增短读判定（对比 `Content-Length`，超阈值告警并写入清单）；README 用例数与文件清单同步 |
 | v1.2.0 | 直播回放下载（`lms_live.py`）；修同一天多个 `lecture_live` 活动 title 相同导致回放互相覆盖的丢数据 bug（文件名加入本地时间戳与机位）；离线测试扩到 79 个 |
 | v1.1.0 | 下载可靠性：断点续传、自动重试、sha256 校验、etag 交叉验证、登录态探测、进度条、`--list-only` / `--manifest`、语义化退出码；修长文件名丢扩展名；测试扩到 60 个 |
