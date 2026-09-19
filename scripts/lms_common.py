@@ -1,0 +1,93 @@
+# -*- coding: utf-8 -*-
+"""
+xjtu-lms-grab —— 公共配置
+
+把「本机专属」的东西全部集中到这里，并改成自动探测 + 环境变量可覆盖，
+这样换一台电脑不需要改代码。
+
+可用环境变量:
+    LMS_BASE     平台地址, 默认 https://lms.xjtu.edu.cn
+                 (别的学校用同一套 TronClass 的话改这个就行, 如 https://lms.xxxx.edu.cn)
+    LMS_CACHE    登录态 / profile 存放目录, 默认 ~/.lms-grab
+    LMS_BROWSER  强制指定浏览器可执行文件绝对路径
+"""
+import os
+import shutil
+import sys
+from urllib.parse import urlparse
+
+# 平台地址。注意: 不带末尾斜杠
+BASE = os.environ.get("LMS_BASE", "https://lms.xjtu.edu.cn").rstrip("/")
+
+# 从这个域名读 cookie
+HOST = urlparse(BASE).hostname or "lms.xjtu.edu.cn"
+
+
+def cache_dir():
+    """登录态 / 浏览器 profile 的默认存放位置: ~/.lms-grab"""
+    d = os.environ.get("LMS_CACHE") or os.path.join(os.path.expanduser("~"), ".lms-grab")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def state_path(course):
+    return os.path.join(cache_dir(), "state_%s.json" % course)
+
+
+def profile_path(course):
+    return os.path.join(cache_dir(), "profile_%s" % course)
+
+
+def find_browser():
+    """
+    自动找一台机器上能用的 Chromium 系浏览器。
+    顺序: 环境变量 -> Edge -> Chrome -> Playwright 自带 Chromium(返回 None 由调用方兜底)
+    找不到时返回 None，调用方不传 executable_path 就会用 playwright 自带的 chromium。
+    """
+    forced = os.environ.get("LMS_BROWSER")
+    if forced and os.path.isfile(forced):
+        return forced
+
+    cands = []
+    if sys.platform == "win32":
+        pf = os.environ.get("ProgramFiles", r"C:\Program Files")
+        pf86 = os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")
+        lad = os.environ.get("LOCALAPPDATA", "")
+        cands = [
+            os.path.join(pf86, r"Microsoft\Edge\Application\msedge.exe"),
+            os.path.join(pf, r"Microsoft\Edge\Application\msedge.exe"),
+            os.path.join(lad, r"Microsoft\Edge\Application\msedge.exe"),
+            os.path.join(pf, r"Google\Chrome\Application\chrome.exe"),
+            os.path.join(pf86, r"Google\Chrome\Application\chrome.exe"),
+            os.path.join(lad, r"Google\Chrome\Application\chrome.exe"),
+        ]
+    elif sys.platform == "darwin":
+        cands = [
+            "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+            "/Applications/Google Chrome.app/Contents/Google Chrome",
+        ]
+    else:
+        for exe in ("microsoft-edge", "google-chrome", "chromium", "chromium-browser"):
+            p = shutil.which(exe)
+            if p:
+                cands.append(p)
+
+    for p in cands:
+        if p and os.path.isfile(p):
+            return p
+    return None
+
+
+def require_playwright():
+    """导入 playwright，没装就给一句能直接复制的安装命令"""
+    try:
+        from playwright.sync_api import sync_playwright
+        return sync_playwright
+    except ImportError:
+        print(
+            "缺少 playwright。装一下:\n"
+            "    pip install playwright\n"
+            "（用系统自带的 Edge/Chrome 就够了，不必跑 playwright install 下载浏览器内核）",
+            file=sys.stderr,
+        )
+        sys.exit(3)
