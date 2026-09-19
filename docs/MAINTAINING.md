@@ -2,6 +2,26 @@
 
 面向修改这个仓库的人。使用者请看 [README](../README.md)。
 
+发版流程、CI 配置、测试矩阵、完整更新日志都在这份文档里，README 只留使用者需要的内容。
+
+## README 与本文档的分工（2026-09-20 精简后）
+
+README 面向「拿到仓库想用它下课件的人」，只保留：Skill 定位、快速开始、参数、
+可靠性设计、注意事项、隐私、目录清单、跑测试的命令、最近两版更新日志。
+
+以下内容**只在本文档维护**，README 里只留一行链接：
+
+| 内容 | 在哪 |
+|---|---|
+| 发版流程（方式 A / 方式 B）、三层保护、`release.py` 参数 | 本文「发版流程」 |
+| CI / 自动发版的配置细节、workflows 权限 | 本文「CI 配置」+「GitHub Actions 的实测坑」 |
+| 文档站的发布与排错 | 本文「文档站」 |
+| 测试覆盖矩阵、时区用例、`FakeOpener` 范式 | 本文「测试矩阵与覆盖明细」 |
+| v1.0.0 ~ v1.2.1 的历史更新日志 | 本文「完整更新日志」 |
+
+改 README 时注意：顶部引用块里的锚点 `#装成-skill推荐用法` 指向
+「装成 Skill（推荐用法）」一节，**该标题不能改名**，否则链接失效。
+
 ---
 
 ## 文档站（GitHub Pages）
@@ -398,6 +418,133 @@ GitHub 的 `windows-latest` runner 终端编码是 **cp1252**，脚本 `--help` 
 **只看 head sha 对应（最新）那条的结论**，前面的中途 run 可以无视。
 另外 `release.yml` 靠「推 `v*` tag」触发，本机 git 推不了 tag，
 发版仍走 `release.py` 本地方案（方式 A）。
+
+---
+
+## 发版流程
+
+### 方式 A：本地一键（推荐，本机 git 协议不通时唯一可行）
+
+```bash
+set GH_TOKEN=github_pat_xxx
+
+python release.py --version 1.1.0 --title "下载可靠性" --dry-run   # 先看打包内容
+python release.py --version 1.1.0 --title "下载可靠性" --yes       # 正式发
+```
+
+它会依次做：**版本号自检 → 打包 → 包体校验 → 打 tag → 建 Release → 传附件**。
+
+| 参数 | 作用 |
+|---|---|
+| `--dry-run` | 只打包 + 列清单，不碰 GitHub |
+| `--push-code` | 发布前先把源码推到 main（注意：依赖旁边的 `gh_push_dir.py`） |
+| `--notes notes.md` | 用文件里的内容当 Release 说明 |
+| `--resume` | 上次发到一半中断了，只补缺的部分 |
+| `--update-notes` | 只更新已发布 Release 的说明，不重新打包 |
+| `--yes` | 跳过发布前确认。**脚本化/自动化调用必须加**，否则 `input()` 会 `EOFError` |
+
+> **`--title` 只写版本号后面那部分。** 脚本自己会拼成 `v1.1.0 —— <title>`，
+> 你写 `--title "v1.1.0 - 下载可靠性"` 会得到 `v1.1.0 —— v1.1.0 - 下载可靠性`。
+> （新版已自动剥掉重复前缀，但仍建议只写后半段。）
+
+> **改代码要在打包之前。** `release.py` 自己也在发布内容里（`INCLUDE` 含它），
+> 如果打包后才改它，就会出现「zip 里是旧版、仓库里是新版」的不一致。
+
+`release.py` 放在仓库内外都能跑：它会自动判断自己在维护者工作区
+（源目录是旁边的 `xjtu-lms-grab/`）还是在仓库内（源目录就是自己所在目录）。
+
+**三层保护：**
+
+1. **版本号自检** —— tag 已存在就报错退出。已发布的版本内容不可变，要改就发新版本号。
+   （这条是踩过坑换来的：v1.0.0 曾被原地覆盖过。）
+2. **包体校验** —— 上传前解压到临时目录，确认关键文件齐全、没混进登录态、
+   离线测试能过（三个测试文件，共 163 个用例；用例数由测试自己报出，并与
+   静态扫描的 `def test_` 数量交叉核对，对不上就告警）。校验不过就不发。
+3. **打包白名单** —— 用 `INCLUDE` 显式列出该打进去的东西，新文件必须手动加；
+   另有体积上限兜底，防止课程资料误入。
+   **这份清单和 CI 用的 `.github/scripts/pack.py` 必须保持一致** —— 否则本地发的包和 CI 发的包内容不同。
+
+### 方式 B：GitHub Actions 自动发
+
+启用 workflow 后，打一个 tag 就自动发布：
+
+```bash
+git tag v1.1.0 && git push origin v1.1.0
+```
+
+或在仓库 Actions 页面手动触发 `Release`，输入版本号。
+
+> 前提是 **git push 通**。本机不通（见「本机环境约束」），所以实际仍走方式 A。
+
+---
+
+## CI 配置
+
+workflow 配置已直接放在仓库里（`.github/workflows/ci.yml`、`.github/workflows/release.yml`、
+`.github/scripts/pack.py`），推上 GitHub 就生效，不需要任何还原步骤。
+
+两点说明：
+
+1. **不启用也完全能用。** 发布走本地方案（方式 A）就够了，`release.py` 在打 zip 后
+   已经强制跑过全部离线测试，测试不过就 `SystemExit`，不会发出坏包。
+   CI 的额外价值只有**跨平台兼容性验证**（ubuntu / windows / macos × py3.8/3.10/3.12）。
+2. **推送 workflows 文件需要 `Workflows: write` 权限。** 用只有 `Contents: write`
+   的细粒度 token 走 Contents API 时，`.github/workflows/` 下的文件会 403
+   （推送脚本会跳过它们并明确列出剩余清单），此时在网页端
+   *Add file → Upload files* 手动上传这几个文件即可；或换用带 workflows 权限的
+   token / 真 git 推送。
+
+权限设计：workflow 顶层是 `contents: read`；`release.yml` 里只有发布 job 才是
+`contents: write`，校验 job 只读。第三方 action 固定到具体 commit SHA
+（`softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2`）。
+
+---
+
+## 测试矩阵与覆盖明细
+
+全部离线，不需要网络与登录态，共 **163 个用例**：
+
+```bash
+python tests/test_organize.py     # 22 个用例
+python tests/test_fetch.py        # 121 个用例
+python tests/test_selfcheck.py    # 20 个用例
+```
+
+| 文件 | 覆盖 |
+|---|---|
+| `test_organize.py` | 中文数字转换、括号剥离、六种章节写法、假章号排除、目录名去重、目录名不带扩展名 |
+| `test_fetch.py` | 下载成功/重试/403 不重试/5xx 重试/空响应/HTML 响应/sha256 不符/etag 不符、断点续传与 Range 对齐四情形（正常/忽略/向前扩大/缺口）、回放短读判定（轻度过、严重失败、保留 `.part`）、元信息错误分类（403/404→N/A，401→登录态，5xx/超时/坏 JSON→FAIL）、已有文件大小比对、新旧登录态格式兼容、Cookie 安全属性还原、文件名安全（含 Windows 保留名）、路径冲突消解、项目包判定、CSV 公式注入防护、时间戳固定 UTC+8（跨时区一致）、清单导出、多来源计数 |
+| `test_selfcheck.py` | 登录态五种状态判定、检查级别（警告 vs 失败）、退出码、默认不联网、自检清单与 `scripts/` 实际文件一致 |
+
+`test_fetch.py` 用 **假 opener**（`FakeOpener` / `RangeFakeOpener` / `FakeResponse` /
+`http_err`）脚本化服务端行为，所以能测「第一次超时第二次成功」「服务端把 Range 起点
+从 5MB 挪到 4MB」这类真实环境里很难复现的路径。新增用例优先用这个范式，
+不要引入 `responses` / `vcr` 之类的新依赖——`lms_fetch.py` 只依赖标准库。
+
+时区用例（`test_stamp_stable_across_machine_timezones`）会遍历
+UTC / Asia-Tokyo / America-New_York / Asia-Shanghai，改 `TZ` 环境变量 + `time.tzset()`
+验证，因此**不依赖跑测试机器所在的时区**。
+
+改测试断言逻辑时要保持用例总数，`release.py` 的 `verify_zip` 会交叉核对
+（静态扫 `def test_` vs 实跑 `Ran N tests`）。新增测试文件要**同时**改三处：
+`release.py` 的关键文件清单 + 测试循环、`ci.yml`、`pack.py`。
+
+---
+
+## 完整更新日志
+
+README 只留最近两版，历史在这里：
+
+| 版本 | 变更 |
+|---|---|
+| v1.2.1 | 修 `collect()` 的来源②计数（原先用总数相减，把直播回放误算成「正文内嵌」）；`release.py` 包体校验改为上报测试实际执行的用例数并与静态扫描交叉核对；抽取 `download()` 中重复四次的失败处理块；回放下载新增短读判定（对比 `Content-Length`，超阈值告警并写入清单）；README 用例数与文件清单同步 |
+| v1.2.0 | 直播回放下载（`lms_live.py`）；修同一天多个 `lecture_live` 活动 title 相同导致回放互相覆盖的丢数据 bug（文件名加入本地时间戳与机位）；离线测试扩到 79 个 |
+| v1.1.0 | 下载可靠性：断点续传、自动重试、sha256 校验、etag 交叉验证、登录态探测、进度条、`--list-only` / `--manifest`、语义化退出码；修长文件名丢扩展名；测试扩到 60 个 |
+| v1.0.4 | `release.py` 纳入发布内容并支持两种存放位置；新增 `--update-notes` |
+| v1.0.3 | 新增本地一键发布脚本 `release.py`：版本号自检 + 包体校验 + 打包白名单 |
+| v1.0.2 | 新增 `--organize` 按章整理；新增离线测试与 CI；`.gitignore` 补漏（profile 目录、压缩包、缓存） |
+| v1.0.1 | 安装说明泛化到 WorkBuddy / Claude Code / Codex，强调不装 Skill 也能用；仓库改名 xjtu-siyuanxuetang-grab |
+| v1.0.0 | 首个版本：登录、两类附件来源合并、增量下载、干跑 |
 
 ---
 
