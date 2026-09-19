@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: ${{ matrix.os }} / py${{ matrix.python-version }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        python-version: ["3.8", "3.10", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Byte-compile all scripts
+        run: python -m compileall -q scripts/ tests/
+
+      - name: Run offline tests
+        run: python tests/test_organize.py
+
+      - name: Check CLI help works
+        run: |
+          python scripts/lms_fetch.py --help
+          python scripts/lms_login.py --help
+
+  lint:
+    name: 语法与隐私自检
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 确认没有提交登录态 / 本机路径
+        run: |
+          set -e
+          echo "--- 检查是否误提交登录态 ---"
+          if git ls-files | grep -Ei '(^|/)(state_.*\.json|storage_state\.json|cookies.*\.json)$'; then
+            echo "::error::仓库里出现了登录态文件，必须移除"; exit 1
+          fi
+          echo "--- 检查是否残留本机绝对路径 ---"
+          if grep -rn --include='*.py' -E 'C:\\\\Users\\\\|/Users/[a-z]|D:\\\\' scripts/ ; then
+            echo "::error::脚本里出现本机绝对路径，应改为相对路径或环境变量"; exit 1
+          fi
+          echo "OK"
