@@ -10,6 +10,9 @@
 「发 Release」交给 softprops/action-gh-release 这个成熟 action。
 
 此文件由 enable-ci.bat 从 pack.py.txt 还原到 .github/scripts/ 下。
+
+注意：INCLUDE 必须与 release.py 里的那份保持同步，否则本地发的包和
+CI 发的包内容会不一致（踩过：这里漏了 release.py，而本地那份有）。
 """
 import argparse
 import os
@@ -32,6 +35,7 @@ INCLUDE = [
     "release.yml.txt",
     "pack.py.txt",
     "enable-ci.bat",
+    "release.py",
     "scripts",
     "tests",
 ]
