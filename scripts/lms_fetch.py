@@ -173,7 +173,7 @@ def api_ok(op):
 # ---------------------------------------------------------------- 收集
 
 def collect(op, course, activities=None, want_video=True):
-    """返回 ([(kind, 活动标题, upload_id)], 来源①数量)
+    """返回 ([(kind, 活动标题, upload_id)], 来源①数量, 来源②数量)
 
     kind 取值:
         课件   —— 讲义 / PDF / 附件
@@ -186,6 +186,9 @@ def collect(op, course, activities=None, want_video=True):
 
     第四类的 upload_id 位放的是「活动 id」，不是 upload id —— 它根本不是附件。
     下载时按 kind 分流，不会走到 uploads 端点上去。
+
+    两个计数都是「进 plan 的去重增量」，来源③（回放）不计入其中，
+    想拿回放条数请按 kind == "回放" 数。用 len(keys) 相减推来源②会把回放算进去。
     """
     if activities is None:
         activities = get_json(op, "%s/api/courses/%s/activities?sub_course_id=0"
@@ -227,6 +230,9 @@ def collect(op, course, activities=None, want_video=True):
         blob = json.dumps(d.get("data") or {}, ensure_ascii=False)
         for uid in set(re.findall(r"/api/uploads/(\d+)", blob)):
             add("课件", a.get("title"), uid)
+    # 三个来源的去重增量要分开记：来源②若与来源①撞了同一 (kind, 活动, uid)，
+    # 就不会进 plan，用减法会把它算错。回放条目也在这里被排除。
+    n2 = len(plan) - n1
 
     # 来源 ③：lecture_live 回放。replay_videos 只在活动详情里有，列表接口拿不到。
     if want_video:
@@ -247,7 +253,7 @@ def collect(op, course, activities=None, want_video=True):
                 continue
             # uid 用负数存活动 id —— 它不是 upload，走不了 uploads 端点
             add("回放", a.get("title"), -(int(aid)))
-    return sorted(plan.keys()), n1
+    return sorted(plan.keys()), n1, n2
 
 
 def meta(op, uid):
@@ -304,6 +310,14 @@ def download(op, uid, path, expect_size=None, retries=3, quiet=False, resume=Tru
     last_err = None
     used_resume = False
 
+    def drop_part():
+        """删掉残片。删不掉也无所谓 —— 下次开下会按 offset 重新判断。"""
+        if os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+
     for attempt in range(retries):
         # 有残片就尝试续传
         offset = 0
@@ -311,10 +325,20 @@ def download(op, uid, path, expect_size=None, retries=3, quiet=False, resume=Tru
             offset = os.path.getsize(tmp)
             if expect_size and offset >= expect_size:
                 offset = 0                      # 残片比目标还大，不靠谱，重来
-                try:
-                    os.remove(tmp)
-                except OSError:
-                    pass
+                drop_part()
+
+        # 重试判定只写一遍：还有机会就退避后重来，没机会就把 err 定格返回。
+        # retry_or_give_up 的返回值非 None 时就该立刻 return 出去。
+        def retry_or_give_up(err, fatal=False):
+            nonlocal last_err
+            last_err = err
+            if attempt < retries - 1:
+                time.sleep(1.5 * (attempt + 1))
+                return None
+            d = {"ok": False, "err": err}
+            if fatal:
+                d["fatal"] = True
+            return d
 
         try:
             req = urllib.request.Request("%s/api/uploads/%s/blob" % (BASE, uid))
@@ -331,11 +355,7 @@ def download(op, uid, path, expect_size=None, retries=3, quiet=False, resume=Tru
             partial = (offset > 0 and status == 206)
             if offset and not partial:
                 offset = 0
-                if os.path.exists(tmp):
-                    try:
-                        os.remove(tmp)
-                    except OSError:
-                        pass
+                drop_part()
 
             total = None
             try:
@@ -388,44 +408,34 @@ def download(op, uid, path, expect_size=None, retries=3, quiet=False, resume=Tru
                 sys.stdout.flush()
 
             if got < 512:
-                if os.path.exists(tmp):
-                    try:
-                        os.remove(tmp)
-                    except OSError:
-                        pass
-                last_err = "只有 %d 字节，疑似空响应" % got
-                if attempt < retries - 1:
-                    time.sleep(1.5 * (attempt + 1))
-                    continue
-                return {"ok": False, "err": last_err}
+                drop_part()
+                d = retry_or_give_up("只有 %d 字节，疑似空响应" % got)
+                if d:
+                    return d
+                continue
 
             # 完整性判据：优先服务端 sha256，其次 etag 里的大小，最后元信息大小
             if exp_sha and exp_sha.lower() != h.hexdigest().lower():
-                if os.path.exists(tmp):
-                    try:
-                        os.remove(tmp)
-                    except OSError:
-                        pass
-                last_err = ("sha256 不匹配（期望 %s… 实得 %s…）"
-                            % (exp_sha[:12], h.hexdigest()[:12]))
-                if attempt < retries - 1:
-                    time.sleep(1.5 * (attempt + 1))
-                    continue
-                return {"ok": False, "err": last_err}
+                drop_part()
+                d = retry_or_give_up("sha256 不匹配（期望 %s… 实得 %s…）"
+                                     % (exp_sha[:12], h.hexdigest()[:12]))
+                if d:
+                    return d
+                continue
 
             if etag_size and got != etag_size:
-                last_err = "大小与 etag 不符（etag=%d 实得=%d）" % (etag_size, got)
-                if attempt < retries - 1:
-                    time.sleep(1.5 * (attempt + 1))
-                    continue
-                return {"ok": False, "err": last_err}
+                d = retry_or_give_up("大小与 etag 不符（etag=%d 实得=%d）"
+                                     % (etag_size, got))
+                if d:
+                    return d
+                continue
 
             if expect_size and abs(expect_size - got) > 16:
-                last_err = "大小与元信息不符（元信息=%d 实得=%d）" % (expect_size, got)
-                if attempt < retries - 1:
-                    time.sleep(1.5 * (attempt + 1))
-                    continue
-                return {"ok": False, "err": last_err}
+                d = retry_or_give_up("大小与元信息不符（元信息=%d 实得=%d）"
+                                     % (expect_size, got))
+                if d:
+                    return d
+                continue
 
             os.replace(tmp, path)
             return {"ok": True, "size": got, "sha256": h.hexdigest(),
@@ -444,11 +454,8 @@ def download(op, uid, path, expect_size=None, retries=3, quiet=False, resume=Tru
             time.sleep(1.5 * (attempt + 1))
 
     # 全部失败：保留 .part 以便下次续传（只在能续传时保留）
-    if not resume and os.path.exists(tmp):
-        try:
-            os.remove(tmp)
-        except OSError:
-            pass
+    if not resume:
+        drop_part()
     return {"ok": False, "err": last_err or "未知错误", "kept_part": resume}
 
 
@@ -513,9 +520,9 @@ def main():
         acts = json.load(open(args.activities, encoding="utf-8")).get("activities")
 
     print("扫描课程 %s ..." % args.course)
-    keys, n1 = collect(op, args.course, acts, want_video=not args.no_video)
+    keys, n1, n2 = collect(op, args.course, acts, want_video=not args.no_video)
     print("  来源① uploads 字段: %d" % n1)
-    print("  来源② 正文内嵌:     %d" % (len(keys) - n1))
+    print("  来源② 正文内嵌:     %d" % n2)
     n_vid = sum(1 for k in keys if k[0] == "录像")
     n_live = sum(1 for k in keys if k[0] == "回放")
     if n_vid:
@@ -600,12 +607,18 @@ def main():
                 mark += "  (无官方哈希)"
             print("[%2d] OK    %10s  %s%s"
                   % (i, human_size(res["size"]), name[:40], mark))
+            # 回放拿不到官方哈希，短读只能靠声明总长比对暴露出来
+            if res.get("note"):
+                print("       !! %s（超出 %.0f%% 阈值，建议复核）"
+                      % (res["note"], lms_live.SHORT_TOLERANCE * 100))
             ok += 1
             rows.append({"i": i, "kind": kind, "activity": act, "name": name,
                          "size": res["size"], "dir": rel, "status": "ok",
                          "sha256": res["sha256"],
                          "server_sha256": res.get("exp_sha"),
-                         "retried": res.get("retried", 0)})
+                         "retried": res.get("retried", 0),
+                         "declared": res.get("declared"),
+                         "note": res.get("note")})
         else:
             print("[%2d] FAIL  %s :: %s" % (i, name[:40], res["err"]))
             fail += 1
