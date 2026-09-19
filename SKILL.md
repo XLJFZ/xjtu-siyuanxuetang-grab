@@ -79,6 +79,8 @@ python scripts/lms_fetch.py --course <ID> --out "<目录>"
 | `--retries N` | 单文件重试次数，默认 3 |
 | `--no-verify` | 跳过开跑前的登录态探测 |
 | `--exclude "2020\|2021\|2022"` | 文件名正则，命中就跳过（清旧版作业很好用） |
+| `--no-video` | 跳过课堂录像与直播回放。录像动辄几百 MB，只要讲义时用得上 |
+| `--all-cameras` | 直播回放默认只下「屏幕录制」机位，加此项连「教师机位」一起下 |
 | `--split-projects` | 项目压缩包单独进 `项目/`，不混在作业里 |
 | `--layout flat` | 平铺，不按活动建子文件夹 |
 | `--activities <json>` | 用本地清单，省一次请求 |
@@ -118,6 +120,7 @@ python scripts/lms_fetch.py --course <ID> --out "<目录>"
 | 课件分页列表 | `GET /api/course/<ID>/coursewares?conditions=...` |
 | 附件元信息（**取文件名用它**） | `GET /api/uploads/<上传id>` |
 | **下载** | `GET /api/uploads/<上传id>/blob` |
+| 直播回放地址 | 活动详情 `data.external_live_detail.replay_videos[].url`（指向 rms-v5，非本域名） |
 
 页面路由：课件 `/course/<ID>/courseware#/` · 作业 `/course/<ID>/homework#/` · 章节 `/course/<ID>/content#/`
 · 活动详情 `/course/<ID>/learning-activity#/<id>`
@@ -138,9 +141,111 @@ python scripts/lms_fetch.py --course <ID> --out "<目录>"
 > 个别附件元信息就取不到（403 无权限、404 已删除），脚本会标 `N/A` 跳过，不用反复重试。
 > `/api/uploads/<id>/download` 是 404，正确端点是 `/blob`。
 
+## 课堂录像
+
+思源学堂的录像有**两种完全不同的承载方式**，脚本对两类都支持，但实现路径不同。
+
+| 类型 | 目录 | 端点 | 校验 |
+|---|---|---|---|
+| `online_video` | `录像/` | `/api/uploads/<id>/blob`（同课件） | etag 大小 + sha256 |
+| `lecture_live` | `回放/` | `rms-v5.xjtu.edu.cn/.../preview?previewToken=` | 只有 Content-Length |
+
+```bash
+python scripts/lms_fetch.py --course <ID> --out ./课程资料              # 全都要
+python scripts/lms_fetch.py --course <ID> --out ./课程资料 --no-video    # 只要讲义
+```
+
+### 类型 A：`online_video` —— 就是普通附件
+
+录像躺在活动的 `uploads[]` 里，和课件走同一个端点：
+
+```
+activities[i].type == "online_video"
+  .uploads[0] = {id: 76161, name: "xxx_标清.mp4", size: 5618914, ...}
+GET /api/uploads/<id>/blob
+```
+
+实测（2026-09，20 个此类活动，含 `.mp4` / `.flv`）：`Content-Type: video/mp4`、
+带 `Content-Length`、`accept-ranges: bytes`，**断点续传与 etag 校验全部可用**，
+下载字节数与 API 声明的 `size` 逐字节一致。
+
+> [!tip] 哪些课有
+> 各课差异极大——建筑设计类课程常有（某门 CAD 课 17 个），理论课往往一个没有。
+> 先 `--dry-run` 看输出里的「其中课堂录像: N」一行。
+
+### 类型 B：`lecture_live` —— 直播回放，另一套域名
+
+教室录播走的是**完全独立**的一套系统，不在 `uploads` 里：
+
+```
+activities[i].type == "lecture_live"
+  .data.external_live_detail.replay_videos[] = [
+      {camera_id: 960821, camera_type: "instructor", url: "..."},   # 教师机位
+      {camera_id: 960824, camera_type: "encoder",    url: "..."},   # 屏幕录制
+  ]
+```
+
+URL 指向 `rms-v5.xjtu.edu.cn`（不是 `lms.xjtu.edu.cn`），由 `scripts/lms_live.py` 处理。
+默认只下 `encoder`（屏幕录制 = 正课画面），`--all-cameras` 连 `instructor` 一起下。
+
+#### 下载契约（实测）
+
+```
+https://rms-v5.xjtu.edu.cn/api/base/orgs/xjtu/captures/<capture_id>/videos/<camera_id>/preview?previewToken=<hex>
+```
+
+响应头（`GET`，不带 Range）：
+
+```
+Content-Length: 438175558        ← 完整大小，可作进度与校验依据
+Accept-Ranges:  bytes            ← 支持断点续传
+Etag:          "d4a1f1b58094be3d0b03424470c3c342"
+```
+
+带 `Range` 返回 `206`，`Content-Range: bytes 100000000-102097151/438175558`。
+
+> [!warning] 三个必须注意的实测行为
+> **① `previewToken` 会限流，别并发。** 同一 token 同时发多个请求（GET + HEAD + Range 混着来）
+> 会稳定返回 403，看起来像 token 过期。**串行发就完全正常**——实测单连接连续读 438 MB /
+> 4.6 分钟无一次中断，token 跨多轮请求也不失效。排查时如果看到 403，先怀疑并发而不是时效。
+>
+> **② 服务端会把 Range 对齐到 2 MB 边界。** 请求 `bytes=100000000-100199999`（20 万字节）
+> 实际返回 `bytes 100000000-102097151`（2 MB）。**必须按响应里的 `Content-Range` 用实际长度**，
+> 不能假设服务端照办请求值，否则续传时会错位。
+>
+> **③ 读取速度会衰减。** 前 30 秒能到 8 MB/s（吃服务端缓存），之后稳定到 ~1.6 MB/s
+> （实时转码速度）。一节课（438 MB / 90 分钟）约需 5 分钟下完。进度条必须显示，别让人以为卡死。
+
+> [!important] 文件名必须带时间戳，否则会丢数据
+> 同一天的多个 `lecture_live` 活动 **`title` 完全相同**。实测一门课 4 节课都叫
+> 「2026-09-19-计算机视觉与模式识别」，只有 `start_time` 不同（06:30Z / 07:30Z / 08:40Z / 09:40Z）。
+> 只用标题命名会让 4 节课**互相覆盖、最终只剩最后一节**。
+> 现在文件名形如 `<标题>-<YYYYMMDD-HHMM 本地时间>-<机位>.mp4`，
+> `start_time` 在活动详情的**顶层**，不在 `data` 里。
+
+> [!warning] 别把 `lecture_live` 和 `online_video` 搞混
+> 名字里都带「视频」，但一个是附件、一个是流媒体。判断方式很简单：看 `type` 字段。
+> 两类**现在都能下**，不用再挑。区别只在体量与耗时：`online_video` 是普通附件，
+> 一个几十 MB，下载很快；`lecture_live` 回放单节 350–440 MB，且服务端是实时转码
+> （~1.6 MB/s），一节 90 分钟的课要约 5 分钟。
+>
+> 数量上别按课的类型想当然。全量扫过 58 门课，`online_video` 共 20 个、`lecture_live`
+> 出现在少数几门课里，且分布很偏：
+>
+> | 课程 | `online_video` | `lecture_live` |
+> |---|---|---|
+> | 计算机辅助建筑设计【04 | 17 | 0 |
+> | 传统木构与营造做法 | 2 | 8 |
+> | 计算机视觉与模式识别 | 1 | 4 |
+>
+> 建筑设计类课程能攒到 17 个录像——**「录像很少」是错觉**，开扫前别预设。
+
 ## 归类建议
 
-下载产物默认 `<目录>/{课件,作业}/<活动标题>/<文件名>`。
+下载产物默认 `<目录>/{课件,作业,录像,回放}/<活动标题>/<文件名>`。
+
+**录像与回放不参与 `--organize`**：标题基本认不出章号，硬套只会让几十个视频全堆进
+`录像/其他/`。所以这两类始终按活动标题分目录，文档部分照常按章归并。
 
 **优先试 `--organize`**：脚本会从活动标题和文件名里自动抽chapter号，归到
 `课件/第01章 绪论/` 这样的结构，认不出章号的统一进 `其他/`。
