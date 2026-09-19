@@ -4,6 +4,8 @@ state_*.json
 storage_state.json
 cookies*.json
 *.har
+.env
+*.env
 lms_profile/
 */lms-pw-profile/
 .lms-grab/
