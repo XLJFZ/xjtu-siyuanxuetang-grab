@@ -110,7 +110,7 @@ curl -sI https://xljfz.github.io/xjtu-siyuanxuetang-grab/
 
 #### ⚠️ 构建历史里的 `errored` 多半是假警报
 
-用 API 查构建记录时，会看到这种输出：
+用 API 查构建记录（`GET /pages/builds`）时，会看到这种输出：
 
 ```
 92f6a1b2  built      created=13:42:00   err=None          ← 最终生效的就是它
@@ -141,6 +141,8 @@ e2d1677e  errored    created=13:39:18   err=Page build failed.
 
 **别被 `errored` 牵着去排查内容**——先比对 sha256，一致就说明已经生效了。
 
+> **同一件事在 Actions 页面显示为红叉 `0/3`**，判读方法见下一节。
+
 > 附注一：查 Pages 配置的 `GET /repos/<owner>/<repo>/pages` 有时会返回 **404**，
 > 哪怕站点实际在正常运行。这是 token 权限范围的问题（该端点需要 `Pages` 读权限），
 > 不是"站点被删了"。**以线上实测为准，不要以这个端点为准。**
@@ -148,6 +150,80 @@ e2d1677e  errored    created=13:39:18   err=Page build failed.
 > 附注二：验证时优先看响应头的 `X-Cache: MISS` + `Age: 0`——这表示命中源站新内容，
 > 而非 CDN 缓存的旧版本。如果拿到 `X-Cache: HIT` 且 `Age` 较大，就是缓存，
 > 过一会再请求。
+
+#### ⚠️ 仓库首页/Commits 页上的红叉 `0/3`，同样是假警报
+
+打开仓库首页的提交列表，或点进 Commits 页，会看到这种景象：
+
+```
+update: docs/index.html          ✓ 3/3      ← 绿勾
+update: docs/MAINTAINING.md      ✗ 0/3      ← 红叉
+update: docs/index.html          ✓ 3/3
+update: docs/MAINTAINING.md      ✗ 0/3
+add:    docs/MAINTAINING.md      ✗ 0/3
+```
+
+**这些红叉跟 `errored` 是同一件事的两个观测面**，不是两个问题：
+
+| 界面 | 记录位置 | 状态名 |
+|---|---|---|
+| Actions 页 / 提交列表 | `GET /actions/runs` | `cancelled`（红叉，`0/3`） |
+| Pages 设置页 | `GET /pages/builds` | `errored`（`Page build failed.`） |
+
+查 `/actions/runs` 能看到真相：
+
+```
+#9  68b4eb12  success       ← 最终生效
+#8  72099a52  cancelled     ← 被 #9 取代
+#7  92f6a1b2  success
+#6  d3f665da  cancelled     ← 被 #7 取代
+#5  a1bdaf10  success
+#4  c8ca2765  cancelled     ← 被 #5 取代
+#3  e2d1677e  cancelled     ← 被 #5 取代
+#2  5b592aca  success
+#1  c9fd021c  success
+```
+
+**9 条记录里没有一条是 `failure`——全是 `success` 或 `cancelled`。**
+
+那 3 个 job 是 `build` / `report-build-status` / `deploy`。
+被取消时它们根本不会执行，所以显示 `0/3`。**GitHub 用红色叉号表示 `cancelled`，
+视觉上跟 `failure` 完全一样**，这是最容易误判的地方。
+
+#### 为什么会产生红叉：推送脚本两个文件两个 commit
+
+`push_docs.py` 是**一个文件一个 commit**：
+
+```
+[1/2] update docs/MAINTAINING.md    ← 触发一次构建
+[2/2] update docs/index.html        ← 触发第二次，把上一次掐掉
+```
+
+两个 commit 只隔 2～3 秒。第一个刚启动，第二个就来了，
+Pages 的并发策略是**保留最新、取消旧的**，于是"第一个文件"那次提交必然留个红叉。
+
+**因此：红叉只跟推送节奏有关，跟文件内容好坏无关。**
+
+#### 要不要消除这些红叉
+
+**不需要。** 仓库状态是健康的，线上内容已逐字节校验过。红叉只在推送瞬间出现，
+最终态都是绿的；这个仓库只有自己人在推，不影响任何人。
+
+真想消除，可以让推送脚本改用 **Git Trees API 一次提交多个文件**，
+就不会有中间态了（代价是脚本复杂度上升）。
+
+#### 三秒判断法
+
+看到红叉时按顺序做两件事就够，不用读日志：
+
+1. **看最后一条运行**是否 `success`——是就没事
+2. **比对线上 sha256** 与本地是否一致——一致就说明已生效
+
+只要这两条成立，中间有多少红叉都可以忽略。
+
+> 补充：这些 workflow 是 **GitHub 为 Pages 自动生成的**
+> （名字叫 `pages build and deployment`），**不在你的仓库里**——
+> `.github/workflows/` 目录是空的/不存在。所以它们不需要你维护，也无法在仓库里"修"。
 
 ### 页面布局的注意事项
 
