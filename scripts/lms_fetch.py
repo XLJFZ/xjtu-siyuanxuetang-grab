@@ -48,8 +48,13 @@ import lms_live
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36 Edg/153.0.0.0")
 
-# 常见的项目压缩包 -> 归到 项目/ 而不是 作业/
-PROJ_HINT = re.compile(r"project|proj[_\-\s]?\d|zip", re.I)
+# 常见大作业 / 项目压缩包的关键词。
+# ★ 注意：`zip` **不能**单独作为判据 —— 那样等于「所有压缩包都是项目包」，
+#   实测会把 `资料.zip`、`课件.zip` 一起归进 项目/。真正的项目判断来自
+#   project / proj1 / Project 2 / 项目 / 大作业 这类关键词，
+#   而 .zip 只是「允许被判为项目包」的必要条件之一（见 is_project_pkg）。
+PROJ_HINT = re.compile(r"project|proj[_\-\s]?\d|项目|大作业|课程设计|大程",
+                       re.I)
 
 # 文件名主干上限。Windows 全路径上限约 260 字符，留足目录深度后给文件名 120 比较稳
 MAX_STEM = 120
@@ -60,6 +65,12 @@ RC_OK = 0
 RC_NO_STATE = 2                   # 没有登录态文件
 RC_EXPIRED = 3                    # 登录态过期
 RC_PARTIAL = 4                    # 有文件下载失败
+
+# 取元信息失败时的三类错误。**必须分开**，否则一次接口抖动会被
+# 伪装成「这些文件平台没给权限」而静默跳过，用户还会看到 fail=0。
+ERR_UNAVAILABLE = "unavailable"   # 403 / 404，确实拿不到，可跳过
+ERR_AUTH = "authentication"       # 401，登录态问题，明确失败
+ERR_TRANSIENT = "transient"       # 超时 / 连接错误 / 5xx / JSON 解析失败，算失败
 
 
 # ---------------------------------------------------------------- 工具
@@ -82,6 +93,27 @@ def split_ext(name):
     return stem, "." + ext
 
 
+# Windows 保留设备名。这些名字**带扩展名也照样不能当文件名**
+# （`CON.pdf`、`NUL.txt` 在 Windows 上同样无法创建），
+# 在 Linux/macOS 上却完全合法 —— 为了跨平台一致，统一加下划线前缀。
+_WIN_RESERVED = frozenset(
+    ["CON", "PRN", "AUX", "NUL"]
+    + ["COM%d" % i for i in range(1, 10)]
+    + ["LPT%d" % i for i in range(1, 10)]
+)
+
+
+def _dedupe_reserved(stem):
+    """主干撞上 Windows 保留名就加下划线前缀，保持跨平台一致。"""
+    if not stem:
+        return stem
+    # Windows 对 `CON` 和 `con` 一视同仁，且 `CON.txt` 也非法
+    probe = stem.split(".")[0].rstrip(" .")
+    if probe.upper() in _WIN_RESERVED:
+        return "_" + stem
+    return stem
+
+
 def safe(s, max_stem=MAX_STEM):
     """把任意字符串变成安全的文件名，**保证不切掉扩展名**。
 
@@ -89,6 +121,10 @@ def safe(s, max_stem=MAX_STEM):
     落盘后双击打不开。现在：先切出扩展名，只截主干，并在截断处补 6 位短哈希防重名。
 
         '很长的标题...（60字）.pdf' -> '很长的标题...（约110字）~a1b2c3.pdf'
+
+    另外处理 Windows 保留设备名：`CON.pdf` / `NUL.txt` 这类在 Windows 上
+    无法创建（Linux/macOS 合法），统一转成 `_CON.pdf` / `_NUL.txt`，
+    保证三个平台落盘结果一致。
     """
     s = (s or "").strip()
     stem, ext = split_ext(s)
@@ -98,12 +134,13 @@ def safe(s, max_stem=MAX_STEM):
         return "untitled" + ext
 
     if len(stem) <= max_stem:
-        return stem + ext
+        return _dedupe_reserved(stem) + ext
 
     # 超长：截断 + 短哈希。哈希取自原始主干，保证同一长名字每次都得到同一个结果
     digest = hashlib.sha1(stem.encode("utf-8")).hexdigest()[:6]
     keep = max_stem - len(digest) - 1
-    return stem[:keep].rstrip(" .") + "~" + digest + ext
+    cut = stem[:keep].rstrip(" .")
+    return _dedupe_reserved(cut) + "~" + digest + ext
 
 
 def human_size(n):
@@ -124,14 +161,89 @@ def is_tty():
 
 # ---------------------------------------------------------------- 网络
 
+def load_state(path):
+    """读登录态，同时兼容两种格式。
+
+    ① Playwright 的原生 storage_state：{"cookies": [...], "origins": [...]}
+    ② 本项目自己的精简结构：{"version":1, "base":..., "host":..., "cookies":[...]}
+
+    两种都只取 cookies 数组，其余字段忽略。旧文件不要突然不能用。
+    另外允许裸 cookies 数组（极简格式）。
+    """
+    with open(path, encoding="utf-8") as f:
+        st = json.load(f)
+    if isinstance(st, list):
+        return {"cookies": st}
+    if not isinstance(st, dict):
+        raise ValueError("登录态文件结构不对")
+    cookies = st.get("cookies")
+    if not isinstance(cookies, list):
+        raise ValueError("登录态文件缺少 cookies 数组")
+    return st
+
+
+def state_host(path):
+    """登录态是为哪个 host 建的。旧格式没有这个字段，返回 None。"""
+    try:
+        st = load_state(path)
+    except Exception:
+        return None
+    h = st.get("host")
+    return str(h) if h else None
+
+
 def opener(state):
-    st = json.load(open(state, encoding="utf-8"))
+    """按登录态建一个 opener。
+
+    ★ Cookie 重建必须保留安全语义：domain / path / secure / expires。
+    以前这些位置被硬编码（secure=True, expires=None），会导致
+      - 给目标 host 之外的域名带上 cookie；
+      - 把 HTTPS-only 的 cookie 发到 HTTP 上（安全属性被抹掉）。
+    现在：domain 与 expires 按原样还原，secure 也按原样还原；
+    只装载适用于当前目标 host 的 cookie。
+    """
+    st = load_state(state)
+    target = HOST.lower()
+
+    def applies(c):
+        dom = str(c.get("domain") or "").lstrip(".").lower()
+        if not dom:
+            # 没写 domain 的按当前 host 处理
+            return True
+        # 精确匹配或子域匹配；目标 host 不能越出 cookie 的域
+        return target == dom or target.endswith("." + dom)
+
     cj = http.cookiejar.CookieJar()
-    for c in st["cookies"]:
+    for c in st.get("cookies") or []:
+        if not c.get("name"):
+            continue
+        if not applies(c):
+            continue                    # 不属于当前 host 的，不装载
+        dom = c.get("domain") or HOST
+        expires = c.get("expires")
+        try:
+            expires = int(expires) if expires not in (None, "", -1) else None
+        except (TypeError, ValueError):
+            expires = None
         cj.set_cookie(http.cookiejar.Cookie(
-            0, c["name"], c["value"], None, False,
-            c.get("domain", HOST), True, True,
-            c.get("path", "/"), True, False, None, False, None, None, {}))
+            version=0,
+            name=c["name"],
+            value=c.get("value") or "",
+            port=None,
+            port_specified=False,
+            domain=dom,
+            domain_specified=bool(dom),
+            domain_initial_dot=str(dom).startswith("."),
+            path=c.get("path") or "/",
+            path_specified=True,
+            secure=bool(c.get("secure", False)),
+            expires=expires,
+            discard=(expires is None),
+            comment=None,
+            comment_url=None,
+            rest={},
+            rfc2109=False,
+        ))
     op = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cj))
     op.addheaders = [("User-Agent", UA), ("Referer", BASE + "/course/index")]
     return op
@@ -257,15 +369,88 @@ def collect(op, course, activities=None, want_video=True):
 
 
 def meta(op, uid):
+    """取一个 upload 的元信息。
+
+    返回 (info, err)。err 为 None 表示成功。
+
+    ★ 为什么不在这里吞异常：以前是 `except Exception: return {}`，
+    调用方拿到空 dict 只能一律标成「平台侧无权限或已删除」，于是
+    403 / 404 / 500 / 超时 / DNS 失败 / JSON 解不开 全被归成同一种「跳过」。
+    一次接口抖动就可能让整门课显示 fail=0、退出码 0，用户以为全下完了。
+    现在把错误原样交给调用方，由 expand_items 按类型分流。
+    """
     try:
-        return get_json(op, "%s/api/uploads/%s" % (BASE, uid))
-    except Exception:
-        return {}
+        return get_json(op, "%s/api/uploads/%s" % (BASE, uid)), None
+    except urllib.error.HTTPError as e:
+        return None, classify_http(e.code)
+    except Exception as e:
+        return None, {"kind": ERR_TRANSIENT,
+                      "msg": "%s: %s" % (type(e).__name__, str(e)[:60])}
+
+
+def classify_http(code):
+    """把 HTTP 状态码映射成错误类别。
+
+    403 / 404 —— 资源确实不可达（无权限 / 已删除），跳过合理；
+    401       —— 登录态问题，必须明确失败并提示重新登录；
+    其余(5xx 等)—— 服务端临时故障，算获取失败，不能当「没有这个文件」。
+    """
+    if code in (403, 404):
+        return {"kind": ERR_UNAVAILABLE, "code": code,
+                "msg": "平台侧无权限或已删除 (HTTP %d)" % code}
+    if code == 401:
+        return {"kind": ERR_AUTH, "code": code,
+                "msg": "登录态失效 (HTTP 401)，请重新登录"}
+    return {"kind": ERR_TRANSIENT, "code": code, "msg": "HTTP %d" % code}
+
+
+def has_expected_size(size):
+    """有没有可靠的服务端声明大小。0 / None 都视为不可靠。
+
+    回放这类资源常常拿不到声明总长，此时无法做一致性判断，
+    只能退回「文件存在且非空即视为已下载」的老策略。
+    """
+    try:
+        return int(size) > 0
+    except (TypeError, ValueError):
+        return False
+
+
+def already_complete(path, size):
+    """判断某个目标文件是否真的已经下载完。
+
+    ★ 以前是 `exists and getsize > 1024` —— 服务器上 100MB 的文件，
+    本地只有 20MB（上次下到一半被杀）也会被当成完整文件永远跳过。
+    现在：服务端有明确 size 时必须**大小相等**才算完整，不等就重下。
+
+    拿不到声明大小时（size 为 0 / None）退回「存在且非空」的宽松策略。
+    返回 (是否完整, 本地大小, 期望大小)。
+    """
+    if not os.path.exists(path):
+        return False, 0, None
+    local = os.path.getsize(path)
+    if has_expected_size(size):
+        exp = int(size)
+        return local == exp, local, exp
+    return local > 1024, local, None
+
+
+def is_project_pkg(name):
+    """这个文件名像不像「项目 / 大作业」压缩包。
+
+    .zip / .7z / .rar 是**必要条件**（项目包一定是压缩包），
+    但压缩包不一定是项目包 —— 还要名字里有 project / 项目 / 大作业 这类词。
+    以前 `PROJ_HINT` 里直接带了 `zip`，结果所有压缩包都被归进 项目/。
+    """
+    low = (name or "").lower()
+    if not low.endswith((".zip", ".7z", ".rar")):
+        return False
+    return bool(PROJ_HINT.search(name))
 
 
 def dest_for(kind, act, name, args):
     """决定落盘目录"""
-    if args.split_projects and PROJ_HINT.search(name) and name.lower().endswith(".zip"):
+    if args.split_projects and is_project_pkg(name):
         return os.path.join(args.out, "项目", act)
     # 录像与回放不参与按章归并：标题基本认不出章号，套下来只会全进「其他」
     if args.organize and kind not in ("录像", "回放"):
@@ -537,6 +722,12 @@ def main():
     # 其余 kind 的 uid 就是 upload id，直接用。
     items, live_err = expand_items(op, keys, args)
 
+    # ---- 消解目标路径冲突 ----
+    # 必须在列清单和下载之前做，否则第二个同名文件会被静默跳过、悄悄丢文件。
+    items, n_collided = resolve_collisions(items, args)
+    if n_collided and not args.quiet:
+        print("  检测到 %d 个目标路径冲突，已改用确定性后缀避免覆盖" % n_collided)
+
     # ---- 只列清单 ----
     if args.list_only:
         rows = build_rows(op, items, excl, args, quiet=args.quiet)
@@ -545,6 +736,7 @@ def main():
         return RC_OK
 
     ok = fail = skip = 0
+    auth_fail = 0
     rows = []
     for i, it in enumerate(items, 1):
         kind = it["kind"]
@@ -553,10 +745,26 @@ def main():
         size = it.get("size") or 0
 
         if it.get("error"):
-            print("[%2d] N/A   %s (平台侧无权限或已删除, 跳过)" % (i, it.get("uid")))
-            skip += 1
-            rows.append({"i": i, "kind": kind, "activity": act, "uid": it.get("uid"),
-                         "status": "na"})
+            # ★ 关键分流：只有 403 / 404（确实没权限或已删除）才算「跳过」。
+            #   登录态失效、超时、5xx、JSON 解析失败都是**获取失败**，
+            #   必须计入 fail，否则接口抖动会被伪装成「平台没给这个文件」，
+            #   用户看到 fail=0、退出码 0，以为全下完了。
+            if it.get("unavailable"):
+                print("[%2d] N/A   %s (%s)" % (i, it.get("uid"),
+                                               it.get("err_msg") or "不可达，跳过"))
+                skip += 1
+                rows.append({"i": i, "kind": kind, "activity": act,
+                             "uid": it.get("uid"), "status": "na",
+                             "error": it.get("err_msg")})
+                continue
+            msg = it.get("err_msg") or "元信息获取失败"
+            print("[%2d] FAIL  %s :: %s" % (i, str(it.get("uid"))[:40], msg))
+            fail += 1
+            rows.append({"i": i, "kind": kind, "activity": act,
+                         "uid": it.get("uid"), "status": "fail",
+                         "error": msg})
+            if it.get("err_kind") == ERR_AUTH:
+                auth_fail += 1
             continue
 
         if excl and excl.search(name):
@@ -570,13 +778,19 @@ def main():
         path = os.path.join(dest, name)
         rel = os.path.relpath(dest, args.out)
 
-        if os.path.exists(path) and os.path.getsize(path) > 1024:
+        complete, local_size, exp = already_complete(path, size)
+        if complete:
             if not args.quiet:
                 print("[%2d] SKIP  %-4s %-30s -> %s" % (i, kind, name[:28], rel))
             skip += 1
             rows.append({"i": i, "kind": kind, "activity": act, "name": name,
-                         "size": size, "dir": rel, "status": "exists"})
+                         "size": local_size, "dir": rel, "status": "exists"})
             continue
+        if local_size > 0:
+            # 有文件但大小对不上 —— 多半是上次中断留下的，重下（.part 会走续传）
+            print("[%2d] REDO  %-4s %-30s 本地 %s / 期望 %s"
+                  % (i, kind, name[:28], human_size(local_size),
+                     human_size(exp) if exp else "未知"))
 
         if args.dry_run:
             if args.verbose:
@@ -630,6 +844,10 @@ def main():
 
     tag = " (dry-run)" if args.dry_run else ""
     print("=== done%s ok=%d fail=%d skip=%d ===" % (tag, ok, fail, skip))
+    if auth_fail:
+        print("!! 有 %d 项因登录态问题失败，先重新登录再跑: "
+              "python lms_login.py --course %s" % (auth_fail, args.course),
+              file=sys.stderr)
     return RC_PARTIAL if fail else RC_OK
 
 
@@ -640,15 +858,21 @@ def expand_items(op, keys, args):
     - 回放（uid 是负数）：每个负数对应一个 lecture_live 活动，展开成多路机位
 
     返回 (items, errors)。每个 item 形如
-        {kind, activity, name, uid, size, url?, error?}
+        {kind, activity, name, uid, size, url?, error?, err_kind?}
+
+    error 字段：None 正常；ERR_UNAVAILABLE 的资源标 unavailable=True（跳过）；
+    其余错误（ERR_AUTH / ERR_TRANSIENT）标 error=True，调用方必须计入失败。
     """
     items = []
     for kind, act, uid in keys:
         if kind != "回放":
-            m = meta(op, uid)
-            if not m:
+            m, err = meta(op, uid)
+            if err:
+                kind_err = err.get("kind")
                 items.append({"kind": kind, "activity": act, "uid": uid,
-                              "name": "upload_%s" % uid, "error": True})
+                              "name": "upload_%s" % uid, "error": True,
+                              "err_kind": kind_err, "err_msg": err.get("msg"),
+                              "unavailable": kind_err == ERR_UNAVAILABLE})
                 continue
             items.append({
                 "kind": kind, "activity": act, "uid": uid,
@@ -661,10 +885,20 @@ def expand_items(op, keys, args):
         act_id = -uid
         try:
             d = get_json(op, "%s/api/activities/%s?sub_course_id=0" % (BASE, act_id))
+        except urllib.error.HTTPError as e:
+            err = classify_http(e.code)
+            items.append({"kind": kind, "activity": act, "uid": act_id,
+                          "name": "%s-回放" % act, "error": True,
+                          "err_kind": err["kind"], "err_msg": err["msg"],
+                          "unavailable": err["kind"] == ERR_UNAVAILABLE})
+            continue
         except Exception as e:
             print("  回放详情失败 %s: %s" % (act_id, str(e)[:50]))
             items.append({"kind": kind, "activity": act, "uid": act_id,
-                          "name": "%s-回放" % act, "error": True})
+                          "name": "%s-回放" % act, "error": True,
+                          "err_kind": ERR_TRANSIENT,
+                          "err_msg": "%s: %s" % (type(e).__name__, str(e)[:50]),
+                          "unavailable": False})
             continue
 
         reps = lms_live.parse_replay(d)
@@ -688,6 +922,56 @@ def expand_items(op, keys, args):
                 "error": None if p.get("ok") else True,
             })
     return items, None
+
+
+def resolve_collisions(items, args):
+    """下载计划阶段消解目标路径冲突。
+
+    ★ 为什么必须做：不同活动下的同名附件（例如每章都有一份 `讲义.pdf`，
+    或 `作业1.zip` 在多处出现）经 safe() / dest_for() 后可能落到同一个路径。
+    第二个条目会因为「目标已存在」被静默跳过 —— 文件悄悄丢了，日志里只多
+    一行 SKIP，用户根本看不出来。
+
+    处理方式：多个不同 uid 撞到同一路径时，从第二个开始改名为
+    `stem~<uid>.ext`。**确定性**的，重复运行得到同一路径 —— 不用随机数，
+    也不加时间戳，否则每次跑都是新文件，磁盘会被灌满。
+
+    仅处理带 error 之外的真实条目；条目会增加 `name` / `_collided` 字段。
+    返回 (items, n_fixed)。
+    """
+    seen = {}                       # (dest, name) -> 已经用过的条目
+    fixed = 0
+    for it in items:
+        if it.get("error") or it.get("unavailable"):
+            continue                # 这些条目根本不会下载，不参与占位
+        name = it.get("name")
+        if not name:
+            continue
+        dest = dest_for(it["kind"], it["activity"], name, args)
+        key = (dest, name)
+        if key not in seen:
+            seen[key] = it
+            continue
+        # 撞了：换一个带 uid 的确定性后缀
+        prev = seen[key]
+        if prev.get("_collided"):
+            # 前一个已经被改过名，说明新的这个还是撞，直接给它后缀
+            pass
+        stem, ext = split_ext(name)
+        uid = it.get("uid")
+        suffix = "~%s" % uid if uid is not None else "~dup"
+        new_name = safe("%s%s%s" % (stem, suffix, ext))
+        # 极少数情况下带上 uid 还是撞（同名不同 kind 落到同一目录底下的
+        # `其他/`），继续加计数把确定性保持住
+        n = 2
+        while (dest, new_name) in seen:
+            new_name = safe("%s%s-%d%s" % (stem, suffix, n, ext))
+            n += 1
+        it["name"] = new_name
+        it["_collided"] = True
+        fixed += 1
+        seen[(dest, new_name)] = it
+    return items, fixed
 
 
 def build_rows(op, items, excl, args, quiet=False):
@@ -722,6 +1006,27 @@ def build_rows(op, items, excl, args, quiet=False):
     return rows
 
 
+# 会被 Excel / LibreOffice 当公式解释的开头字符
+_CSV_FORMULA_PREFIX = ("=", "+", "-", "@", "\t", "\r")
+
+
+def csv_guard(v):
+    """CSV 单元格防公式注入。
+
+    LMS 的文件名 / 活动标题是**外部输入**，若以 = + - @ 开头，
+    用 Excel 打开清单时会当成公式执行（CSV Formula Injection）。
+    处理方式是在前面加一个单引号，让表格软件按文本处理。
+
+    ★ 只作用于写进 CSV 的文本，**不改实际落盘的文件名**，JSON 清单也不改。
+    非字符串（数字 / None / bool）原样返回，避免把 size 变成字符串。
+    """
+    if not isinstance(v, str):
+        return v
+    if v.startswith(_CSV_FORMULA_PREFIX):
+        return "'" + v
+    return v
+
+
 def write_manifest(path, rows):
     """按扩展名决定写 JSON 还是 CSV"""
     ext = os.path.splitext(path)[1].lower()
@@ -733,7 +1038,7 @@ def write_manifest(path, rows):
             w = csv.DictWriter(f, fieldnames=cols, extrasaction="ignore")
             w.writeheader()
             for r in sorted(rows, key=lambda x: x.get("i", 0)):
-                w.writerow(r)
+                w.writerow({k: csv_guard(v) for k, v in r.items()})
     else:
         with open(path, "w", encoding="utf-8") as f:
             json.dump({"count": len(rows), "files": rows}, f,
