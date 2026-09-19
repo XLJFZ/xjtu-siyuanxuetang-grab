@@ -73,14 +73,11 @@ ZIP_STEM = "xjtu-siyuanxuetang-grab"                # 压缩包与顶层文件�
 # 打进 Release 包的内容（白名单，不是黑名单 —— 新文件要显式加进来）
 INCLUDE = [
     ".gitignore",
+    ".github",
     "LICENSE",
     "README.md",
     "SKILL.md",
     "prompt.md",
-    "ci.yml.txt",
-    "release.yml.txt",
-    "pack.py.txt",
-    "enable-ci.bat",
     "release.py",
     "scripts",
     "tests",
@@ -88,12 +85,15 @@ INCLUDE = [
 
 # 就算在 INCLUDE 目录里也绝不打包
 EXCLUDE_NAMES = {
-    "__pycache__", ".git", ".github", ".pytest_cache", ".mypy_cache",
+    "__pycache__", ".git", ".pytest_cache", ".mypy_cache",
     ".ruff_cache", ".venv", "venv", ".idea", ".vscode",
 }
 EXCLUDE_SUFFIX = (".pyc", ".pyo", ".pyd", ".log", ".swp")
-# 登录态绝不能进包
-EXCLUDE_STATE = re.compile(r"(^|/)(state_.*\.json|.*\.state\.json|storage_state\.json|cookies.*\.json|.*\.har)$", re.I)
+# 登录态 / 活动清单 / 浏览器 profile 绝不能进包（与 .gitignore 保持同步）
+EXCLUDE_STATE = re.compile(
+    r"(^|/)(state_.*\.json|.*\.state\.json|storage_state\.json|cookies.*\.json"
+    r"|activities_.*\.json|.*\.har)$", re.I)
+EXCLUDE_PROFILE = re.compile(r"(^|/)profile_[^/]+(/|$)")
 
 # 单个文件体积上限，超过就报警（防止误把课程资料打进去）
 MAX_FILE_MB = 5
@@ -195,8 +195,8 @@ def collect_files(src):
                 rel = os.path.relpath(p, src).replace(os.sep, "/")
                 if fn in EXCLUDE_NAMES or fn.endswith(EXCLUDE_SUFFIX):
                     continue
-                if EXCLUDE_STATE.search(rel):
-                    warn("跳过疑似登录态：%s" % rel)
+                if EXCLUDE_STATE.search(rel) or EXCLUDE_PROFILE.search(rel):
+                    warn("跳过疑似凭据/个人数据：%s" % rel)
                     continue
                 out.append((p, rel))
     return sorted(out, key=lambda x: x[1])
@@ -274,7 +274,9 @@ def verify_zip(zip_path):
         for must in ("README.md", "SKILL.md", "scripts/lms_fetch.py",
                      "scripts/lms_organize.py", "scripts/lms_selfcheck.py",
                      "tests/test_organize.py", "tests/test_fetch.py",
-                     "tests/test_selfcheck.py"):
+                     "tests/test_selfcheck.py",
+                     ".github/workflows/ci.yml", ".github/workflows/release.yml",
+                     ".github/scripts/pack.py"):
             if not os.path.isfile(os.path.join(root, must)):
                 raise SystemExit("校验失败：包里缺 %s" % must)
 
