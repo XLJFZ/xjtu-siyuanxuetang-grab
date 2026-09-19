@@ -8,6 +8,10 @@
 
 实测：单门课 **58 个文件 / 530 MB / 0 失败**。
 
+[![CI](https://github.com/XLJFZ/xjtu-siyuanxuetang-grab/actions/workflows/ci.yml/badge.svg)](https://github.com/XLJFZ/xjtu-siyuanxuetang-grab/actions/workflows/ci.yml)
+![Python](https://img.shields.io/badge/python-3.8%2B-blue)
+![License](https://img.shields.io/badge/license-MIT-green)
+
 </div>
 
 ---
@@ -73,6 +77,38 @@ python scripts/lms_fetch.py --course <课程ID> --out "./CV" --dry-run
 python scripts/lms_fetch.py --course <课程ID> --out "./CV"
 ```
 
+**想要开箱就是分好章的结构？** 加个 `--organize`：
+
+```bash
+python scripts/lms_fetch.py --course <课程ID> --out "./CV" --organize --dry-run   # 先看归类对不对
+python scripts/lms_fetch.py --course <课程ID> --out "./CV" --organize
+```
+
+产物从 `课件/<活动标题>/` 变成：
+
+```
+CV/
+├── 课件/
+│   ├── 第01章 绪论/
+│   ├── 第11章 卷积的应用--Harris, GFTT,SIFT特征/
+│   └── 其他/                    ← 认不出章号的
+└── 作业/
+    ├── 第07章作业 Canny边缘检测/
+    └── 其他/                    ← 实验1、大实验作业这类
+```
+
+章节号从活动标题和文件名两处抽，优先采信活动标题。已覆盖 `第1章 / 第一章 / 第1讲`、
+`Lec11 / Lecture 3 / Chapter 2 / Unit 5`、纯数字开头 `01-绪论` 等写法。
+
+**会主动避开这些「假章号」**——它们前面是实验/作业/项目编号，不是章次：
+
+| 输入 | 结果 | 原因 |
+|---|---|---|
+| `实验1-数据库管理系统配置` + `1.1使用docker安装部署openGauss.pdf` | `其他/` | `1.1` 是小节号 |
+| `Project 1 Dolly Zoom` + `Project1_Dollyzoom.zip` | `其他/` | 项目编号 |
+| `大实验作业` + `实验报告模板.docx` | `其他/` | 实验编号 |
+| `【第一章】作业` + `第1章作业题目.png` | `第01章作业/` | 这是真章号，该按章归 |
+
 用系统自带的 Edge / Chrome 时**不需要**跑 `playwright install` 下载浏览器内核，脚本会自动探测。
 
 ## 目录内容
@@ -84,14 +120,18 @@ python scripts/lms_fetch.py --course <课程ID> --out "./CV"
 | `scripts/lms_common.py` | 公共配置——**唯一**含机器相关逻辑的文件 |
 | `scripts/lms_login.py` | 登录：Playwright 持久化 profile，登录态落盘 JSON |
 | `scripts/lms_fetch.py` | 抓取主体：列清单 / 下载 / 归类，支持干跑与增量 |
+| `scripts/lms_organize.py` | 章节解析：中文数字转换、多写法匹配、假章号排除 |
+| `tests/test_organize.py` | 离线自测，21 个用例，**不需要网络和登录态** |
 
 ## 参数与环境变量
 
 | 参数 | 作用 |
 |---|---|
+| `--organize` | 自动按章整理：`课件/第01章 xxx/`，认不出放 `其他/` |
 | `--exclude "2020\|2021\|2022"` | 文件名正则，命中跳过（清理旧版作业） |
 | `--split-projects` | 项目压缩包单独进 `项目/` |
 | `--layout flat` | 平铺，不按活动建子文件夹 |
+| `--dry-run` | 只打清单不下载 |
 | `--activities <json>` | 用本地清单，省一次请求 |
 | `--base <url>` | 换平台地址（**别的 TronClass 学校可直接复用**） |
 
@@ -102,6 +142,20 @@ python scripts/lms_fetch.py --course <课程ID> --out "./CV"
 | `LMS_BROWSER` | 自动探测 | 强制指定浏览器 exe 绝对路径 |
 
 浏览器探测顺序：`LMS_BROWSER` → 系统 Edge → 系统 Chrome → playwright 自带 chromium（Windows / macOS / Linux 三分支都已覆盖）。
+
+## 开发者：跑测试
+
+章节解析这块是最容易出回归的地方（一个正则改动就可能让整门课归错目录），所以有一份**纯离线**测试：
+
+```bash
+python tests/test_organize.py
+```
+
+21 个用例，全部来自真实抓取数据（CV 课 33593 + 数据库课 33590），不需要网络、不需要登录态、零依赖。
+覆盖：中文数字转换、括号剥离、六种章节写法识别、假章号排除、目录名去重。
+
+CI 在 push / PR 时自动跑三平台 × 三个 Python 版本，外加一步隐私自检——
+确认仓库里没有误提交登录态、脚本里没有残留本机绝对路径。
 
 ## 三个必踩的坑
 
@@ -120,6 +174,15 @@ python scripts/lms_fetch.py --course <课程ID> --out "./CV"
 ## 出处
 
 2026-09-19 从《计算机视觉与模式识别》（课程 33593）的一次实战抓取中提炼。当天实测下载 58 个文件 / 530.5 MB / 0 失败。
+同日用《数据库系统》（课程 33590）交叉验证：20 个文件 / 34 MB / 0 失败，覆盖 `--organize` 与两类附件来源。
+
+## 更新日志
+
+| 版本 | 变更 |
+|---|---|
+| v1.0.2 | 新增 `--organize` 按章整理；新增离线测试与 CI；`.gitignore` 补漏（profile 目录、压缩包、缓存） |
+| v1.0.1 | 安装说明泛化到 WorkBuddy / Claude Code / Codex，强调不装 Skill 也能用；仓库改名 xjtu-siyuanxuetang-grab |
+| v1.0.0 | 首个版本：登录、两类附件来源合并、增量下载、干跑 |
 
 ## License
 
