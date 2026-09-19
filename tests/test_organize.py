@@ -6,7 +6,7 @@
 或（不想装 pytest 时）：
     python tests/test_organize.py
 
-用例全部取自真实课程数据：《计算机视觉与模式识别》33593 与《数据库系统》33590。
+用例取自真实课程数据，已隐去课程名称。
 """
 import os
 import sys
@@ -82,7 +82,7 @@ class TestParseChapter(unittest.TestCase):
             with self.subTest(act=act, name=name):
                 self.assertEqual(parse_chapter(act, name), want)
 
-    def test_real_db_course(self):
+    def test_real_course_data(self):
         cases = [
             ("【第一章】课件", "第1章-数据库系统概述-米辅.pptx", 1),
             ("【第二章】课件", "第2章-关系模型-米辅.pptx", 2),
