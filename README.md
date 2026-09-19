@@ -1,6 +1,6 @@
 <div align="center">
 
-# xjtu-lms-grab
+# xjtu-siyuanxuetang-grab
 
 **思源学堂 2.0 课程资料一键抓取 —— AI Skill + Prompt + 脚本**
 
@@ -35,11 +35,11 @@ AI 就会自动走完「登录 → 干跑列清单 → 确认 → 下载 → 归
 
 ## 安装
 
-把 `xjtu-lms-grab` 文件夹放进 Skill 目录：
+把 `xjtu-siyuanxuetang-grab` 文件夹放进 Skill 目录：
 
 ```
-Windows:      C:\Users\<你>\.workbuddy\skills\xjtu-lms-grab\
-macOS / Linux: ~/.workbuddy/skills/xjtu-lms-grab/
+Windows:      C:\Users\<你>\.workbuddy\skills\xjtu-siyuanxuetang-grab\
+macOS / Linux: ~/.workbuddy/skills/xjtu-siyuanxuetang-grab/
 ```
 
 > Skill 是本仓库所用 AI 助手（WorkBuddy / Claude Code 类工具）的扩展机制：目录下放一份 `SKILL.md`，助手在匹配到场景时会自动读取并执行。
