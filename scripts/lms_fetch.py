@@ -12,7 +12,16 @@
     python lms_fetch.py --course 33593 --out "./CV" --dry-run
     python lms_fetch.py --course 33593 --out "./CV"
     python lms_fetch.py --course 33593 --out ./CV --exclude "2020|2021|2022"
+    python lms_fetch.py --course 33593 --out ./CV --organize
     python lms_fetch.py --course 33593 --out ./CV --layout flat
+
+目录结构（默认 activity 布局）:
+    <out>/{课件,作业}/<活动标题>/<文件名>
+加 --organize 后自动按章归并:
+    <out>/课件/第01章 绪论/<文件名>
+    <out>/课件/其他/<文件名>          ← 认不出章号的
+加 --split-projects 后 zip 项目包单独走:
+    <out>/项目/<活动标题>/<文件名>
 
 环境要求:
     只需要标准库 + 已跑过 lms_login.py 生成的登录态 JSON，不依赖浏览器。
@@ -29,6 +38,7 @@ from urllib.parse import urlparse
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from lms_common import BASE, HOST, state_path
+from lms_organize import parse_chapter, chapter_dir
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36 Edg/153.0.0.0")
@@ -107,9 +117,13 @@ def main():
     ap.add_argument("--exclude", default=None, help="文件名正则, 命中则跳过")
     ap.add_argument("--layout", choices=["activity", "flat"], default="activity",
                     help="activity=按活动分文件夹(默认)  flat=平铺")
+    ap.add_argument("--organize", action="store_true",
+                    help="自动按章整理: 课件/第01章 xxx/ ；识别不到章号的放 其他/")
     ap.add_argument("--split-projects", action="store_true",
                     help="把项目压缩包单独放进 项目/ 目录")
     ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("-v", "--verbose", action="store_true",
+                    help="干跑时打印归类后的目标目录")
     args = ap.parse_args()
 
     if args.base:
@@ -152,6 +166,12 @@ def main():
 
         if args.split_projects and PROJ_HINT.search(name) and name.lower().endswith(".zip"):
             dest = os.path.join(args.out, "项目", act)
+        elif args.organize:
+            ch = parse_chapter(act, name)
+            if ch is None:
+                dest = os.path.join(args.out, kind, "其他")
+            else:
+                dest = os.path.join(args.out, kind, chapter_dir(ch, [act, name]))
         elif args.layout == "flat":
             dest = os.path.join(args.out, kind)
         else:
@@ -162,8 +182,12 @@ def main():
             skip += 1
             continue
         if args.dry_run:
-            print("[%2d] PLAN  %-9s %-28s %-44s %8.1fKB"
-                  % (i, kind, act[:26], name[:42], size / 1024))
+            if args.verbose:
+                print("[%2d] PLAN  %-4s %-30s -> %s" % (i, kind, name[:28],
+                                                        os.path.relpath(dest, args.out)))
+            else:
+                print("[%2d] PLAN  %-9s %-28s %-44s %8.1fKB"
+                      % (i, kind, act[:26], name[:42], size / 1024))
             continue
         os.makedirs(dest, exist_ok=True)
         try:
