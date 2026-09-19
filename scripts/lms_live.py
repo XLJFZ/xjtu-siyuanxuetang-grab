@@ -23,7 +23,11 @@
 
 一个未解之谜：实测 Content-Length 438175558，读到自然 EOF 共 413.7MB（差 5.6%）。
 原因不明（容器尾部 / 时间戳对齐都有可能），在拿到官方哈希前不把它当失败。
-校验只能用「比上次多读到多少」这种相对判据。
+
+处理方式：不再静默吞掉，而是显式比对「服务端声明的总长」与「实得字节数」。
+差异在 SHORT_TOLERANCE 以内视作正常（实测 5.6% 落在这个区间），只记一条 note；
+超出阈值就告警并把 shortfall 写进结果，让调用方能看出这一节可能真的没下完。
+校验只能用「比上次多读到多少」这种相对判据 —— 没有官方哈希可用。
 """
 import hashlib
 import json
@@ -36,6 +40,10 @@ import urllib.request
 # 一节课的录像能到 500MB 上下，留点余量
 MAX_BYTES = 4 * 1024 * 1024 * 1024
 CHUNK = 256 * 1024
+
+# 实得字节数相对 Content-Length 允许少多少而不告警。
+# 实测的自然短读约 5.6%，取 8% 留出余量；超出就说明这次真的异常。
+SHORT_TOLERANCE = 0.08
 
 
 def parse_replay(activity_data):
@@ -146,7 +154,10 @@ def download(op, url, path, expect=None, retries=3, quiet=False,
       - Range 起点以 Content-Range 为准（服务端会扩大）
       - 不做整体 sha256 比对（拿不到官方哈希），只做大小合理性检查
 
-    返回 {ok, size, sha256, err, retried, resumed}
+    返回 {ok, size, sha256, err, retried, resumed, declared, shortfall, note}
+    declared  : 服务端声明的总字节数（Content-Range 总长，拿不到为 None）
+    shortfall : 实得比声明少了多少比例（拿不到声明总长时为 None）
+    note      : 人可读的补充说明，正常时为 None
     """
     tmp = path + ".part"
     last_err = None
@@ -261,9 +272,19 @@ def download(op, url, path, expect=None, retries=3, quiet=False,
                 return {"ok": False, "err": last_err}
 
             os.replace(tmp, path)
+            # 短读判定：拿到声明总长时才算，不静默吞掉差异
+            declared = None
+            shortfall = None
+            note = None
+            if total and total > 0:
+                declared = total
+                shortfall = max(0.0, (total - got) / float(total))
+                if shortfall > SHORT_TOLERANCE:
+                    note = ("实得 %d 字节，服务端声明 %d 字节，少 %.1f%%"
+                            % (got, total, shortfall * 100))
             return {"ok": True, "size": got, "sha256": h.hexdigest(),
                     "retried": attempt, "resumed": used_resume,
-                    "expected": expect}
+                    "declared": declared, "shortfall": shortfall, "note": note}
 
         except urllib.error.HTTPError as e:
             if e.code in (401, 403):
