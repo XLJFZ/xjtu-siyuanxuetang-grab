@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>xjtu-siyuanxuetang-grab</title>
-<meta name="description" content="把西安交大思源学堂 2.0 任意课程的课件、作业、课堂录像一次性拉到本地。">
+<meta name="description" content="思源学堂 2.0 个人课程资料下载、备份与整理工具，仅用于当前账号有权访问的课程资源。">
 <style>
 :root {
   --bg: #fff;
@@ -220,7 +220,7 @@ footer a { color: var(--fg-2); }
   <div class="wrap">
     <span class="tb-name">xjtu-siyuanxuetang-grab</span>
     <span class="tb-sep">/</span>
-    <span class="tb-sub">思源学堂课程资料抓取</span>
+    <span class="tb-sub">思源学堂课程资料下载与整理</span>
     <span class="tb-links">
       <a href="https://github.com/XLJFZ/xjtu-siyuanxuetang-grab">GitHub</a>
       <a href="https://github.com/XLJFZ/xjtu-siyuanxuetang-grab#readme">文档</a>
@@ -231,8 +231,8 @@ footer a { color: var(--fg-2); }
 <div class="wrap">
 
   <div class="hero">
-    <h1>把整门课的课件、作业和录像<br>一次性拉到本地</h1>
-    <p>西安交大思源学堂 2.0 任意课程，自动走完登录、列清单、下载、按章归类。课堂录像与直播回放一并支持。</p>
+    <h1>把课程资料备份到本地<br>并自动整理归类</h1>
+    <p>面向西安交大思源学堂 2.0，仅处理当前账号有权访问的课程。自动走完登录、列清单、下载、按章归类。课堂录像与直播回放一并支持。</p>
     <div class="meta">
       <span>Python 3.8+</span><span class="dot"></span>
       <span>MIT</span><span class="dot"></span>
@@ -276,23 +276,42 @@ python scripts/lms_fetch.py --course &lt;课程ID&gt; --out "./CV"</code></pre>
       </div>
 
       <div class="sec">
+        <h2>使用范围</h2>
+        <p>仅用于个人学习过程中的课程资料备份与离线整理，只访问当前登录账号正常拥有访问权限的课程资源。</p>
+        <div class="faq">
+          <div class="q">
+            <b>会绕过认证或越权吗？</b>
+            <span>不会。登录由学校统一身份认证完成，程序沿用你本人正常登录后的会话状态，也不提供枚举无权课程的功能。</span>
+          </div>
+          <div class="q">
+            <b>会不会给平台造成压力？</b>
+            <span>请求保持串行，权限类错误（401 / 403）立即停止重试，并支持断点续传避免重复下载。建议先用 <code>--dry-run</code> 确认资源量。</span>
+          </div>
+          <div class="q">
+            <b>下载的资料可以再传播吗？</b>
+            <span>不建议。课程资源版权归教师和学校，请在获得授权的范围内使用，不要通过本项目重新公开传播。</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="sec">
         <h2>常见问题</h2>
         <div class="faq">
           <div class="q">
             <b>干跑出来的清单不全？</b>
-            <span>课件藏在页面正文里，不在附件字段。脚本已经两个来源都扫了，如果还缺，多半是平台侧无权限（会标 <code>N/A</code>）。</span>
+            <span>课件藏在活动正文里，不在附件字段。脚本已经两个来源都扫了，如果还缺，多半是平台侧无权限（会标 <code>N/A</code>）。</span>
           </div>
           <div class="q">
             <b>登录态多久过期？</b>
             <span>没有固定时限。下载前会自动探测，过期会明确提示重跑登录。</span>
           </div>
           <div class="q">
-            <b>能下别的学校吗？</b>
-            <span>可以。用 <code>--base</code> 指向任意 TronClass 平台。</span>
+            <b>能用于别的学校吗？</b>
+            <span>可以。用 <code>--base</code> 指向其他 TronClass 平台，同样仅限该账号有权访问的资源。</span>
           </div>
           <div class="q">
             <b>回放下载中途报错怎么办？</b>
-            <span>直接重跑，从断点继续。回放限流返回的 <code>403</code> 会被自动识别成限流并退避重试，不是登录态过期。</span>
+            <span>直接重跑，从断点继续。回放请求需保持串行，并发会被服务端拒绝。</span>
           </div>
           <div class="q">
             <b>同一天上了好几节课，会覆盖吗？</b>
@@ -307,11 +326,11 @@ python scripts/lms_fetch.py --course &lt;课程ID&gt; --out "./CV"</code></pre>
         <h2>特点</h2>
         <div class="feats">
           <div class="feat"><b>断点续传</b><span>中断了从断点继续，不重头下</span></div>
-          <div class="feat"><b>自动重试</b><span>超时和 5xx 退避重试</span></div>
+          <div class="feat"><b>自动重试</b><span>超时和 5xx 退避重试，权限错误不重试</span></div>
           <div class="feat"><b>按章归类</b><span>认得出六种章号写法</span></div>
-          <div class="feat"><b>可换学校</b><span>指向任意 TronClass 平台</span></div>
+          <div class="feat"><b>串行请求</b><span>不并发，避免给平台造成额外压力</span></div>
           <div class="feat"><b>课件·作业·录像·回放</b><span>四类自动分流到各自目录</span></div>
-          <div class="feat"><b>多机位命名</b><span>带本地时间戳，同名课程不会互相覆盖</span></div>
+          <div class="feat"><b>完整性校验</b><span>sha256 + 大小交叉验证，支持增量</span></div>
         </div>
       </div>
 
