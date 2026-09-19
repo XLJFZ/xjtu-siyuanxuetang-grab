@@ -513,13 +513,16 @@ class TestCollectKinds(Base):
 
             return R(raw)
 
-    def _run(self, acts, details, want_video=True):
-        """跑一次真实的 collect()，并把它的进度输出静音。"""
+    def _run_full(self, acts, details, want_video=True):
+        """跑一次真实的 collect()，返回 (keys, n1, n2)，输出静音。"""
         import contextlib
         op = self._Op(acts, details)
         with contextlib.redirect_stdout(io.StringIO()):
-            keys, _ = F.collect(op, "1", acts, want_video=want_video)
-        return keys
+            keys, n1, n2 = F.collect(op, "1", acts, want_video=want_video)
+        return keys, n1, n2
+
+    def _run(self, acts, details, want_video=True):
+        return self._run_full(acts, details, want_video)[0]
 
     def _kinds(self, acts, want_video=True):
         return self._run(acts, {}, want_video)
@@ -587,6 +590,35 @@ class TestCollectKinds(Base):
                 {"type": "lesson", "title": "L", "uploads": [{"id": 3}]}]
         kinds = [k for k, _, _ in self._kinds(acts)]
         self.assertEqual(sorted(kinds), ["作业", "录像", "课件"])
+
+    def test_source_counts_exclude_replay(self):
+        """来源①②的计数只算 uploads 类条目，回放（来源③）不能混进去。
+
+        回归背景：主流程一度用 len(keys) - n1 反推来源②，视频默认开启时
+        回放条目会被算成「正文内嵌」，数字虚高且随回放数量漂移。
+        """
+        acts = [{"id": 777, "type": "lecture_live", "title": "回放", "uploads": []},
+                {"type": "lesson", "title": "L", "uploads": [{"id": 3}]}]
+        det = {777: {"data": {"external_live_detail": {"replay_videos": [
+            {"camera_id": 1, "camera_type": "encoder", "url": "http://r/x"}]}}}}
+        keys, n1, n2 = self._run_full(acts, det, want_video=True)
+
+        self.assertEqual(n1, 1)                     # 来源①：只有 L 的那个附件
+        self.assertEqual(n2, 0)                     # 正文内嵌：没有
+        self.assertEqual(n1 + n2, 1)                # 两个来源合计
+        self.assertEqual(len(keys), 2)              # 但总条目含回放，多 1
+        self.assertEqual(sum(1 for k, _, _ in keys if k == "回放"), 1)
+
+    def test_source2_counts_embedded_uploads(self):
+        """type=page 活动正文里嵌的 uploads 要计入来源②，且与条目数吻合。"""
+        acts = [{"id": 5, "type": "page", "title": "第1讲", "uploads": None}]
+        det = {5: {"data": {"content":
+                            '<img src="/api/uploads/8811"><a href="/api/uploads/8812">'}}}
+        keys, n1, n2 = self._run_full(acts, det, want_video=False)
+
+        self.assertEqual(n1, 0)
+        self.assertEqual(n2, 2)
+        self.assertEqual(sorted(keys), [("课件", "第1讲", 8811), ("课件", "第1讲", 8812)])
 
 
 class TestReplayNaming(Base):
@@ -672,6 +704,75 @@ class TestManifest(Base):
             head = f.readline().strip()
         self.assertIn("name", head)
         self.assertIn("status", head)
+
+
+class TestLiveShortRead(Base):
+    """回放下载的短读判定 —— lms_live 没有官方哈希可用，只能靠声明总长比对。
+
+    回归背景：实测 Content-Length 438175558，自然 EOF 只读到 413.7MB（差 5.6%），
+    旧实现静默接受，调用方无法分辨「正常的自然短读」和「真的没下完」。
+    """
+
+    class _Op:
+        """假的 opener：直接给出 _open_range 的返回值形状。"""
+
+        def __init__(self, body, content_range=None, headers=None):
+            self.body = body
+            self.content_range = content_range
+            self.headers = headers or {}
+
+        def open(self, req, timeout=None):
+            h = {"Content-Type": "video/mp4"}
+            h.update(self.headers)
+            if self.content_range:
+                h["Content-Range"] = self.content_range
+            return FakeResponse(self.body, headers=h, status=206)
+
+    def _dl(self, body_len, declared):
+        import lms_live
+        op = self._Op(b"x" * body_len,
+                      content_range="bytes 0-%d/%d" % (body_len - 1, declared))
+        path = os.path.join(self.tmp, "r.mp4")
+        return lms_live.download(op, "http://r/x", path, retries=1, quiet=True)
+
+    def test_normal_short_read_is_tolerated(self):
+        """实测的自然短读（约 5.6%）落在阈值内：算成功，但不给 note。"""
+        res = self._dl(944000, 1000000)          # 少 5.6%
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["size"], 944000)
+        self.assertEqual(res["declared"], 1000000)
+        self.assertAlmostEqual(res["shortfall"], 0.056, places=3)
+        self.assertIsNone(res["note"])
+
+    def test_excessive_short_read_warns(self):
+        """少得太多（超过阈值）时要在 note 里说清楚，让调用方能复核。"""
+        res = self._dl(500000, 1000000)          # 少 50%
+        self.assertTrue(res["ok"])
+        self.assertIsNotNone(res["note"])
+        self.assertIn("500000", res["note"])
+        self.assertIn("1000000", res["note"])
+
+    def test_exact_length_has_no_shortfall(self):
+        res = self._dl(1000000, 1000000)
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["shortfall"], 0.0)
+        self.assertIsNone(res["note"])
+
+    def test_no_declared_length_stays_silent(self):
+        """拿不到声明总长时不该瞎判，shortfall / note 都留空。"""
+        import lms_live
+        op = self._Op(b"x" * 4096)               # 没有 Content-Range
+        path = os.path.join(self.tmp, "n.mp4")
+        res = lms_live.download(op, "http://r/x", path, retries=1, quiet=True)
+        self.assertTrue(res["ok"])
+        self.assertIsNone(res["declared"])
+        self.assertIsNone(res["shortfall"])
+        self.assertIsNone(res["note"])
+
+    def test_tolerance_constant_reasonable(self):
+        """阈值本身要大于实测的 5.6%，否则正常回放天天告警。"""
+        import lms_live
+        self.assertGreater(lms_live.SHORT_TOLERANCE, 0.056)
 
 
 if __name__ == "__main__":
