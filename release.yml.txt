@@ -42,7 +42,9 @@ jobs:
         run: python -m compileall -q scripts/ tests/
 
       - name: 离线测试
-        run: python tests/test_organize.py
+        run: |
+          python tests/test_organize.py
+          python tests/test_fetch.py
 
       - name: 隐私自检
         run: |
