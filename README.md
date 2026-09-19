@@ -169,8 +169,9 @@ CV/
 | `scripts/lms_login.py` | 登录：Playwright 持久化 profile，登录态落盘 JSON |
 | `scripts/lms_fetch.py` | 抓取主体：列清单 / 下载 / 归类，支持续传、重试、干跑与增量 |
 | `scripts/lms_organize.py` | 章节解析：中文数字转换、多写法匹配、假章号排除 |
+| `scripts/lms_live.py` | 直播回放下载：走 rms-v5 独立端点，串行、按 Content-Range 校正偏移 |
 | `tests/test_organize.py` | 章节解析离线自测，22 个用例 |
-| `tests/test_fetch.py` | 下载逻辑离线自测，38 个用例（用假 opener 模拟服务端） |
+| `tests/test_fetch.py` | 下载逻辑离线自测，64 个用例（用假 opener 模拟服务端） |
 | `ci.yml.txt` | CI 配置，用 `enable-ci.bat` 启用 |
 | `release.yml.txt` | 打 tag 自动发版的 Actions 配置 |
 | `pack.py.txt` | Release 工作流用的打包脚本 |
@@ -233,13 +234,13 @@ CV/
 
 ```bash
 python tests/test_organize.py     # 22 个用例
-python tests/test_fetch.py        # 38 个用例
+python tests/test_fetch.py        # 64 个用例
 ```
 
 | 文件 | 覆盖 |
 |---|---|
 | `test_organize.py` | 中文数字转换、括号剥离、六种章节写法、假章号排除、目录名去重、目录名不带扩展名 |
-| `test_fetch.py` | 下载成功/重试/403 不重试/5xx 重试/空响应/HTML 响应/sha256 不符/etag 不符、断点续传四场景、文件名安全、归类路径、清单导出 |
+| `test_fetch.py` | 下载成功/重试/403 不重试/5xx 重试/空响应/HTML 响应/sha256 不符/etag 不符、断点续传四场景、文件名安全、归类路径、清单导出、多来源计数、回放短读判定 |
 
 `test_fetch.py` 用假 opener 脚本化服务端行为，所以能测「第一次超时第二次成功」这类
 真实环境里很难复现的路径。
@@ -318,7 +319,8 @@ python release.py --version 1.1.0 --title "下载可靠性" --yes       # 正式
 1. **版本号自检** —— tag 已存在就报错退出。已发布的版本内容不可变，要改就发新版本号。
    （这条是踩过坑换来的：v1.0.0 曾被原地覆盖过。）
 2. **包体校验** —— 上传前解压到临时目录，确认关键文件齐全、没混进登录态、
-   离线测试能过（两个测试文件，共 60 个用例）。校验不过就不发。
+   离线测试能过（两个测试文件，共 86 个用例；用例数由测试自己报出，并与
+   静态扫描的 `def test_` 数量交叉核对，对不上就告警）。校验不过就不发。
 3. **打包白名单** —— 用 `INCLUDE` 显式列出该打进去的东西，新文件必须手动加；
    另有体积上限兜底，防止课程资料误入。
    **这份清单和 CI 用的 `pack.py.txt` 必须保持一致** —— 否则本地发的包和 CI 发的包内容不同。
@@ -372,6 +374,8 @@ git tag v1.1.0 && git push origin v1.1.0
 
 | 版本 | 变更 |
 |---|---|
+| v1.2.1 | 修 `collect()` 的来源②计数（原先用总数相减，把直播回放误算成「正文内嵌」）；`release.py` 包体校验改为上报测试实际执行的用例数并与静态扫描交叉核对；抽取 `download()` 中重复四次的失败处理块；回放下载新增短读判定（对比 `Content-Length`，超 8% 告警并写入清单）；README 用例数与文件清单同步 |
+| v1.2.0 | 直播回放下载（`lms_live.py`，走 rms-v5 独立端点）；修同一天多个 `lecture_live` 活动 title 相同导致回放互相覆盖的丢数据 bug（文件名加入本地时间戳与机位）；离线测试扩到 79 个 |
 | v1.1.0 | 下载可靠性：断点续传、自动重试、sha256 校验、etag 交叉验证、登录态探测、进度条、`--list-only` / `--manifest`、语义化退出码；修长文件名丢扩展名；测试扩到 60 个 |
 | v1.0.4 | `release.py` 纳入发布内容并支持两种存放位置；新增 `--update-notes`（`PATCH /releases/tags/<tag>` 不存在，须走数字 id） |
 | v1.0.3 | 新增本地一键发布脚本 `release.py`：版本号自检 + 包体校验 + 打包白名单 |
