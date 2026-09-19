@@ -314,11 +314,11 @@ class TestResume(Base):
 
 
 class TestEtagSize(Base):
-    """etag 里藏着文件大小 —— 这是思源学堂唯一可用的服务端完整性信号。"""
+    """etag 里藏着文件大小 —— 这是平台唯一可用的服务端完整性信号。"""
 
     def test_parse(self):
-        # 实测：etag "698e9012-cb2ec" 对应 832236 字节
-        self.assertEqual(F._etag_size('"698e9012-cb2ec"'), 832236)
+        # etag 后半段是十六进制文件大小：0xcb2ec = 832236
+        self.assertEqual(F._etag_size('"00000000-cb2ec"'), 832236)
 
     def test_invalid(self):
         self.assertIsNone(F._etag_size(None))
@@ -625,13 +625,13 @@ class TestReplayNaming(Base):
     """回放文件名 —— 踩过的坑：同一天多个活动 title 完全相同。"""
 
     def test_stamp_disambiguates(self):
-        """没有时间戳时，同一天 4 节课会生成同一个文件名、互相覆盖。
+        """没有时间戳时，同一天多节课会生成同一个文件名、互相覆盖。
 
-        实测某课程 4 个 lecture_live 活动 title 都是
-        「2026-09-19-计算机视觉与模式识别」，只有 start_time 不同。
+        实际情形：同一课程的多个 lecture_live 活动 title 完全相同，
+        只有 start_time 不同。
         """
         import lms_live
-        t = "2026-09-19-计算机视觉与模式识别"
+        t = "2026-09-19-示例课程A"
         a = lms_live.safe_name(t, "encoder", stamp="20260919-1430")
         b = lms_live.safe_name(t, "encoder", stamp="20260919-1530")
         self.assertNotEqual(a, b)
@@ -641,7 +641,7 @@ class TestReplayNaming(Base):
     def test_camera_disambiguates(self):
         """同一场次的两路机位也不能撞名。"""
         import lms_live
-        t = "2026-09-19-计算机视觉与模式识别"
+        t = "2026-09-19-示例课程A"
         a = lms_live.safe_name(t, "encoder", stamp="20260919-1430")
         b = lms_live.safe_name(t, "instructor", stamp="20260919-1430")
         self.assertNotEqual(a, b)
@@ -709,7 +709,7 @@ class TestManifest(Base):
 class TestLiveShortRead(Base):
     """回放下载的短读判定 —— lms_live 没有官方哈希可用，只能靠声明总长比对。
 
-    回归背景：实测 Content-Length 438175558，自然 EOF 只读到 413.7MB（差 5.6%），
+    回归背景：服务端声明的 Content-Length 与自然 EOF 实得字节数之间存在小幅差异，
     旧实现静默接受，调用方无法分辨「正常的自然短读」和「真的没下完」。
     """
 
