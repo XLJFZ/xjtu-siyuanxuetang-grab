@@ -4,11 +4,16 @@
 #   1. 推一个 v* 开头的 tag：       git tag v1.0.3 && git push origin v1.0.3
 #   2. 网页 Actions 页手动触发：    输入版本号即可
 #
-# 为什么本仓库可能用不上：GitHub 要求 .github/workflows/ 下的文件必须用带
-# Workflows 权限的 token 推送，Contents API 会被 403。如果这个文件没在仓库里，
-# 把 ci.yml.txt 旁边的这份 release-notes.yml 按同样方式启用（见 enable-ci.bat 说明）。
+# 依赖：本工作流调用 .github/scripts/pack.py，由 enable-ci.bat 从
+#       pack.py.txt 一并还原。只还原 ci.yml 而不还原 pack.py 会在这里挂掉。
 #
-# 若本机 git 协议不通（代理拦截），可以改用 release.py --version X.Y.Z 从本地发。
+# 为什么本仓库默认没启用：GitHub 要求 .github/workflows/ 下的文件必须用带
+# Workflows: Read and write 权限的 token 推送，Contents API 会被 403。
+# 所以这些配置以 .txt 形式随包提供，想启用就双击 enable-ci.bat 还原到正确位置。
+#
+# 注意：本工作流的入口是 "推一个 tag"。如果你的网络环境 git push 不通
+# （代理拦截 git 协议），这条路径就用不上 —— 改用 release.py --version X.Y.Z
+# 从本地发布，功能等价。
 
 name: Release
 
@@ -81,7 +86,12 @@ jobs:
           echo "版本: v$V"
 
       - name: 打包
-        run: python .github/scripts/pack.py --version "${{ steps.ver.outputs.version }}"
+        run: |
+          test -f .github/scripts/pack.py || {
+            echo "::error::缺少 .github/scripts/pack.py，请先运行 enable-ci.bat 或手动 cp pack.py.txt .github/scripts/pack.py"
+            exit 1
+          }
+          python .github/scripts/pack.py --version "${{ steps.ver.outputs.version }}"
 
       - name: 发布
         uses: softprops/action-gh-release@v2
