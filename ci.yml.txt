@@ -28,7 +28,9 @@ jobs:
         run: python -m compileall -q scripts/ tests/
 
       - name: Run offline tests
-        run: python tests/test_organize.py
+        run: |
+          python tests/test_organize.py
+          python tests/test_fetch.py
 
       - name: Check CLI help works
         run: |
