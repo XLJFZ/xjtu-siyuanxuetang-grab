@@ -237,6 +237,20 @@ def build_zip(src, version, dry_run=False):
     return zip_path, files
 
 
+def count_cases(root):
+    """数一数 tests/ 下有多少个 test_ 方法，用于校验输出里报个数。"""
+    n = 0
+    tdir = os.path.join(root, "tests")
+    for fn in os.listdir(tdir):
+        if not (fn.startswith("test_") and fn.endswith(".py")):
+            continue
+        with open(os.path.join(tdir, fn), encoding="utf-8") as f:
+            for line in f:
+                if re.match(r"\s+def test_", line):
+                    n += 1
+    return n
+
+
 def verify_zip(zip_path):
     """解包到临时目录跑一遍测试，确认包是能用的。"""
     tmp = tempfile.mkdtemp(prefix="relverify_")
@@ -247,7 +261,8 @@ def verify_zip(zip_path):
 
         # 关键文件必须在
         for must in ("README.md", "SKILL.md", "scripts/lms_fetch.py",
-                     "scripts/lms_organize.py", "tests/test_organize.py"):
+                     "scripts/lms_organize.py",
+                     "tests/test_organize.py", "tests/test_fetch.py"):
             if not os.path.isfile(os.path.join(root, must)):
                 raise SystemExit("校验失败：包里缺 %s" % must)
 
@@ -257,15 +272,20 @@ def verify_zip(zip_path):
                 if EXCLUDE_STATE.search(fn):
                     raise SystemExit("校验失败：包里混进了登录态 %s" % fn)
 
-        # 跑离线测试
-        r = subprocess.run([sys.executable, os.path.join(root, "tests", "test_organize.py")],
-                           capture_output=True, text=True)
-        tail = (r.stderr or r.stdout).strip().splitlines()
-        if r.returncode != 0:
-            print("\n".join(tail[-8:]))
-            raise SystemExit("校验失败：离线测试没通过")
-        ran = [l for l in tail if l.startswith("Ran ")]
-        ok("包内自测通过（%s）" % (ran[0] if ran else "OK"))
+        # 跑离线测试（两个文件都要跑，别只跑一个）
+        total_ran = 0
+        for t in ("test_organize.py", "test_fetch.py"):
+            r = subprocess.run([sys.executable,
+                                os.path.join(root, "tests", t)],
+                               capture_output=True, text=True)
+            tail = (r.stderr or r.stdout).strip().splitlines()
+            if r.returncode != 0:
+                print("\n".join(tail[-8:]))
+                raise SystemExit("校验失败：%s 没通过" % t)
+            ran = [l for l in tail if l.startswith("Ran ")]
+            total_ran += 1
+        ok("包内自测通过（%d 个测试文件，共 %d 个用例）"
+           % (total_ran, count_cases(root)))
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -291,12 +311,17 @@ def release_by_tag(tag):
 
 
 def push_code(src, branch="main"):
-    """调 gh_push_dir.py 把源目录推上去（复用已有脚本，不重写）。"""
-    pusher = os.path.join(HERE, "..", "_工具", "gh_push_dir.py")
+    """调 gh_push_dir.py 把源目录推上去（复用已有脚本，不重写）。
+
+    注意：找不到推送脚本时**必须报错退出**，不能静默跳过 ——
+    否则会出现「包是新的、仓库代码是旧的」这种最危险的不一致。
+    """
+    pusher = os.path.join(HERE, "gh_push_dir.py")
     pusher = os.path.abspath(pusher)
     if not os.path.isfile(pusher):
-        warn("找不到 %s，跳过代码推送" % pusher)
-        return
+        err("找不到推送脚本 %s" % pusher)
+        err("要么把它放回该位置，要么去掉 --push-code 参数")
+        raise SystemExit(1)
     r = subprocess.run([sys.executable, pusher, src, "%s/%s" % (OWNER, REPO), branch],
                        capture_output=True, text=True, encoding="utf-8", errors="replace")
     for line in (r.stdout or "").splitlines()[-14:]:
