@@ -50,6 +50,7 @@ jobs:
         run: |
           python tests/test_organize.py
           python tests/test_fetch.py
+          python tests/test_selfcheck.py
 
       - name: 隐私自检
         run: |
