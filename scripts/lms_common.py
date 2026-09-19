@@ -11,6 +11,7 @@ xjtu-lms-grab —— 公共配置
     LMS_CACHE    登录态 / profile 存放目录, 默认 ~/.lms-grab
     LMS_BROWSER  强制指定浏览器可执行文件绝对路径
 """
+import json
 import os
 import shutil
 import sys
@@ -36,6 +37,37 @@ def state_path(course):
 
 def profile_path(course):
     return os.path.join(cache_dir(), "profile_%s" % course)
+
+
+def describe_state(path):
+    """检查一份登录态文件，返回 (状态, 说明, cookie数)。
+
+    状态取值:
+        "missing"  文件不存在
+        "bad"      存在但读不出来 / 结构不对            —— 需要重新登录
+        "empty"    cookies 为空（登录流程没走完）
+        "partial"  cookies 里没有属于目标域名的
+        "ok"       可用
+
+    单独抽出来是因为「文件在但内容是空的」和「文件压根不在」从报错上看不出区别，
+    而这两种情况的处理方式完全不同。
+    """
+    if not path or not os.path.isfile(path):
+        return "missing", "没有 %s" % (path or ""), 0
+    try:
+        with open(path, encoding="utf-8") as f:
+            st = json.load(f)
+    except (ValueError, OSError) as e:
+        return "bad", "解析失败: %s" % str(e)[:60], 0
+    if not isinstance(st, dict) or not isinstance(st.get("cookies"), list):
+        return "bad", "结构不对（缺 cookies 数组）", 0
+    cookies = st["cookies"]
+    if not cookies:
+        return "empty", "cookies 为空", 0
+    n_host = sum(1 for c in cookies if HOST in str(c.get("domain", "")))
+    if not n_host:
+        return "partial", "%d 个 cookie，但都不属于 %s" % (len(cookies), HOST), len(cookies)
+    return "ok", "%d 个 cookie（%d 个属于 %s）" % (len(cookies), n_host, HOST), len(cookies)
 
 
 def find_browser():
