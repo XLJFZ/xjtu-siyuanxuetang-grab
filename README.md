@@ -176,7 +176,7 @@ python scripts/lms_selfcheck.py --course <课程ID>
 | playwright | 未安装只报**警告**——它只影响登录那一步 |
 | 浏览器 | 自动探测 Edge / Chrome，找不到会提示三种解决方式 |
 | 缓存目录 | 登录态存放位置是否可写 |
-| 登录态 | 是否存在、是不是一份形状合法的 storage_state |
+| 登录态 | 是否存在、形状是否合法（新旧两种格式都认），cookies 是否属于目标域名 |
 | 浏览器 profile | 是否已生成（第二次免登录的关键） |
 
 加 `--online` 才会额外打一次接口，确认登录态在服务端仍然有效。
@@ -317,11 +317,11 @@ python scripts/lms_fetch.py --course <课程ID> --out "./课程资料" --no-vide
 | `scripts/lms_organize.py` | 章节解析：中文数字转换、多写法匹配、假章号排除 |
 | `scripts/lms_live.py` | 直播回放下载：串行请求、按响应长度校正偏移 |
 | `tests/test_organize.py` | 章节解析离线自测，22 个用例 |
-| `tests/test_fetch.py` | 下载逻辑离线自测，64 个用例（用假 opener 模拟服务端） |
+| `tests/test_fetch.py` | 下载逻辑离线自测，121 个用例（用假 opener 模拟服务端） |
 | `tests/test_selfcheck.py` | 自检逻辑离线自测，20 个用例 |
-| `ci.yml.txt` | CI 配置，用 `enable-ci.bat` 启用 |
-| `release.yml.txt` | 打 tag 自动发版的 Actions 配置 |
-| `pack.py.txt` | Release 工作流用的打包脚本 |
+| `.github/workflows/ci.yml` | CI：三平台 × 三 Python 版本测试 + 隐私自检 |
+| `.github/workflows/release.yml` | 打 tag 自动发版（校验 job 只读，发布 job 才有写权限） |
+| `.github/scripts/pack.py` | Release 工作流用的打包脚本 |
 | `release.py` | 维护者用的一键发布脚本 |
 
 ## 参数与环境变量
@@ -336,7 +336,7 @@ python scripts/lms_fetch.py --course <课程ID> --out "./课程资料" --no-vide
 | `--exclude "2020\|2021\|2022"` | 文件名正则，命中跳过（清理旧版作业） |
 | `--no-video` | 跳过录像与回放，只要讲义时用 |
 | `--all-cameras` | 直播回放默认只下「屏幕录制」机位，加此项连「教师机位」一起下 |
-| `--split-projects` | 项目压缩包单独进 `项目/` |
+| `--split-projects` | 项目/大作业压缩包（`Project1.zip`、`大作业.zip` 这类）单独进 `项目/`；普通 zip 如 `资料.zip` 不受影响 |
 | `--layout flat` | 平铺，不按活动建子文件夹 |
 | `--dry-run` | 只打清单不下载；配 `-v` 会显示归类后的目标目录 |
 | `-q` / `--quiet` | 不显示下载进度 |
@@ -373,9 +373,18 @@ python scripts/lms_fetch.py --course <课程ID> --out "./课程资料" --no-vide
 残片保留在 `<文件名>.part`，续传时会把残片计入 sha256 —— 否则哈希校验就是空的。
 
 服务端若忽略 `Range`（返回 200 全量），脚本会丢掉残片重下，不会把新旧数据拼成脏文件。
+回放服务端还会按自己的块边界**扩大请求区间**（返回的起点可能比请求的更靠前），
+脚本以响应里的 `Content-Range` 为准，把重叠部分丢弃后再续写；若返回起点跳到了
+残片末尾之后（出现缺口），直接判定这次续传无效、作废残片重下 ——
+绝不把对不上的数据 append 进文件。
 
 **失败重试。** 超时、连接中断、5xx 会退避重试（默认 3 次）。但 **403 / 404 不重试**——
 那是平台侧的限制（无权限或已删除），重试只是浪费时间。
+
+**失败与 N/A 分得清。** 取文件元信息时，403 / 404 标 `N/A` 跳过（平台确实没给这个文件）；
+401 明确报「登录态失效，请重新登录」；超时、连接错误、5xx、JSON 解析失败
+一律计为 **FAIL** 并计入退出码 4 —— 接口临时抖动不会被伪装成「平台没权限」，
+不会出现 `fail=0` 却漏了一堆文件的假象。
 
 **登录态探测。** 下载前先探一次接口。登录过期会明确报「登录态已失效，跑 `lms_login.py`」，
 而不是让每个文件都显示成 `N/A` 让人误以为平台没给权限。退出码 `3` 专门表示这个情况。
@@ -383,8 +392,20 @@ python scripts/lms_fetch.py --course <课程ID> --out "./课程资料" --no-vide
 **完整性校验。** 平台不提供官方哈希响应头，可用的信号是 `etag`。
 脚本会用它和元信息大小交叉验证，并把本地算出的 sha256 写进 `--manifest`，供事后核对。
 
+**已有文件先比对大小。** 服务端声明了文件大小时，本地文件**大小相等**才算已下载完成，
+不等就重下 —— 上次下到一半留下的 20MB 不会被当成完整的 100MB 永远跳过。
+（拿不到声明大小的资源才退回「存在且非空」的宽松判断。）
+
+**回放完整性。** 回放拿不到官方哈希，只能比对「服务端声明的总长」与实得字节数。
+差异在 8% 以内视为自然短读（实测正常水平），超出就直接判失败：不落盘成最终 mp4、
+保留 `.part` 供下次续传 —— 截断的视频不会被当成完整文件留在磁盘上。
+
 **文件名安全。** 长文件名截断时**保住扩展名**（超长才补 6 位短哈希防重名），
-非法字符替换，路径穿越（`../../etc/passwd`）会被拍平。
+非法字符替换，路径穿越（`../../etc/passwd`）会被拍平，Windows 保留设备名
+（`CON.pdf` / `NUL.txt` 等）统一加下划线前缀，三个平台落盘结果一致。
+
+**同名不覆盖。** 不同活动下的同名附件落到同一路径时，自动改用带 uid 的确定性后缀
+（`讲义~123.pdf`），第二个文件不会被静默跳过。
 
 ## 开发者：跑测试
 
@@ -392,52 +413,38 @@ python scripts/lms_fetch.py --course <课程ID> --out "./课程资料" --no-vide
 
 ```bash
 python tests/test_organize.py     # 22 个用例
-python tests/test_fetch.py        # 64 个用例
+python tests/test_fetch.py        # 121 个用例
 python tests/test_selfcheck.py    # 20 个用例
 ```
 
 | 文件 | 覆盖 |
 |---|---|
 | `test_organize.py` | 中文数字转换、括号剥离、六种章节写法、假章号排除、目录名去重、目录名不带扩展名 |
-| `test_fetch.py` | 下载成功/重试/403 不重试/5xx 重试/空响应/HTML 响应/sha256 不符/etag 不符、断点续传四场景、文件名安全、归类路径、清单导出、多来源计数、回放短读判定 |
+| `test_fetch.py` | 下载成功/重试/403 不重试/5xx 重试/空响应/HTML 响应/sha256 不符/etag 不符、断点续传与 Range 对齐四情形（正常/忽略/向前扩大/缺口）、回放短读判定（轻度过、严重失败、保留 .part）、元信息错误分类（403/404→N/A，401→登录态，5xx/超时/坏 JSON→FAIL）、已有文件大小比对、新旧登录态格式兼容、Cookie 安全属性还原、文件名安全（含 Windows 保留名）、路径冲突消解、项目包判定、CSV 公式注入防护、时间戳固定 UTC+8（跨时区一致）、清单导出、多来源计数 |
 | `test_selfcheck.py` | 登录态五种状态判定、检查级别（警告 vs 失败）、退出码、默认不联网、自检清单与 `scripts/` 实际文件一致 |
 
-`test_fetch.py` 用假 opener 脚本化服务端行为，所以能测「第一次超时第二次成功」这类
-真实环境里很难复现的路径。
+`test_fetch.py` 用假 opener 脚本化服务端行为，所以能测「第一次超时第二次成功」「服务端
+把 Range 起点从 5MB 挪到 4MB」这类真实环境里很难复现的路径。时区相关的用例会临时切换
+`TZ` 环境变量验证，不依赖跑测试的机器在哪。
 
 CI 在 push / PR 时自动跑三平台 × 三个 Python 版本，外加一步隐私自检——
 确认仓库里没有误提交登录态、脚本里没有残留本机绝对路径。
-### 启用 CI（可选）
 
-**先说结论：不启用也完全能用。** 发布走本地方案（见下）就够了，
-`release.py` 在打 zip 后已经强制跑过全部离线测试，测试不过就 `SystemExit`，不会发出坏包。
+### CI / 自动发版
 
-CI 的额外价值只有一个：**跨平台兼容性验证**（ubuntu / windows / macos × py3.8/3.10/3.12）。
-如果你是 Windows 单平台使用，这个价值有限。
+workflow 配置已直接放在仓库里（`.github/workflows/ci.yml`、`.github/workflows/release.yml`、
+`.github/scripts/pack.py`），推上 GitHub 就生效，不需要任何还原步骤。
 
-想启用的话，配置已经随包提供，只是放在 `.txt` 里。原因：GitHub 对
-`.github/workflows/` 下的文件有**额外权限要求**（token 需带 `Workflows: write`），
-通过 Contents API 推送会被 403 拒掉，所以只能在你本地还原后再用真 git 推上去。
+两点说明：
 
-```
-双击 enable-ci.bat          # Windows
-```
-
-它会生成 `ci.yml`（测试 + 隐私自检）、`release.yml`（打 tag 自动发版）
-和 `.github/scripts/pack.py`，然后 `git add / commit / push` 就生效了。
-手动方式也一样简单：
-
-```bash
-mkdir -p .github/workflows .github/scripts
-cp ci.yml.txt     .github/workflows/ci.yml
-cp release.yml.txt .github/workflows/release.yml
-cp pack.py.txt    .github/scripts/pack.py
-```
-
-> **前提：你的 git push 得是通的。** 如果 git 协议被代理拦（症状是
-> `schannel: server closed abruptly` 或 `CONNECT tunnel failed, response 502`），
-> 最后那步 `git push` 会失败 —— 而且 `release.yml` 本身也依赖「推 tag」触发，
-> 同样用不上。这种情况下保持默认就好，用下面的方式 A 发布。
+1. **不启用也完全能用。** 发布走本地方案（见下）就够了，`release.py` 在打 zip 后
+   已经强制跑过全部离线测试，测试不过就 `SystemExit`，不会发出坏包。
+   CI 的额外价值只有**跨平台兼容性验证**（ubuntu / windows / macos × py3.8/3.10/3.12）。
+2. **推送 workflows 文件需要 `Workflows: write` 权限。** 用只有 `Contents: write`
+   的细粒度 token 走 Contents API 时，`.github/workflows/` 下的文件会 403
+   （推送脚本会跳过它们并明确列出剩余清单），此时在网页端
+   *Add file → Upload files* 手动上传这几个文件即可；或换用带 workflows 权限的
+   token / 真 git 推送。
 
 ## 维护者：怎么发一个版本
 
@@ -478,11 +485,11 @@ python release.py --version 1.1.0 --title "下载可靠性" --yes       # 正式
 1. **版本号自检** —— tag 已存在就报错退出。已发布的版本内容不可变，要改就发新版本号。
    （这条是踩过坑换来的：v1.0.0 曾被原地覆盖过。）
 2. **包体校验** —— 上传前解压到临时目录，确认关键文件齐全、没混进登录态、
-   离线测试能过（三个测试文件，共 106 个用例；用例数由测试自己报出，并与
+   离线测试能过（三个测试文件，共 163 个用例；用例数由测试自己报出，并与
    静态扫描的 `def test_` 数量交叉核对，对不上就告警）。校验不过就不发。
 3. **打包白名单** —— 用 `INCLUDE` 显式列出该打进去的东西，新文件必须手动加；
    另有体积上限兜底，防止课程资料误入。
-   **这份清单和 CI 用的 `pack.py.txt` 必须保持一致** —— 否则本地发的包和 CI 发的包内容不同。
+   **这份清单和 CI 用的 `.github/scripts/pack.py` 必须保持一致** —— 否则本地发的包和 CI 发的包内容不同。
 
 ## 文档站
 
@@ -514,7 +521,9 @@ git tag v1.1.0 && git push origin v1.1.0
 
 1. **附件来源不止一处。** 课件 PDF 藏在活动正文里，只看附件数组会误判成「这门课没有课件文件」。
 2. **文件名要从平台接口的元信息取，别从正文链接文字猜。** 正文显示名与实际文件名常不一致。
-3. **403 / 404 是平台侧限制，不是下载失败。** 个别附件元信息取不到（无权限 / 已删除），脚本会标 `N/A` 跳过，别反复重试。
+3. **N/A 与 FAIL 是两回事。** 个别附件元信息 403 / 404（无权限 / 已删除）标 `N/A` 跳过；
+   超时、5xx、JSON 解析失败是**获取失败**，计入 `FAIL` 和退出码 4，
+   换个时间重跑就能补上 —— 结尾看一眼 `ok/fail/skip` 统计再下结论。
 
 另外：启动 URL **不要带 `#/`**——带 hash 会让页面路由异常，渲染进程假死。
 
@@ -523,9 +532,15 @@ git tag v1.1.0 && git push origin v1.1.0
 本项目不会要求用户将账号密码写入代码。
 
 登录由浏览器和学校统一身份认证系统完成，随后只在用户本机保存必要的会话状态。
+登录态文件就是**你的登录凭据**：拿到它的人等于拿到了你的账号会话，
+不要分享、不要截图外发、不要提交到任何仓库。`lms_login.py` 只保存下载所需的
+最小内容（目标域名的 cookie），并在 POSIX 系统上把文件权限收成 `0600`；
+Windows 的 NTFS 权限由系统管理，脚本不做模拟。
 
-任何与登录凭据、Cookie、浏览器 profile 相关的文件都已通过 `.gitignore` 排除，
-不应提交到 Git 仓库。提交代码前仍建议运行 `git status` 确认。
+任何与登录凭据、Cookie、浏览器 profile 相关的文件都已通过 `.gitignore` 排除
+（`state_*.json` / `activities_*.json` / `profile_*/` / `storage_state.json` /
+`cookies*.json` / `*.har` / `.lms-grab/`），不应提交到 Git 仓库。
+提交代码前仍建议运行 `git status` 确认。
 
 ## 关于课程资源
 
@@ -546,6 +561,7 @@ git tag v1.1.0 && git push origin v1.1.0
 
 | 版本 | 变更 |
 |---|---|
+| v1.4.0 | 下载可靠性专项：修回放续传 Range 对齐错位（服务端扩大区间时重叠段重复写入，会损坏文件）；服务端 Range 缺口不再 append 成坏文件；回放严重短读改判失败（不再落盘成截断的 mp4，保留 .part 续传）；元信息错误三分类（403/404→N/A、401→登录态、超时/5xx/坏 JSON→FAIL），接口抖动不再伪装成「平台无权限」；已有文件按声明大小比对而非「>1KB 即完整」；登录态保存收紧为最小 cookie 集（自定义结构，POSIX 0600，新旧格式兼容）；Cookie 重建保留 domain/path/secure/expires 并按目标 host 过滤；回放时间戳固定 UTC+8（跨时区文件名一致）；同名附件路径冲突自动加确定性后缀；`--split-projects` 不再把所有 zip 当项目包；`safe()` 处理 Windows 保留设备名；CSV 清单防公式注入；CI 落到 `.github/workflows/`（校验 job 最小权限，第三方 action 固定 SHA），移除 `.txt` 模板与 `enable-ci.bat`；离线测试扩到 163 个 |
 | v1.3.0 | 新增 `scripts/lms_selfcheck.py` 安装后自检（环境 / 依赖 / 浏览器 / 登录态形状，默认离线，`--online` 可选探测登录态）；登录态判定抽成 `lms_common.describe_state()`，区分「文件不存在 / 损坏 / cookies 为空 / 域不匹配 / 正常」五种状态；离线测试扩到 106 个（新增 `tests/test_selfcheck.py` 20 个）；`release.py` 包体校验与 `ci.yml.txt` / `release.yml.txt` 同步到三个测试文件；README 顶部补 Skill 定位说明（仓库元数据端点需 `Administration` 权限，改不了 topics，改在 README 第一屏） |
 | v1.2.1 | 修 `collect()` 的来源②计数（原先用总数相减，把直播回放误算成「正文内嵌」）；`release.py` 包体校验改为上报测试实际执行的用例数并与静态扫描交叉核对；抽取 `download()` 中重复四次的失败处理块；回放下载新增短读判定（对比 `Content-Length`，超阈值告警并写入清单）；README 用例数与文件清单同步 |
 | v1.2.0 | 直播回放下载（`lms_live.py`）；修同一天多个 `lecture_live` 活动 title 相同导致回放互相覆盖的丢数据 bug（文件名加入本地时间戳与机位）；离线测试扩到 79 个 |
