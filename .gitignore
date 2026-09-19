@@ -3,10 +3,19 @@ state_*.json
 *.state.json
 storage_state.json
 cookies*.json
+*.har
+lms_profile/
+*/lms-pw-profile/
+.lms-grab/
 
 # 运行产物
 _lms_downloads/
+课程资料/
+**/课程资料/
 *.log
+_*.log
+downloads/
+out/
 
 # Python
 __pycache__/
@@ -14,10 +23,26 @@ __pycache__/
 *.egg-info/
 .venv/
 venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
 
 # 编辑器 / 系统
 .vscode/
 .idea/
+*.swp
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# 压缩包 —— 抓下来的课程资料里经常混着 zip，别误提交
+*.zip
+*.7z
+*.rar
+
+# Release 附件
+dist/
+build/
