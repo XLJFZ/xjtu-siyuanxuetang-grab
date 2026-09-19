@@ -135,8 +135,9 @@ class TestParseChapter(unittest.TestCase):
 
 class TestChapterDir(unittest.TestCase):
     def test_with_title(self):
+        # 目录名不带文件扩展名 —— 传进来的文件名会被剥掉尾巴
         self.assertEqual(chapter_dir(1, ["第1章-数据库系统概述-米辅.pptx"]),
-                         "第01章 数据库系统概述-米辅.pptx")
+                         "第01章 数据库系统概述-米辅")
 
     def test_pad(self):
         self.assertEqual(chapter_dir(12, ["第十二章 贝叶斯分类"]), "第12章 贝叶斯分类")
@@ -144,14 +145,23 @@ class TestChapterDir(unittest.TestCase):
     def test_no_dup_prefix(self):
         """核心回归：不能拼成「第00章 第0章-课程简介」。"""
         d = chapter_dir(0, ["课程简介", "第0章-课程简介-米辅.pdf"])
-        self.assertEqual(d, "第00章 课程简介-米辅.pdf")
+        self.assertEqual(d, "第00章 课程简介-米辅")
         # 关键是别出现两次「第0章」
         self.assertEqual(d.count("第0章"), 0)
         self.assertTrue(d.startswith("第00章 课程简介"))
 
     def test_brackets_stripped(self):
         d = chapter_dir(1, ["【第一章】课件", "第1章-数据库系统概述-米辅.pptx"])
-        self.assertEqual(d, "第01章 数据库系统概述-米辅.pptx")
+        self.assertEqual(d, "第01章 数据库系统概述-米辅")
+
+    def test_ext_not_in_dirname(self):
+        """目录名里不该出现文件扩展名。"""
+        for fname in ("第3章-关系数据库语言SQL-米辅.pptx",
+                      "第0章-课程简介-米辅.pdf",
+                      "Chapter 3 - CNN.docx"):
+            d = chapter_dir(3, [fname])
+            for ext in (".pptx", ".pdf", ".docx", ".zip"):
+                self.assertNotIn(ext, d, "目录名混进了扩展名：%s" % d)
 
     def test_no_title(self):
         self.assertEqual(chapter_dir(7), "第07章")
