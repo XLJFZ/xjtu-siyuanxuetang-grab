@@ -12,6 +12,7 @@ import io
 import json
 import os
 import shutil
+import socket
 import sys
 import tempfile
 import unittest
@@ -646,12 +647,56 @@ class TestReplayNaming(Base):
         b = lms_live.safe_name(t, "instructor", stamp="20260919-1430")
         self.assertNotEqual(a, b)
 
-    def test_stamp_from_iso(self):
-        """UTC 的 ISO 时间要转成本地时间，否则上午的课会显示成凌晨。"""
+    def test_stamp_utc_to_cst(self):
+        """UTC 的 ISO 时间固定换算成 UTC+8，与运行机器的本地时区无关。"""
         import lms_live
         s = lms_live.start_stamp({"start_time": "2026-09-19T06:30:00Z"})
-        self.assertTrue(s and s.startswith("20260919-"), s)
-        # UTC+8 下 06:30Z == 14:30 本地
+        self.assertEqual(s, "20260919-1430")
+
+    def test_stamp_stable_across_machine_timezones(self):
+        """★ 核心回归：同一份数据在任意时区的机器上必须得到同一个时间戳。
+
+        回归背景：旧实现用 dt.astimezone()（转机器本地时区），于是同一门课
+        在中国（UTC+8）、日本（UTC+9）、GitHub Actions（UTC）会生成三个
+        不同的文件名，同一批资料的落盘路径不稳定。
+        这里直接改 TZ 环境变量并重算，验证结果不受影响。
+        """
+        import lms_live
+        import time as _time
+        cases = [
+            ("2026-09-19T06:30:00Z", "20260919-1430"),
+            ("2026-01-01T00:00:00Z", "20260101-0800"),
+            ("2026-12-31T16:00:00Z", "20270101-0000"),   # 跨年跨日
+            ("2026-09-19T06:30:00+08:00", "20260919-0630"),  # 已带 +08:00
+        ]
+        for tz in ("UTC", "Asia/Tokyo", "America/New_York", "Asia/Shanghai"):
+            old = os.environ.get("TZ")
+            os.environ["TZ"] = tz
+            try:
+                if hasattr(_time, "tzset"):
+                    _time.tzset()
+                for raw, want in cases:
+                    got = lms_live.start_stamp({"start_time": raw})
+                    self.assertEqual(got, want,
+                                     "TZ=%s 时 %s 得到 %s" % (tz, raw, got))
+            finally:
+                if old is None:
+                    os.environ.pop("TZ", None)
+                else:
+                    os.environ["TZ"] = old
+                if hasattr(_time, "tzset"):
+                    _time.tzset()
+
+    def test_stamp_naive_time_untouched(self):
+        """没有时区信息的裸时间不做偏移 —— 当作已经是本地（北京时间）语义。"""
+        import lms_live
+        s = lms_live.start_stamp({"start_time": "2026-09-19T14:30:00"})
+        self.assertEqual(s, "20260919-1430")
+
+    def test_stamp_fallback_regex(self):
+        """解析失败时退回正则，不能因为格式怪就丢掉时间戳。"""
+        import lms_live
+        s = lms_live.start_stamp({"start_time": "2026-09-19T14:30:00.123456"})
         self.assertEqual(s, "20260919-1430")
 
     def test_stamp_missing(self):
@@ -744,13 +789,48 @@ class TestLiveShortRead(Base):
         self.assertAlmostEqual(res["shortfall"], 0.056, places=3)
         self.assertIsNone(res["note"])
 
-    def test_excessive_short_read_warns(self):
-        """少得太多（超过阈值）时要在 note 里说清楚，让调用方能复核。"""
+    def test_excessive_short_read_fails(self):
+        """少得太多（超过阈值）必须判失败。
+
+        回归背景：以前无论少多少都 return ok=True，还先 os.replace 落盘，
+        于是截断的视频被当成完整文件写进最终路径，下次运行因为「文件已存在」
+        直接跳过 —— 用户永远拿不到完整视频，日志里却是一片 OK。
+        """
         res = self._dl(500000, 1000000)          # 少 50%
-        self.assertTrue(res["ok"])
-        self.assertIsNotNone(res["note"])
-        self.assertIn("500000", res["note"])
-        self.assertIn("1000000", res["note"])
+        self.assertFalse(res["ok"])
+        self.assertIn("500000", res["err"])
+        self.assertIn("1000000", res["err"])
+        self.assertEqual(res["declared"], 1000000)
+        self.assertAlmostEqual(res["shortfall"], 0.5, places=3)
+        self.assertTrue(res.get("partial"))
+
+    def test_excessive_short_read_keeps_part(self):
+        """失败时不能落盘成最终文件，且 .part 要保留供下次续传。"""
+        import lms_live
+        op = self._Op(b"x" * 500000,
+                      content_range="bytes 0-499999/1000000")
+        path = os.path.join(self.tmp, "trunc.mp4")
+        res = lms_live.download(op, "http://r/x", path, retries=1, quiet=True)
+        self.assertFalse(res["ok"])
+        self.assertFalse(os.path.exists(path), "残缺文件不许落盘成最终文件")
+        self.assertTrue(os.path.exists(path + ".part"), ".part 应保留以便续传")
+
+    def test_excessive_short_read_retries_then_fails(self):
+        """重试次数用尽后仍是残缺 → 失败。"""
+        import lms_live
+        calls = []
+
+        class _Op:
+            def open(self, req, timeout=None):
+                calls.append(1)
+                return FakeResponse(b"x" * 500000, status=206, headers={
+                    "Content-Type": "video/mp4",
+                    "Content-Range": "bytes 0-499999/1000000"})
+
+        path = os.path.join(self.tmp, "r2.mp4")
+        res = lms_live.download(_Op(), "http://r/x", path, retries=3, quiet=True)
+        self.assertFalse(res["ok"])
+        self.assertEqual(len(calls), 3, "三次重试都要用上")
 
     def test_exact_length_has_no_shortfall(self):
         res = self._dl(1000000, 1000000)
@@ -773,6 +853,555 @@ class TestLiveShortRead(Base):
         """阈值本身要大于实测的 5.6%，否则正常回放天天告警。"""
         import lms_live
         self.assertGreater(lms_live.SHORT_TOLERANCE, 0.056)
+
+
+class TestLiveRangeAlignment(Base):
+    """回放断点续传的 Range 对齐 —— lms_live 下载最容易写坏文件的地方。
+
+    回归背景：回放服务端会按自己的策略调整请求的字节区间（实测常按 4MB /
+    2MB 边界对齐），返回的 Content-Range 起点**未必等于**请求的 offset。
+    旧实现只处理了 start == 0 一种情况，其余一律 append，于是：
+
+        part = 前 5MB，请求 bytes=5MB-，服务端从 4MB 开始返回
+        → 4MB~5MB 这段被写入第二遍 → 文件从 4MB 起整体错位，永久损坏
+
+    这组测试逐字节校验最终内容，确保四种情形都对。
+    """
+
+    class _Op:
+        """假 opener：模拟服务端「把 Range 起点向前对齐到 boundary」的行为。
+
+        serve_from 是服务端实际返回的起点；boundary 用来模拟按块对齐。
+        只有第一次请求才对齐 —— 后续请求按实际 offset 正常返回。
+        """
+
+        def __init__(self, total, serve_from=None):
+            self.total = total
+            self.serve_from = serve_from
+            self.calls = []
+
+        def open(self, req, timeout=None):
+            headers = {k.lower(): v for k, v in (req.headers or {}).items()}
+            rng = headers.get("range")
+            req_start = 0
+            if rng:
+                req_start = int(rng.split("=")[1].split("-")[0])
+            start = req_start
+            # 第一次请求才「扩大」起点
+            if req_start and not self.calls and self.serve_from is not None:
+                start = self.serve_from
+            self.calls.append((req_start, start))
+            body = bytes([(i % 251) for i in range(start, self.total)])
+            h = {"Content-Type": "video/mp4",
+                 "Content-Range": "bytes %d-%d/%d" % (start, self.total - 1,
+                                                      self.total)}
+            return FakeResponse(body, headers=h, status=206)
+
+    def _part_with_bytes(self, path, n):
+        """造一个「前 n 字节正确」的残片"""
+        tmp = path + ".part"
+        with open(tmp, "wb") as f:
+            f.write(bytes([(i % 251) for i in range(n)]))
+        return tmp
+
+    def test_server_expands_range_backwards(self):
+        """★ 核心回归：part=前 5MB，请求 offset=5MB，服务端从 4MB 开始返回。
+
+        最终文件必须逐字节等于原始数据，4MB~5MB 不能被写两遍。
+        """
+        import lms_live
+        MB = 1024 * 1024
+        total = 6 * MB
+        path = os.path.join(self.tmp, "expand.mp4")
+        self._part_with_bytes(path, 5 * MB)
+
+        op = self._Op(total, serve_from=4 * MB)
+        res = lms_live.download(op, "http://r/x", path, retries=1, quiet=True)
+
+        self.assertTrue(res["ok"], res.get("err"))
+        with open(path, "rb") as f:
+            got = f.read()
+        want = bytes([(i % 251) for i in range(total)])
+        self.assertEqual(len(got), total)
+        self.assertEqual(got, want, "向前扩大的重叠段没有被正确丢弃")
+
+    def test_server_restarts_from_zero_discards_part(self):
+        """服务端忽略 Range 从头给（start==0）→ 残片作废，文件仍须完整。"""
+        import lms_live
+        total = 300000
+        path = os.path.join(self.tmp, "from0.mp4")
+        self._part_with_bytes(path, 100000)
+
+        op = self._Op(total, serve_from=0)
+        res = lms_live.download(op, "http://r/x", path, retries=1, quiet=True)
+
+        self.assertTrue(res["ok"], res.get("err"))
+        with open(path, "rb") as f:
+            got = f.read()
+        self.assertEqual(got, bytes([(i % 251) for i in range(total)]))
+
+    def test_server_gap_is_not_appended(self):
+        """★ start > offset（出现缺口）时不能 append，否则必然得到坏文件。
+
+        旧实现在这种情形下直接 append，文件会缺一段、长度也不对。
+        正确行为：判定这次续传无效 → 丢弃残片 → 重下一次（无 Range 的完整请求），
+        最终文件必须逐字节正确。
+        """
+        import lms_live
+        total = 300000
+        path = os.path.join(self.tmp, "gap.mp4")
+        self._part_with_bytes(path, 100000)
+
+        op = self._Op(total, serve_from=150000)   # 第一次：服务端从 150000 开始
+        res = lms_live.download(op, "http://r/x", path, retries=2, quiet=True)
+
+        self.assertTrue(res["ok"], res.get("err"))
+        with open(path, "rb") as f:
+            got = f.read()
+        self.assertEqual(len(got), total, "缺口情形下文件长度不对")
+        self.assertEqual(got, bytes([(i % 251) for i in range(total)]))
+        # 第二次请求不应再带 Range（残片已作废）
+        self.assertEqual(op.calls[-1][0], 0, "缺口后应重下全量")
+
+    def test_gap_keeps_part_when_no_retry_left(self):
+        """缺口但已无重试机会时不落盘、保留 .part，由下次运行补下。"""
+        import lms_live
+        total = 300000
+        path = os.path.join(self.tmp, "gap2.mp4")
+        self._part_with_bytes(path, 100000)
+
+        op = self._Op(total, serve_from=150000)
+        res = lms_live.download(op, "http://r/x", path, retries=1, quiet=True)
+
+        self.assertFalse(res["ok"])
+        self.assertFalse(os.path.exists(path), "残缺文件不许落盘")
+
+    def test_normal_resume_unchanged(self):
+        """start == offset 的正常续传不能被上面的逻辑误伤。"""
+        import lms_live
+        total = 300000
+        path = os.path.join(self.tmp, "ok.mp4")
+        self._part_with_bytes(path, 100000)
+
+        op = self._Op(total, serve_from=None)     # 服务端老实返回
+        res = lms_live.download(op, "http://r/x", path, retries=1, quiet=True)
+
+        self.assertTrue(res["ok"], res.get("err"))
+        self.assertTrue(res["resumed"])
+        with open(path, "rb") as f:
+            got = f.read()
+        self.assertEqual(got, bytes([(i % 251) for i in range(total)]))
+        self.assertEqual(op.calls[0][0], 100000, "应按 part 大小请求续传")
+
+
+class TestProjectPkg(Base):
+    """--split-projects 的判定 —— 压缩包 ≠ 项目包。
+
+    回归背景：旧的 PROJ_HINT 里直接写了 `zip`，配合
+    `name.lower().endswith(".zip")`，等价于「所有 zip 都算项目包」，
+    实测会把 `资料.zip`、`课件.zip` 一起归进 项目/。
+    `.zip` 只应是必要条件，真正的判据是名字里的 project / 项目 / 大作业 等词。
+    """
+
+    def test_plain_zip_is_not_project(self):
+        """资料.zip 是普通压缩包，不是项目包。"""
+        self.assertFalse(F.is_project_pkg("资料.zip"))
+        d = F.dest_for("课件", "参考资料", "资料.zip",
+                       FakeArgs(split_projects=True))
+        self.assertEqual(d, os.path.join("OUT", "课件", "参考资料"))
+
+    def test_project1_zip_is_project(self):
+        self.assertTrue(F.is_project_pkg("Project1.zip"))
+
+    def test_proj_2_zip_is_project(self):
+        self.assertTrue(F.is_project_pkg("proj_2.zip"))
+        self.assertTrue(F.is_project_pkg("proj-3.zip"))
+
+    def test_chinese_keywords(self):
+        self.assertTrue(F.is_project_pkg("大作业.zip"))
+        self.assertTrue(F.is_project_pkg("课程设计.zip"))
+        self.assertTrue(F.is_project_pkg("项目二.rar"))
+        self.assertTrue(F.is_project_pkg("Project 2.7z"))
+
+    def test_non_archive_never_project(self):
+        """非压缩包即使名字带 project 也不进 项目/（只认压缩包）。"""
+        self.assertFalse(F.is_project_pkg("Project1.pdf"))
+
+
+class TestWinReservedNames(Base):
+    """Windows 保留设备名 —— CON.pdf 这类在 Windows 上根本创建不了。
+
+    Linux/macOS 完全合法，但为了让三个平台落盘结果一致，统一加下划线前缀。
+    """
+
+    def test_bare_reserved(self):
+        for name in ("CON", "PRN", "AUX", "NUL"):
+            self.assertEqual(F.safe(name), "_" + name)
+
+    def test_reserved_with_ext(self):
+        """带扩展名也照样非法 —— CON.pdf / NUL.txt 同样创建不了。"""
+        self.assertEqual(F.safe("CON.pdf"), "_CON.pdf")
+        self.assertEqual(F.safe("NUL.txt"), "_NUL.txt")
+        self.assertEqual(F.safe("aux.MP4"), "_aux.MP4")
+
+    def test_com_lpt(self):
+        for i in range(1, 10):
+            self.assertEqual(F.safe("COM%d.pdf" % i), "_COM%d.pdf" % i)
+            self.assertEqual(F.safe("lpt%d.txt" % i), "_lpt%d.txt" % i)
+
+    def test_case_insensitive(self):
+        self.assertEqual(F.safe("con.PDF"), "_con.PDF")
+        self.assertEqual(F.safe("CoM1.zip"), "_CoM1.zip")
+
+    def test_normal_name_untouched(self):
+        self.assertEqual(F.safe("console.pdf"), "console.pdf")
+        self.assertEqual(F.safe("COM10.pdf"), "COM10.pdf")
+        self.assertEqual(F.safe("NULl.pdf"), "NULl.pdf")
+
+    def test_consistency_with_truncation(self):
+        """超长名字截断后，只有主干**整体**是保留名才算非法。
+
+        `CONxxxxx…` 不是保留名（Windows 只拦整个主干恰好等于 CON 的），
+        不该被加前缀 —— 这条用来防止修复过度。
+        """
+        long = "CON" + "x" * 200 + ".pdf"
+        out = F.safe(long)
+        self.assertTrue(out.startswith("CON"), out)
+        self.assertTrue(out.endswith(".pdf"), out)
+
+    def test_exact_reserved_after_truncation_fixed(self):
+        """主干恰好就是保留名时（含截断产生的）要加前缀。"""
+        self.assertEqual(F.safe("NUL.pdf"), "_NUL.pdf")
+
+
+class TestCsvFormulaInjection(Base):
+    """CSV 公式注入 —— LMS 的文件名是外部输入，Excel 会当公式执行。
+
+    只对 CSV 文本字段转义，JSON 清单与实际落盘文件名都不能改。
+    """
+
+    def test_dangerous_prefixes_are_escaped(self):
+        for bad in ("=cmd|'/c calc'!A1", "+1+1", "-2+3", "@SUM(A1)"):
+            self.assertEqual(F.csv_guard(bad), "'" + bad)
+
+    def test_normal_text_untouched(self):
+        self.assertEqual(F.csv_guard("第1章 讲义.pdf"), "第1章 讲义.pdf")
+        self.assertEqual(F.csv_guard("normal.zip"), "normal.zip")
+
+    def test_non_string_untouched(self):
+        """size 这类数字不能被加引号变成字符串。"""
+        self.assertEqual(F.csv_guard(123), 123)
+        self.assertIsNone(F.csv_guard(None))
+
+    def test_csv_escaped_json_not(self):
+        """写 CSV 时转义，写 JSON 时不转义，落盘文件名不受影响。"""
+        rows = [{"i": 1, "name": "=danger.pdf", "status": "ok", "size": 3}]
+        p = os.path.join(self.tmp, "m.csv")
+        F.write_manifest(p, rows)
+        with open(p, encoding="utf-8-sig") as f:
+            body = f.read()
+        self.assertIn("'=danger.pdf", body)
+
+        pj = os.path.join(self.tmp, "m.json")
+        F.write_manifest(pj, rows)
+        with open(pj, encoding="utf-8") as f:
+            d = json.load(f)
+        self.assertEqual(d["files"][0]["name"], "=danger.pdf")
+        self.assertEqual(rows[0]["name"], "=danger.pdf")
+
+
+class TestExistingFileCompleteness(Base):
+    """已存在文件的完整性判断 —— 旧的 `> 1024` 判据太松。
+
+    回归背景：服务器上 100MB 的文件，本地只有 20MB（上次下到一半被杀）
+    也会被当成完整文件永远跳过。有明确声明大小时必须**大小相等**才算完整。
+    """
+
+    def test_exact_match_is_complete(self):
+        p = os.path.join(self.tmp, "a.bin")
+        with open(p, "wb") as f:
+            f.write(b"x" * 1000)
+        ok, local, exp = F.already_complete(p, 1000)
+        self.assertTrue(ok)
+        self.assertEqual(local, 1000)
+        self.assertEqual(exp, 1000)
+
+    def test_truncated_is_not_complete(self):
+        """★ 核心回归：本地截断文件不能算完整。"""
+        p = os.path.join(self.tmp, "b.bin")
+        with open(p, "wb") as f:
+            f.write(b"x" * (20 * 1024 * 1024))
+        ok, local, exp = F.already_complete(p, 100 * 1024 * 1024)
+        self.assertFalse(ok, "本地 20MB / 服务器 100MB 不该被当成已下载完成")
+        self.assertEqual(exp, 100 * 1024 * 1024)
+
+    def test_larger_is_not_complete(self):
+        p = os.path.join(self.tmp, "c.bin")
+        with open(p, "wb") as f:
+            f.write(b"x" * 5000)
+        ok, _, _ = F.already_complete(p, 4000)
+        self.assertFalse(ok)
+
+    def test_no_declared_size_falls_back_to_nonempty(self):
+        """拿不到声明大小时退回「存在且非空」，否则回放会被反复重下。"""
+        p = os.path.join(self.tmp, "d.bin")
+        with open(p, "wb") as f:
+            f.write(b"x" * 5000)
+        ok, _, exp = F.already_complete(p, 0)
+        self.assertTrue(ok)
+        self.assertIsNone(exp)
+
+    def test_missing_file(self):
+        ok, local, _ = F.already_complete(os.path.join(self.tmp, "nope.bin"), 100)
+        self.assertFalse(ok)
+        self.assertEqual(local, 0)
+
+    def test_has_expected_size(self):
+        self.assertTrue(F.has_expected_size(100))
+        self.assertFalse(F.has_expected_size(0))
+        self.assertFalse(F.has_expected_size(None))
+        self.assertFalse(F.has_expected_size("abc"))
+
+
+class TestStateCompat(Base):
+    """登录态格式兼容 —— 新格式（项目自定义）与旧格式（storage_state）都要能读。
+
+    回归背景：lms_login 从 v1.4 起只保存下载真正需要的 cookie（自定义结构 +
+    POSIX 0600），但这不能让用户手上的旧 state 突然不能用。
+    """
+
+    def test_old_storage_state_format(self):
+        p = os.path.join(self.tmp, "old.json")
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump({"cookies": [{"name": "sid", "value": "1",
+                                    "domain": "lms.xjtu.edu.cn", "path": "/"}],
+                       "origins": []}, f)
+        st = F.load_state(p)
+        self.assertEqual(len(st["cookies"]), 1)
+
+    def test_new_custom_format(self):
+        p = os.path.join(self.tmp, "new.json")
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump({"version": 1, "base": "https://lms.xjtu.edu.cn",
+                       "host": "lms.xjtu.edu.cn", "course": "123",
+                       "created_at": "2026-09-19T22:00:00+0800",
+                       "cookies": [{"name": "sid", "value": "1",
+                                    "domain": "lms.xjtu.edu.cn"}]}, f)
+        st = F.load_state(p)
+        self.assertEqual(len(st["cookies"]), 1)
+        self.assertEqual(F.state_host(p), "lms.xjtu.edu.cn")
+
+    def test_bare_list_format(self):
+        p = os.path.join(self.tmp, "bare.json")
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump([{"name": "sid", "value": "1"}], f)
+        st = F.load_state(p)
+        self.assertEqual(len(st["cookies"]), 1)
+
+    def test_bad_structure_raises(self):
+        p = os.path.join(self.tmp, "bad.json")
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump({"no_cookies": 1}, f)
+        with self.assertRaises(ValueError):
+            F.load_state(p)
+
+
+class TestCookieSecurity(Base):
+    """Cookie 重建要保留安全语义 —— 尤其不能把 HTTPS-only 的 cookie 发到 HTTP。
+
+    回归背景：旧 opener() 把 domain/secure/expires 的位置硬编码成
+    `None, False` 和 `True, True`，`secure` 被无条件设成 True、
+    `expires` 丢失，而且不做 host 过滤。
+    """
+
+    def _state(self, cookies, host="lms.xjtu.edu.cn"):
+        p = os.path.join(self.tmp, "st.json")
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump({"version": 1, "host": host, "cookies": cookies}, f)
+        return p
+
+    def _jar(self, path):
+        op = F.opener(path)
+        for h in op.handlers:
+            if hasattr(h, "cookiejar"):
+                return h.cookiejar
+        self.fail("没找到 CookieJar")
+
+    def test_secure_flag_preserved(self):
+        p = self._state([{"name": "s", "value": "1",
+                          "domain": "lms.xjtu.edu.cn", "path": "/",
+                          "secure": True},
+                         {"name": "n", "value": "2",
+                          "domain": "lms.xjtu.edu.cn", "path": "/",
+                          "secure": False}])
+        jar = self._jar(p)
+        got = {c.name: c.secure for c in jar}
+        self.assertTrue(got["s"], "HTTPS-only 属性被抹掉了")
+        self.assertFalse(got["n"])
+
+    def test_expires_preserved(self):
+        p = self._state([{"name": "s", "value": "1",
+                          "domain": "lms.xjtu.edu.cn",
+                          "expires": 1900000000}])
+        jar = self._jar(p)
+        c = list(jar)[0]
+        self.assertEqual(c.expires, 1900000000)
+
+    def test_path_preserved(self):
+        p = self._state([{"name": "s", "value": "1",
+                          "domain": "lms.xjtu.edu.cn", "path": "/api"}])
+        jar = self._jar(p)
+        self.assertEqual(list(jar)[0].path, "/api")
+
+    def test_foreign_domain_filtered(self):
+        """别的域名的 cookie 不应被装进 jar（不盲目全导入）。"""
+        p = self._state([{"name": "lms", "value": "1",
+                          "domain": "lms.xjtu.edu.cn"},
+                         {"name": "evil", "value": "x",
+                          "domain": "example.com"}])
+        jar = self._jar(p)
+        names = {c.name for c in jar}
+        self.assertIn("lms", names)
+        self.assertNotIn("evil", names)
+
+    def test_subdomain_cookie_accepted(self):
+        p = self._state([{"name": "s", "value": "1",
+                          "domain": ".lms.xjtu.edu.cn"}])
+        jar = self._jar(p)
+        self.assertEqual(len(list(jar)), 1)
+
+
+class TestPathCollision(Base):
+    """目标路径冲突 —— 同名附件撞到同一路径会让第二个被静默跳过。
+
+    回归背景：不同活动下的 `讲义.pdf` 经 safe()/dest_for() 后落到同一路径，
+    第二个条目因为「目标已存在」被 SKIP，文件悄悄丢了。
+    """
+
+    def _items(self, names, uid_from=100):
+        out = []
+        for i, n in enumerate(names):
+            out.append({"kind": "课件", "activity": "第1章",
+                        "name": n, "uid": uid_from + i, "size": 10})
+        return out
+
+    def test_no_collision_untouched(self):
+        items, n = F.resolve_collisions(
+            self._items(["a.pdf", "b.pdf"]), FakeArgs())
+        self.assertEqual(n, 0)
+        self.assertEqual([it["name"] for it in items], ["a.pdf", "b.pdf"])
+
+    def test_collision_gets_deterministic_suffix(self):
+        items, n = F.resolve_collisions(
+            self._items(["讲义.pdf", "讲义.pdf"]), FakeArgs())
+        self.assertEqual(n, 1)
+        self.assertEqual(items[0]["name"], "讲义.pdf")
+        self.assertEqual(items[1]["name"], "讲义~101.pdf")
+
+    def test_collision_stable_across_runs(self):
+        """重复运行必须得到同样的路径 —— 不能用随机数或时间戳。"""
+        a, _ = F.resolve_collisions(self._items(["x.pdf", "x.pdf"]), FakeArgs())
+        b, _ = F.resolve_collisions(self._items(["x.pdf", "x.pdf"]), FakeArgs())
+        self.assertEqual([i["name"] for i in a], [i["name"] for i in b])
+
+    def test_three_way_collision(self):
+        items, n = F.resolve_collisions(
+            self._items(["x.pdf", "x.pdf", "x.pdf"]), FakeArgs())
+        self.assertEqual(n, 2)
+        names = [i["name"] for i in items]
+        self.assertEqual(len(set(names)), 3, "三个条目必须有三个不同路径")
+
+    def test_error_items_ignored(self):
+        """不参与下载的条目不该占位。"""
+        items = self._items(["a.pdf"]) + [
+            {"kind": "课件", "activity": "第1章", "name": "a.pdf",
+             "uid": 999, "error": True, "unavailable": True}]
+        _, n = F.resolve_collisions(items, FakeArgs())
+        self.assertEqual(n, 0)
+
+    def test_collision_across_activities(self):
+        """不同活动下的同名文件在 flat 布局下也会撞。"""
+        items = [
+            {"kind": "课件", "activity": "A", "name": "x.pdf", "uid": 1},
+            {"kind": "课件", "activity": "B", "name": "x.pdf", "uid": 2},
+        ]
+        _, n = F.resolve_collisions(items, FakeArgs(layout="flat"))
+        self.assertEqual(n, 1)
+
+
+class TestMetaErrorPropagation(Base):
+    """取元信息失败必须按类型分流 —— 不能把网络错误伪装成「无权限」。
+
+    回归背景：旧 meta() 是 `except Exception: return {}`，调用方把空结果
+    一律标成「平台侧无权限或已删除」跳过。于是 403/404/500/超时/DNS 失败/
+    JSON 解不开 全被当成同一种「跳过」，一次接口抖动就能让整门课显示
+    fail=0、退出码 0，用户以为全下完了。
+    """
+
+    def _op(self, script):
+        return FakeOpener(script)
+
+    def test_403_is_unavailable(self):
+        op = self._op([http_err(403)])
+        m, err = F.meta(op, 1)
+        self.assertIsNone(m)
+        self.assertEqual(err["kind"], F.ERR_UNAVAILABLE)
+
+    def test_404_is_unavailable(self):
+        op = self._op([http_err(404)])
+        m, err = F.meta(op, 1)
+        self.assertEqual(err["kind"], F.ERR_UNAVAILABLE)
+
+    def test_401_is_auth(self):
+        op = self._op([http_err(401)])
+        m, err = F.meta(op, 1)
+        self.assertEqual(err["kind"], F.ERR_AUTH)
+
+    def test_500_is_transient(self):
+        """5xx 是服务端临时故障，必须算获取失败，不能当「没有这个文件」。"""
+        op = self._op([http_err(500)] * 3)
+        m, err = F.meta(op, 1)
+        self.assertEqual(err["kind"], F.ERR_TRANSIENT)
+
+    def test_timeout_is_transient(self):
+        op = self._op([socket.timeout("timed out")] * 3)
+        m, err = F.meta(op, 1)
+        self.assertEqual(err["kind"], F.ERR_TRANSIENT)
+
+    def test_connection_error_is_transient(self):
+        op = self._op([urllib.error.URLError("dns fail")] * 3)
+        m, err = F.meta(op, 1)
+        self.assertEqual(err["kind"], F.ERR_TRANSIENT)
+
+    def test_invalid_json_is_transient(self):
+        """返回 200 但 body 不是 JSON —— 也算获取失败。"""
+        op = self._op([FakeResponse(b"<html>oops</html>")] * 3)
+        m, err = F.meta(op, 1)
+        self.assertEqual(err["kind"], F.ERR_TRANSIENT)
+
+    def test_success_returns_info(self):
+        body = json.dumps({"name": "a.pdf", "size": 5}).encode()
+        op = self._op([FakeResponse(body)])
+        m, err = F.meta(op, 1)
+        self.assertIsNone(err)
+        self.assertEqual(m["name"], "a.pdf")
+
+    def test_classify_http_mapping(self):
+        self.assertEqual(F.classify_http(403)["kind"], F.ERR_UNAVAILABLE)
+        self.assertEqual(F.classify_http(404)["kind"], F.ERR_UNAVAILABLE)
+        self.assertEqual(F.classify_http(401)["kind"], F.ERR_AUTH)
+        for code in (500, 502, 503, 429):
+            self.assertEqual(F.classify_http(code)["kind"], F.ERR_TRANSIENT)
+
+    def test_expand_marks_unavailable_vs_error(self):
+        """expand_items 要区分「确实拿不到」和「这次获取失败」。"""
+        keys = [("课件", "第1章", 1), ("课件", "第1章", 2)]
+        op = self._op([http_err(403)] + [http_err(500)] * 3)
+        items, _ = F.expand_items(op, keys, FakeArgs())
+        self.assertTrue(items[0]["unavailable"], "403 应标 unavailable")
+        self.assertTrue(items[1]["error"])
+        self.assertFalse(items[1]["unavailable"], "500 不该被当成不可达")
+        self.assertEqual(items[1]["err_kind"], F.ERR_TRANSIENT)
 
 
 if __name__ == "__main__":
