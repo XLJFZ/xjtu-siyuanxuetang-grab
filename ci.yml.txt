@@ -31,11 +31,13 @@ jobs:
         run: |
           python tests/test_organize.py
           python tests/test_fetch.py
+          python tests/test_selfcheck.py
 
       - name: Check CLI help works
         run: |
           python scripts/lms_fetch.py --help
           python scripts/lms_login.py --help
+          python scripts/lms_selfcheck.py --help
 
   lint:
     name: 语法与隐私自检
