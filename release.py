@@ -238,7 +238,7 @@ def build_zip(src, version, dry_run=False):
 
 
 def count_cases(root):
-    """数一数 tests/ 下有多少个 test_ 方法，用于校验输出里报个数。"""
+    """静态数一数 tests/ 下有多少个 test_ 方法，用来和实跑结果交叉核对。"""
     n = 0
     tdir = os.path.join(root, "tests")
     for fn in os.listdir(tdir):
@@ -249,6 +249,15 @@ def count_cases(root):
                 if re.match(r"\s+def test_", line):
                     n += 1
     return n
+
+
+def _parse_ran(lines):
+    """从 unittest 输出里取实际执行的用例数，取不到返回 None。"""
+    for l in lines:
+        m = re.match(r"Ran (\d+) tests?", l.strip())
+        if m:
+            return int(m.group(1))
+    return None
 
 
 def verify_zip(zip_path):
@@ -273,6 +282,7 @@ def verify_zip(zip_path):
                     raise SystemExit("校验失败：包里混进了登录态 %s" % fn)
 
         # 跑离线测试（两个文件都要跑，别只跑一个）
+        n_files = 0
         total_ran = 0
         for t in ("test_organize.py", "test_fetch.py"):
             r = subprocess.run([sys.executable,
@@ -282,10 +292,22 @@ def verify_zip(zip_path):
             if r.returncode != 0:
                 print("\n".join(tail[-8:]))
                 raise SystemExit("校验失败：%s 没通过" % t)
-            ran = [l for l in tail if l.startswith("Ran ")]
-            total_ran += 1
-        ok("包内自测通过（%d 个测试文件，共 %d 个用例）"
-           % (total_ran, count_cases(root)))
+            # 实际执行的用例数由 unittest 自己报，别拿文件数顶替
+            ran = _parse_ran(tail)
+            if ran is None:
+                raise SystemExit("校验失败：%s 没有输出用例数，测试可能没跑起来" % t)
+            total_ran += ran
+            n_files += 1
+
+        # 交叉核对：静态数出来的用例数和实跑数应当一致，
+        # 不一致说明有 test_ 方法没被收集到（拼错、被跳过、类名不对）。
+        static_n = count_cases(root)
+        msg = "包内自测通过（%d 个测试文件，共 %d 个用例）" % (n_files, total_ran)
+        if static_n != total_ran:
+            warn("%s —— 但静态扫到 %d 个 test_ 方法，差 %d 个，查一下是否有用例没被收集"
+                 % (msg, static_n, static_n - total_ran))
+        else:
+            ok(msg)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
