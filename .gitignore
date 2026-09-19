@@ -47,6 +47,10 @@ desktop.ini
 dist/
 build/
 
-# 例外：CI 配置以 .txt 形式存放（workflow 文件需要额外权限，
-# 用 enable-ci.bat 还原到 .github/workflows/ci.yml）
+# 例外：workflow 及其脚本以 .txt 形式存放。
+# GitHub 要求 .github/workflows/ 下的文件必须用带 Workflows 权限的 token 推送，
+# 通过 Contents API 会被 403。所以这几个文件以 .txt 随包提供，
+# 由 enable-ci.bat 还原到正确位置。
 !ci.yml.txt
+!release.yml.txt
+!pack.py.txt
