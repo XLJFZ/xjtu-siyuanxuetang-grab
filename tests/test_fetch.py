@@ -9,6 +9,7 @@
 """
 import hashlib
 import io
+import json
 import os
 import shutil
 import sys
@@ -448,6 +449,207 @@ class TestDestFor(Base):
         d = F.dest_for("作业", "项目一", "Project1.pdf",
                        FakeArgs(split_projects=True))
         self.assertEqual(d, os.path.join("OUT", "作业", "项目一"))
+
+    def test_video_dir(self):
+        """录像单独一类，不混进课件。"""
+        d = F.dest_for("录像", "Lec1 Introduction", "Lec1.mp4", FakeArgs())
+        self.assertEqual(d, os.path.join("OUT", "录像", "Lec1 Introduction"))
+
+    def test_video_ignores_organize(self):
+        """--organize 不该把录像塞进「其他」——视频标题认不出章号。
+
+        踩过：不加这个例外，加了 --organize 的课程里录像会全部落进
+        <out>/录像/其他/，几十个视频平铺在一起没法看。
+        """
+        d = F.dest_for("录像", "Lec1 Introduction", "Lec1.mp4",
+                       FakeArgs(organize=True))
+        self.assertEqual(d, os.path.join("OUT", "录像", "Lec1 Introduction"))
+        self.assertNotIn("其他", d)
+
+    def test_video_flat(self):
+        d = F.dest_for("录像", "Lec1", "Lec1.mp4", FakeArgs(layout="flat"))
+        self.assertEqual(d, os.path.join("OUT", "录像"))
+
+
+# ---------------------------------------------------------------- 活动分类
+
+class TestCollectKinds(Base):
+    """collect() 的活动类型分流 —— 纯离线，喂假 activities 列表。
+
+    直接调真的 collect()，用假 opener 挡掉网络。
+    """
+
+    class _Op:
+        """只回答两个请求：活动列表、单个活动详情。"""
+
+        def __init__(self, acts, details):
+            self.acts = acts
+            self.details = details
+            self.urls = []
+
+        def open(self, url, timeout=None, data=None):
+            self.urls.append(url)
+            if "/activities?" in url:
+                payload = {"activities": self.acts}
+            else:
+                aid = url.split("/activities/")[1].split("?")[0]
+                payload = self.details.get(int(aid), {})
+            raw = json.dumps(payload).encode("utf-8")
+
+            class R:
+                def __init__(self, b):
+                    self._b = io.BytesIO(b)
+                    self.status = 200
+                    self.headers = {}
+
+                def read(self, n=None):
+                    return self._b.read() if n is None else self._b.read(n)
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *a):
+                    return False
+
+            return R(raw)
+
+    def _run(self, acts, details, want_video=True):
+        """跑一次真实的 collect()，并把它的进度输出静音。"""
+        import contextlib
+        op = self._Op(acts, details)
+        with contextlib.redirect_stdout(io.StringIO()):
+            keys, _ = F.collect(op, "1", acts, want_video=want_video)
+        return keys
+
+    def _kinds(self, acts, want_video=True):
+        return self._run(acts, {}, want_video)
+
+    def test_online_video_goes_to_video(self):
+        acts = [{"type": "online_video", "title": "Lec1 Introduction",
+                 "uploads": [{"id": 101}]}]
+        self.assertEqual(self._kinds(acts), [("录像", "Lec1 Introduction", 101)])
+
+    def test_no_video_skips(self):
+        acts = [{"type": "online_video", "title": "Lec1",
+                 "uploads": [{"id": 101}]}]
+        self.assertEqual(self._kinds(acts, want_video=False), [])
+
+    def test_homework_still_homework(self):
+        acts = [{"type": "homework", "title": "作业1",
+                 "uploads": [{"id": 202}]}]
+        self.assertEqual(self._kinds(acts), [("作业", "作业1", 202)])
+
+    def test_doc_type_is_courseware(self):
+        """lesson / material / 未知识别类型 ── 一律归课件，不能因为加了
+        录像分支就把它们漏掉。"""
+        acts = [{"type": "lesson", "title": "第1章", "uploads": [{"id": 1}]},
+                {"type": "material", "title": "参考", "uploads": [{"id": 2}]},
+                {"type": "whatever", "title": "未知", "uploads": [{"id": 3}]}]
+        kinds = [k for k, _, _ in self._kinds(acts)]
+        self.assertEqual(kinds, ["课件", "课件", "课件"])
+
+    def test_lecture_live_goes_to_replay(self):
+        """lecture_live 单开一类，且 uid 用负数存活动 id —— 它不是附件，
+        走不了 uploads 端点，必须能一眼区分出来。"""
+        acts = [{"id": 777, "type": "lecture_live", "title": "9-19 第一场",
+                 "uploads": []}]
+        det = {"data": {"external_live_detail": {"replay_videos": [
+            {"camera_id": 1, "camera_type": "encoder", "url": "http://r/x"}]}}}
+        keys = self._run(acts, {777: det}, want_video=True)
+        self.assertEqual(keys, [("回放", "9-19 第一场", -777)])
+
+    def test_lecture_live_skipped_by_no_video(self):
+        acts = [{"id": 777, "type": "lecture_live", "title": "L", "uploads": []}]
+        det = {"data": {"external_live_detail": {"replay_videos": [
+            {"camera_id": 1, "camera_type": "encoder", "url": "http://r/x"}]}}}
+        keys = self._run(acts, {777: det}, want_video=False)
+        self.assertEqual(keys, [])
+
+    def test_lecture_live_without_replay_skipped(self):
+        """live 活动还没生成回放时 replay_videos 为空，不该产生条目。"""
+        acts = [{"id": 777, "type": "lecture_live", "title": "L", "uploads": []}]
+        det = {"data": {"external_live_detail": {"replay_videos": []}}}
+        keys = self._run(acts, {777: det}, want_video=True)
+        self.assertEqual(keys, [])
+
+    def test_activity_without_id_survives(self):
+        """活动数据缺 id 时不能崩 —— 错误处理分支里再抛异常是最难查的。
+
+        （真实场景：API 偶发返回残缺对象。）
+        """
+        acts = [{"type": "lecture_live", "title": "残缺", "uploads": []}]
+        keys = self._run(acts, {}, want_video=True)
+        self.assertEqual(keys, [])
+
+    def test_mixed(self):
+        acts = [{"type": "online_video", "title": "V", "uploads": [{"id": 1}]},
+                {"type": "homework", "title": "H", "uploads": [{"id": 2}]},
+                {"type": "lesson", "title": "L", "uploads": [{"id": 3}]}]
+        kinds = [k for k, _, _ in self._kinds(acts)]
+        self.assertEqual(sorted(kinds), ["作业", "录像", "课件"])
+
+
+class TestReplayNaming(Base):
+    """回放文件名 —— 踩过的坑：同一天多个活动 title 完全相同。"""
+
+    def test_stamp_disambiguates(self):
+        """没有时间戳时，同一天 4 节课会生成同一个文件名、互相覆盖。
+
+        实测某课程 4 个 lecture_live 活动 title 都是
+        「2026-09-19-计算机视觉与模式识别」，只有 start_time 不同。
+        """
+        import lms_live
+        t = "2026-09-19-计算机视觉与模式识别"
+        a = lms_live.safe_name(t, "encoder", stamp="20260919-1430")
+        b = lms_live.safe_name(t, "encoder", stamp="20260919-1530")
+        self.assertNotEqual(a, b)
+        self.assertIn("20260919-1430", a)
+        self.assertIn("20260919-1530", b)
+
+    def test_camera_disambiguates(self):
+        """同一场次的两路机位也不能撞名。"""
+        import lms_live
+        t = "2026-09-19-计算机视觉与模式识别"
+        a = lms_live.safe_name(t, "encoder", stamp="20260919-1430")
+        b = lms_live.safe_name(t, "instructor", stamp="20260919-1430")
+        self.assertNotEqual(a, b)
+
+    def test_stamp_from_iso(self):
+        """UTC 的 ISO 时间要转成本地时间，否则上午的课会显示成凌晨。"""
+        import lms_live
+        s = lms_live.start_stamp({"start_time": "2026-09-19T06:30:00Z"})
+        self.assertTrue(s and s.startswith("20260919-"), s)
+        # UTC+8 下 06:30Z == 14:30 本地
+        self.assertEqual(s, "20260919-1430")
+
+    def test_stamp_missing(self):
+        import lms_live
+        self.assertIsNone(lms_live.start_stamp({}))
+        self.assertIsNone(lms_live.start_stamp(None))
+
+    def test_parse_replay_encoder_first(self):
+        """两路机位按「屏幕录制优先」排序 —— 多数人只要正课画面。"""
+        import lms_live
+        d = {"data": {"external_live_detail": {"replay_videos": [
+            {"camera_id": 1, "camera_type": "instructor", "url": "u1"},
+            {"camera_id": 2, "camera_type": "encoder", "url": "u2"},
+        ]}}}
+        reps = lms_live.parse_replay(d)
+        self.assertEqual(reps[0]["camera_type"], "encoder")
+        self.assertEqual(len(reps), 2)
+
+    def test_parse_replay_skips_empty_url(self):
+        import lms_live
+        d = {"data": {"external_live_detail": {"replay_videos": [
+            {"camera_id": 1, "camera_type": "encoder", "url": ""},
+            {"camera_id": 2, "camera_type": "encoder", "url": "ok"},
+        ]}}}
+        self.assertEqual(len(lms_live.parse_replay(d)), 1)
+
+    def test_parse_replay_no_detail(self):
+        import lms_live
+        self.assertEqual(lms_live.parse_replay({}), [])
+        self.assertEqual(lms_live.parse_replay(None), [])
 
 
 # ---------------------------------------------------------------- 清单导出
