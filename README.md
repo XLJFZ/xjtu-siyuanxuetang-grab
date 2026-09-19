@@ -34,18 +34,24 @@ AI 就会自动走完「登录 → 干跑列清单 → 确认 → 下载 → 归
 |---|---|---|
 | ① 活动 JSON 的 `uploads` 数组 | `/api/courses/<ID>/activities` | 作业附件、**课堂录像** |
 | ② `type=page` 活动正文 `data.content` 内嵌的 `/api/uploads/<id>` | 需逐个拉 `/api/activities/<id>` 再正则抽取 | **课件 PDF（几乎全在这）** |
-| ③ `type=lecture_live` 活动的 `data.external_live_detail.replay_videos[]` | 指向 `rms-v5.xjtu.edu.cn`，另一套系统 | 教室直播回放（**暂不支持**） |
+| ③ `type=lecture_live` 活动的 `data.external_live_detail.replay_videos[]` | 指向 `rms-v5.xjtu.edu.cn`，另一套系统 | **教室直播回放** |
 
 第二类藏在正文富文本的 `div.ccbb-attachments` 里，`uploads` 字段是 `null`——很容易误判成「这门课没有课件文件」。
 
-**课堂录像（`online_video` 类型）走的是第一类**，和课件共用同一个下载端点，所以断点续传、etag 校验全都适用，落到独立的 `录像/` 目录：
+**录像有两类，都已支持**，落到独立的 `录像/` 与 `回放/` 目录：
 
 ```bash
 python scripts/lms_fetch.py --course <ID> --out ./课程资料              # 含录像
 python scripts/lms_fetch.py --course <ID> --out ./课程资料 --no-video    # 只要讲义
 ```
 
-直播回放（`lecture_live`）是另一套系统，本工具不支持——详见 [`SKILL.md`](SKILL.md#课堂录像)。
+- **`online_video`（课堂录像）** 就是普通附件，和课件共用下载端点，
+  断点续传 / etag 校验全部适用
+- **`lecture_live`（直播回放）** 走 `rms-v5` 独立域名，由 `scripts/lms_live.py` 处理；
+  默认只下「屏幕录制」机位，`--all-cameras` 可连教师机位一起下。实测 6–10 MB/s
+
+两者的服务端行为、踩过的坑（并发会 403、Range 被对齐到 2 MB、速度会衰减）都写在
+[`SKILL.md`](SKILL.md#课堂录像)。
 
 ## 安装
 
@@ -94,15 +100,37 @@ python scripts/lms_fetch.py --course <课程ID> --out "./CV" --organize --dry-ru
 python scripts/lms_fetch.py --course <课程ID> --out "./CV" --organize
 ```
 
-**有些课带课堂录像**（`online_video` 类型的活动）。它们自动落到独立的 `录像/` 目录，不跟讲义混在一起：
+**有些课带录像**，两类都自动落到独立目录，不跟讲义混在一起：
 
 ```bash
 python scripts/lms_fetch.py --course <课程ID> --out "./CV" --dry-run    # 输出里会写「其中课堂录像: N」
 python scripts/lms_fetch.py --course <课程ID> --out "./CV" --no-video   # 只要讲义，跳过录像
 ```
 
-录像往往几百 MB（某门 CAD 课 17 个视频加起来 1.5 GB），**下之前先看干跑的体积**。
-录像不参与 `--organize`——视频标题认不出章号，硬套只会全堆进 `其他/`。
+| 类型 | 落到 | 说明 |
+|---|---|---|
+| `online_video` 课堂录像 | `录像/<活动标题>/` | 就是普通附件，原样复用下载逻辑 |
+| `lecture_live` 直播回放 | `回放/<活动标题>/` | 走 rms-v5 独立域名，默认只下屏幕录制机位 |
+
+录像往往几百 MB（某门 CAD 课 17 个视频加起来 1.5 GB；一节 90 分钟的回放约 400 MB），
+**下之前先看干跑的体积**。录像与回放都不参与 `--organize`——标题认不出章号，
+硬套只会全堆进 `其他/`。
+
+```
+CV/
+├── 课件/
+├── 作业/
+├── 录像/                                    ← online_video
+│   └── Lec1 Introduction/
+│       └── Lec1Introduction.mp4
+└── 回放/                                    ← lecture_live
+    └── 2026-09-19-计算机视觉与模式识别/
+        └── 2026-09-19-计算机视觉与模式识别-20260919-1430-encoder.mp4
+```
+
+> 回放文件名里的时间戳不是装饰：同一天的多个活动 **`title` 完全相同**
+> （实测一门课 4 节课都叫「2026-09-19-计算机视觉与模式识别」），
+> 只有 `start_time` 不同。只用标题命名会让 4 节课互相覆盖、只剩最后一节。
 
 产物从 `课件/<活动标题>/` 变成：
 
@@ -158,7 +186,8 @@ CV/
 | `--retries N` | 单文件重试次数，默认 3（指数退避） |
 | `--no-verify` | 跳过下载前的登录态探测 |
 | `--exclude "2020\|2021\|2022"` | 文件名正则，命中跳过（清理旧版作业） |
-| `--no-video` | 跳过课堂录像（`online_video`），只要讲义时用 |
+| `--no-video` | 跳过录像与回放，只要讲义时用 |
+| `--all-cameras` | 直播回放默认只下「屏幕录制」机位，加此项连「教师机位」一起下 |
 | `--split-projects` | 项目压缩包单独进 `项目/` |
 | `--layout flat` | 平铺，不按活动建子文件夹 |
 | `--dry-run` | 只打清单不下载；配 `-v` 会显示归类后的目标目录 |
