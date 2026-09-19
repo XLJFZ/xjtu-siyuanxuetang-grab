@@ -157,6 +157,24 @@ python tests/test_organize.py
 CI 在 push / PR 时自动跑三平台 × 三个 Python 版本，外加一步隐私自检——
 确认仓库里没有误提交登录态、脚本里没有残留本机绝对路径。
 
+### 启用 CI
+
+GitHub 对 `.github/workflows/` 下的文件有**额外权限要求**（需要 token 带 `Workflows: write`），
+通过 Contents API 推送会被 403 拒掉。所以本仓库的 CI 配置以 `ci.yml.txt` 的形式存放，
+想启用的话：
+
+```
+双击 enable-ci.bat          # Windows
+```
+
+它会生成 `.github/workflows/ci.yml`，然后 `git add / commit / push` 就生效了。
+手动方式也一样简单：
+
+```bash
+mkdir -p .github/workflows
+cp ci.yml.txt .github/workflows/ci.yml
+```
+
 ## 三个必踩的坑
 
 1. **`uploads` 为空 ≠ 没有附件。** 课件 PDF 藏在正文 `data.content` 里，必须两个来源都扫。
