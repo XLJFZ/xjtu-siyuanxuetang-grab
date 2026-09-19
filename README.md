@@ -197,11 +197,17 @@ python tests/test_fetch.py        # 38 个用例
 CI 在 push / PR 时自动跑三平台 × 三个 Python 版本，外加一步隐私自检——
 确认仓库里没有误提交登录态、脚本里没有残留本机绝对路径。
 
-### 启用 CI
+### 启用 CI（可选）
 
-GitHub 对 `.github/workflows/` 下的文件有**额外权限要求**（需要 token 带 `Workflows: write`），
-通过 Contents API 推送会被 403 拒掉。所以本仓库的 CI 配置以 `.txt` 的形式存放，
-想启用的话：
+**先说结论：不启用也完全能用。** 发布走本地方案（见下）就够了，
+`release.py` 在打 zip 后已经强制跑过全部离线测试，测试不过就 `SystemExit`，不会发出坏包。
+
+CI 的额外价值只有一个：**跨平台兼容性验证**（ubuntu / windows / macos × py3.8/3.10/3.12）。
+如果你是 Windows 单平台使用，这个价值有限。
+
+想启用的话，配置已经随包提供，只是放在 `.txt` 里。原因：GitHub 对
+`.github/workflows/` 下的文件有**额外权限要求**（token 需带 `Workflows: write`），
+通过 Contents API 推送会被 403 拒掉，所以只能在你本地还原后再用真 git 推上去。
 
 ```
 双击 enable-ci.bat          # Windows
@@ -218,6 +224,11 @@ cp release.yml.txt .github/workflows/release.yml
 cp pack.py.txt    .github/scripts/pack.py
 ```
 
+> **前提：你的 git push 得是通的。** 如果 git 协议被代理拦（症状是
+> `schannel: server closed abruptly` 或 `CONNECT tunnel failed, response 502`），
+> 最后那步 `git push` 会失败 —— 而且 `release.yml` 本身也依赖「推 tag」触发，
+> 同样用不上。这种情况下保持默认就好，用下面的方式 A 发布。
+
 ## 维护者：怎么发一个版本
 
 ### 方式 A：本地一键（推荐，本机 git 协议不通时唯一可行）
@@ -225,8 +236,8 @@ cp pack.py.txt    .github/scripts/pack.py
 ```bash
 set GH_TOKEN=github_pat_xxx
 
-python release.py --version 1.1.0 --title "新增 xxx" --dry-run   # 先看打包内容
-python release.py --version 1.1.0 --title "新增 xxx"             # 正式发
+python release.py --version 1.1.0 --title "下载可靠性" --dry-run   # 先看打包内容
+python release.py --version 1.1.0 --title "下载可靠性" --yes       # 正式发
 ```
 
 它会依次做：**版本号自检 → 打包 → 包体校验 → 打 tag → 建 Release → 传附件**。
@@ -234,11 +245,20 @@ python release.py --version 1.1.0 --title "新增 xxx"             # 正式发
 | 参数 | 作用 |
 |---|---|
 | `--dry-run` | 只打包+列清单，不碰 GitHub |
-| `--push-code` | 发布前先把源码推到 main |
+| `--push-code` | 发布前先把源码推到 main（注意：依赖旁边的 `gh_push_dir.py`） |
 | `--notes notes.md` | 用文件里的内容当 Release 说明 |
 | `--resume` | 上次发到一半中断了，只补缺的部分 |
 | `--update-notes` | 只更新已发布 Release 的说明，不重新打包 |
-| `--yes` | 跳过发布前确认 |
+| `--yes` | 跳过发布前确认。**脚本化/自动化调用必须加**，否则 `input()` 会 `EOFError` |
+
+> **`--title` 只写版本号后面那部分。** 脚本自己会拼成 `v1.1.0 —— <title>`，
+> 你写 `--title "v1.1.0 - 下载可靠性"` 会得到 `v1.1.0 —— v1.1.0 - 下载可靠性`。
+> （新版已自动剥掉重复前缀，但仍建议只写后半段。）
+
+> **改代码要在打包之前。** `release.py` 自己也在发布内容里（`INCLUDE` 含它），
+> 如果打包后才改它，就会出现「zip 里是旧版、仓库里是新版」的不一致。
+> 维护者工作区里 `_release/release.py` 和 `_release/xjtu-lms-grab/release.py`
+> 必须同步 —— 后者才是会被打进包的那份。
 
 `release.py` 放在仓库内外都能跑：它会自动判断自己在维护者工作区
 （源目录是旁边的 `xjtu-lms-grab/`）还是在仓库内（源目录就是自己所在目录）。
@@ -248,9 +268,10 @@ python release.py --version 1.1.0 --title "新增 xxx"             # 正式发
 1. **版本号自检** —— tag 已存在就报错退出。已发布的版本内容不可变，要改就发新版本号。
    （这条是踩过坑换来的：v1.0.0 曾被原地覆盖过。）
 2. **包体校验** —— 上传前解压到临时目录，确认关键文件齐全、没混进登录态、
-   离线测试能过。校验不过就不发。
+   离线测试能过（两个测试文件，共 60 个用例）。校验不过就不发。
 3. **打包白名单** —— 用 `INCLUDE` 显式列出该打进去的东西，新文件必须手动加；
    另有体积上限兜底，防止课程资料误入。
+   **这份清单和 CI 用的 `pack.py.txt` 必须保持一致** —— 否则本地发的包和 CI 发的包内容不同。
 
 ### 方式 B：GitHub Actions 自动发
 
@@ -261,6 +282,8 @@ git tag v1.1.0 && git push origin v1.1.0
 ```
 
 或在仓库 Actions 页面手动触发 `Release`，输入版本号。
+
+> 前提同样是 **git push 通**。不通就只能走方式 A。
 
 ## 三个必踩的坑
 
