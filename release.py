@@ -422,7 +422,15 @@ def main():
 
     ver = args.version.lstrip("vV")
     tag = "v" + ver
-    name = ("%s —— %s" % (tag, args.title)) if args.title else tag
+
+    # --title 只写「版本号后面的那部分」。人很容易顺手写成 "v1.1.0 - xxx"，
+    # 那样拼出来就成了 "v1.1.0 —— v1.1.0 - xxx"。这里自动剥掉重复的版本号前缀。
+    title = args.title.strip()
+    for dup in (tag, ver):
+        if title.lower().startswith(dup.lower()):
+            title = title[len(dup):].lstrip(" \t-—–:：")
+            break
+    name = ("%s —— %s" % (tag, title)) if title else tag
 
     # 参数预检 —— 放在最前面，别等 tag 都建好了才发现文件不存在
     if args.notes and not os.path.isfile(args.notes):
