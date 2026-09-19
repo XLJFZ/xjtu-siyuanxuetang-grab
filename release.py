@@ -272,8 +272,9 @@ def verify_zip(zip_path):
 
         # 关键文件必须在
         for must in ("README.md", "SKILL.md", "scripts/lms_fetch.py",
-                     "scripts/lms_organize.py",
-                     "tests/test_organize.py", "tests/test_fetch.py"):
+                     "scripts/lms_organize.py", "scripts/lms_selfcheck.py",
+                     "tests/test_organize.py", "tests/test_fetch.py",
+                     "tests/test_selfcheck.py"):
             if not os.path.isfile(os.path.join(root, must)):
                 raise SystemExit("校验失败：包里缺 %s" % must)
 
@@ -283,10 +284,10 @@ def verify_zip(zip_path):
                 if EXCLUDE_STATE.search(fn):
                     raise SystemExit("校验失败：包里混进了登录态 %s" % fn)
 
-        # 跑离线测试（两个文件都要跑，别只跑一个）
+        # 跑离线测试（每个文件都要跑，别只跑一个）
         n_files = 0
         total_ran = 0
-        for t in ("test_organize.py", "test_fetch.py"):
+        for t in ("test_organize.py", "test_fetch.py", "test_selfcheck.py"):
             r = subprocess.run([sys.executable,
                                 os.path.join(root, "tests", t)],
                                capture_output=True, text=True)
