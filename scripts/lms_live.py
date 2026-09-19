@@ -218,14 +218,19 @@ def download(op, url, path, expect=None, retries=3, quiet=False,
                 except Exception:
                     pass
                 last_err = "续传缺口（请求 %d 服务端从 %d 起）" % (offset, start)
-                try:
-                    os.remove(tmp)
-                except OSError:
-                    pass
                 if attempt < retries - 1:
+                    # 还有机会：残片已经和任何请求都对不齐了，留着只会让下一轮
+                    # 继续撞缺口，丢掉、下一轮从 0 完整重下。
+                    try:
+                        os.remove(tmp)
+                    except OSError:
+                        pass
                     time.sleep(3 * (attempt + 1))
                     continue
-                return {"ok": False, "err": last_err, "kept_part": False}
+                # ★ 已经是最后一次：这次响应不能用，但原有的 .part 仍是
+                #   一段有效前缀。此时删掉等于白白丢掉已经下对的部分，
+                #   用户下次只能从头再来 —— 保留它，并把失败如实报上去。
+                return {"ok": False, "err": last_err, "kept_part": True}
 
             total = None
             cr = r.headers.get("Content-Range")
