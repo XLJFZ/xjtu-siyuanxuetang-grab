@@ -113,30 +113,41 @@ curl -sI https://xljfz.github.io/xjtu-siyuanxuetang-grab/
 用 API 查构建记录时，会看到这种输出：
 
 ```
-a1bdaf10  building  2026-09-19T13:39:27
-c8ca2765  errored   2026-09-19T13:39:22
-e2d1677e  errored   2026-09-19T13:39:18
+92f6a1b2  built      created=13:42:00   err=None          ← 最终生效的就是它
+d3f665da  errored    created=13:41:57   err=Page build failed.
+a1bdaf10  built      created=13:39:27   err=None
+c8ca2765  errored    created=13:39:22   err=Page build failed.
+e2d1677e  errored    created=13:39:18   err=Page build failed.
+5b592aca  built      created=13:34:56   err=None
 ```
 
-**连推多个 commit 时，前面几条必然是 `errored`——这是正常现象，不是部署失败。**
+**连推多个 commit 时，间隔几秒的那几条必然是 `errored`——这是正常现象，不是部署失败。**
 
 原因：Pages 同时只跑一个构建。新 commit 一进来，正在跑的那次会被中止，
-记录上就落成 `errored`。它**不代表内容有问题**，只代表"这次构建被后来的取代了"。
-GitHub 不会特意标注"被取代"，所以看起来像失败。
+记录上就落成 `errored`，`error.message` 统一写成 `Page build failed.`。
+**这是中止时的通用文案，不是真实错误原因**，不要照着这句话去排查内容。
+
+看上面那段就能发现规律：**每次连续推送，最后一条必然是 `built`，被挤掉的必然 `errored`**
+（`5b592aca → e2d1677e/c8ca2765 → a1bdaf10`，以及 `a1bdaf10 → d3f665da → 92f6a1b2`，
+两轮完全同构）。GitHub 不会标注"被后来的取代了"，所以看起来像失败。
 
 判断真实状态看这三条，不用纠结历史记录：
 
 | 看什么 | 期望值 |
 |---|---|
+| 最后一条构建记录 | `built`（`err=None`） |
 | 响应头 `Last-Modified` | 晚于最后一次 commit 时间 |
 | 线上文件 sha256 | 与本地逐字节一致 |
-| 最后一条构建记录 | 最终变成 `built` |
 
 **别被 `errored` 牵着去排查内容**——先比对 sha256，一致就说明已经生效了。
 
-> 附注：查 Pages 配置的 `GET /repos/<owner>/<repo>/pages` 有时会返回 **404**，
+> 附注一：查 Pages 配置的 `GET /repos/<owner>/<repo>/pages` 有时会返回 **404**，
 > 哪怕站点实际在正常运行。这是 token 权限范围的问题（该端点需要 `Pages` 读权限），
 > 不是"站点被删了"。**以线上实测为准，不要以这个端点为准。**
+>
+> 附注二：验证时优先看响应头的 `X-Cache: MISS` + `Age: 0`——这表示命中源站新内容，
+> 而非 CDN 缓存的旧版本。如果拿到 `X-Cache: HIT` 且 `Age` 较大，就是缓存，
+> 过一会再请求。
 
 ### 页面布局的注意事项
 
