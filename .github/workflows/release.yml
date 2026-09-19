@@ -1,0 +1,105 @@
+# 打 tag 即自动发布：校验 → 打包 → 建 Release → 传 zip
+#
+# 触发方式（两种）：
+#   1. 推一个 v* 开头的 tag：       git tag v1.0.3 && git push origin v1.0.3
+#   2. 网页 Actions 页手动触发：    输入版本号即可
+#
+# 注意：本工作流的入口是 "推一个 tag"。如果你的网络环境 git push 不通
+# （代理拦截 git 协议），这条路径就用不上 —— 改用 release.py --version X.Y.Z
+# 从本地发布，功能等价。
+#
+# 权限说明：verify 只读代码即可；只有真正发布 Release 的 job 需要
+# contents: write。workflow 级默认权限不放开，按 job 最小化声明。
+
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "版本号（不带 v，如 1.0.3）"
+        required: true
+        type: string
+
+jobs:
+  # 先把测试跑通，测试挂了就不发版 —— 这个 job 不需要任何写权限
+  verify:
+    name: 校验
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 语法编译
+        run: python -m compileall -q scripts/ tests/
+
+      - name: 离线测试
+        run: |
+          python tests/test_organize.py
+          python tests/test_fetch.py
+          python tests/test_selfcheck.py
+
+      - name: 隐私自检
+        run: |
+          set -e
+          if git ls-files | grep -Ei '(^|/)(state_.*\.json|storage_state\.json|cookies.*\.json|activities_.*\.json)$'; then
+            echo "::error::仓库里出现登录态或活动清单文件"; exit 1
+          fi
+          if git ls-files | grep -Ei '(^|/)profile_[^/]*/'; then
+            echo "::error::仓库里出现浏览器 profile 目录"; exit 1
+          fi
+          if grep -rn --include='*.py' -E 'C:\\\\Users\\\\|/Users/[a-z]|D:\\\\' scripts/; then
+            echo "::error::脚本里有本机绝对路径"; exit 1
+          fi
+          echo "OK"
+
+  release:
+    name: 打包并发布
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write        # 建 Release、传附件必需
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 确定版本号
+        id: ver
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            V="${{ inputs.version }}"
+          else
+            V="${GITHUB_REF_NAME#v}"
+          fi
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "tag=v$V" >> "$GITHUB_OUTPUT"
+          echo "版本: v$V"
+
+      - name: 打包
+        run: python .github/scripts/pack.py --version "${{ steps.ver.outputs.version }}"
+
+      # 第三方 action 固定到 commit SHA（v2.6.2），防止 tag 被挪动后引入意外变更
+      - name: 发布
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
+        with:
+          tag_name: ${{ steps.ver.outputs.tag }}
+          name: ${{ steps.ver.outputs.tag }}
+          files: dist/*.zip
+          generate_release_notes: true
+          draft: false
+          prerelease: false
