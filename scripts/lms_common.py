@@ -49,6 +49,11 @@ def describe_state(path):
         "partial"  cookies 里没有属于目标域名的
         "ok"       可用
 
+    两种格式都认（都只看 cookies 数组）:
+        ① Playwright 原生 storage_state ：{"cookies": [...], "origins": [...]}
+        ② 项目自定义精简结构            ：{"version":1, "host":..., "cookies":[...]}
+    ② 是从 lms_login 起使用的新格式，落盘的敏感信息更少；旧文件继续可用。
+
     单独抽出来是因为「文件在但内容是空的」和「文件压根不在」从报错上看不出区别，
     而这两种情况的处理方式完全不同。
     """
@@ -59,15 +64,28 @@ def describe_state(path):
             st = json.load(f)
     except (ValueError, OSError) as e:
         return "bad", "解析失败: %s" % str(e)[:60], 0
+    if isinstance(st, list):
+        st = {"cookies": st}              # 裸数组也算一种极简格式
     if not isinstance(st, dict) or not isinstance(st.get("cookies"), list):
         return "bad", "结构不对（缺 cookies 数组）", 0
     cookies = st["cookies"]
     if not cookies:
         return "empty", "cookies 为空", 0
-    n_host = sum(1 for c in cookies if HOST in str(c.get("domain", "")))
+    fmt = "新格式" if st.get("version") else "storage_state"
+    n_host = sum(1 for c in cookies if _cookie_host_ok(c.get("domain")))
     if not n_host:
         return "partial", "%d 个 cookie，但都不属于 %s" % (len(cookies), HOST), len(cookies)
-    return "ok", "%d 个 cookie（%d 个属于 %s）" % (len(cookies), n_host, HOST), len(cookies)
+    return "ok", "%d 个 cookie（%d 个属于 %s）[%s]" % (
+        len(cookies), n_host, HOST, fmt), len(cookies)
+
+
+def _cookie_host_ok(domain):
+    """cookie 的 domain 是否覆盖当前目标 host（含子域匹配）"""
+    dom = str(domain or "").lstrip(".").lower()
+    if not dom:
+        return True
+    t = HOST.lower()
+    return t == dom or t.endswith("." + dom)
 
 
 def find_browser():
