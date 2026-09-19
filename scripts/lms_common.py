@@ -23,6 +23,16 @@ BASE = os.environ.get("LMS_BASE", "https://lms.xjtu.edu.cn").rstrip("/")
 # 从这个域名读 cookie
 HOST = urlparse(BASE).hostname or "lms.xjtu.edu.cn"
 
+# 非 UTF-8 终端防护：GitHub 的 Windows runner 是 cp1252，`--help` 输出中文
+# 会抛 UnicodeEncodeError 直接崩（实测 CI 三种 Python 版本全挂在这一步）。
+# 把编码错误降级成替换符而不是崩溃；不改编码本身，本地 GBK 终端显示不受影响。
+# StringIO（测试捕获输出）没有 reconfigure，忽略即可。
+for _s in (sys.stdout, sys.stderr):
+    try:
+        _s.reconfigure(errors="replace")
+    except (AttributeError, ValueError):
+        pass
+
 
 def cache_dir():
     """登录态 / 浏览器 profile 的默认存放位置: ~/.lms-grab"""
