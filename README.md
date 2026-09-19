@@ -122,6 +122,9 @@ CV/
 | `scripts/lms_fetch.py` | 抓取主体：列清单 / 下载 / 归类，支持干跑与增量 |
 | `scripts/lms_organize.py` | 章节解析：中文数字转换、多写法匹配、假章号排除 |
 | `tests/test_organize.py` | 离线自测，21 个用例，**不需要网络和登录态** |
+| `ci.yml.txt` | CI 配置，用 `enable-ci.bat` 启用 |
+| `release.yml.txt` | 打 tag 自动发版的 Actions 配置 |
+| `pack.py.txt` | Release 工作流用的打包脚本 |
 
 ## 参数与环境变量
 
@@ -160,20 +163,60 @@ CI 在 push / PR 时自动跑三平台 × 三个 Python 版本，外加一步隐
 ### 启用 CI
 
 GitHub 对 `.github/workflows/` 下的文件有**额外权限要求**（需要 token 带 `Workflows: write`），
-通过 Contents API 推送会被 403 拒掉。所以本仓库的 CI 配置以 `ci.yml.txt` 的形式存放，
+通过 Contents API 推送会被 403 拒掉。所以本仓库的 CI 配置以 `.txt` 的形式存放，
 想启用的话：
 
 ```
 双击 enable-ci.bat          # Windows
 ```
 
-它会生成 `.github/workflows/ci.yml`，然后 `git add / commit / push` 就生效了。
+它会生成 `ci.yml`（测试 + 隐私自检）、`release.yml`（打 tag 自动发版）
+和 `.github/scripts/pack.py`，然后 `git add / commit / push` 就生效了。
 手动方式也一样简单：
 
 ```bash
-mkdir -p .github/workflows
-cp ci.yml.txt .github/workflows/ci.yml
+mkdir -p .github/workflows .github/scripts
+cp ci.yml.txt     .github/workflows/ci.yml
+cp release.yml.txt .github/workflows/release.yml
+cp pack.py.txt    .github/scripts/pack.py
 ```
+
+## 维护者：怎么发一个版本
+
+### 方式 A：本地一键（推荐，本机 git 协议不通时唯一可行）
+
+```bash
+set GH_TOKEN=github_pat_xxx
+
+python release.py --version 1.1.0 --title "新增 xxx" --dry-run   # 先看打包内容
+python release.py --version 1.1.0 --title "新增 xxx"             # 正式发
+```
+
+它会依次做：**版本号自检 → 打包 → 包体校验 → 打 tag → 建 Release → 传附件**。
+
+| 参数 | 作用 |
+|---|---|
+| `--dry-run` | 只打包+列清单，不碰 GitHub |
+| `--push-code` | 发布前先把源码推到 main |
+| `--notes notes.md` | 用文件里的内容当 Release 说明 |
+| `--resume` | 上次发到一半中断了，只补缺的部分 |
+| `--yes` | 跳过发布前确认 |
+
+**版本号自检是硬保护**：如果 tag 已存在就直接报错退出。已发布的版本内容不可变 ——
+要改内容就发新版本号，不要原地覆盖（这条踩过坑）。
+
+**包体校验**会在上传前解压到临时目录、确认关键文件齐全、确认没有混进登录态、
+并跑一遍离线测试。校验不过就不发。
+
+### 方式 B：GitHub Actions 自动发
+
+启用 workflow 后（见上），打一个 tag 就自动发布：
+
+```bash
+git tag v1.1.0 && git push origin v1.1.0
+```
+
+或在仓库 Actions 页面手动触发 `Release`，输入版本号。
 
 ## 三个必踩的坑
 
