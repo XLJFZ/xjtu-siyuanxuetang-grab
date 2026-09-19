@@ -232,11 +232,11 @@ footer a { color: var(--fg-2); }
 
   <div class="hero">
     <h1>把课程资料备份到本地<br>并自动整理归类</h1>
-    <p>面向西安交大思源学堂 2.0，仅处理当前账号有权访问的课程。自动走完登录、列清单、下载、按章归类。课堂录像与直播回放一并支持。</p>
+    <p>面向西安交大思源学堂 2.0，仅处理当前账号有权访问的课程。装成 Skill 后一句话跑完整流程，也支持 Prompt 与纯命令行。</p>
     <div class="meta">
+      <span>WorkBuddy · Claude Code · Codex</span><span class="dot"></span>
       <span>Python 3.8+</span><span class="dot"></span>
-      <span>MIT</span><span class="dot"></span>
-      <span>断点续传 · 双机位回放</span>
+      <span>MIT</span>
     </div>
     <div class="acts">
       <a class="btn p" href="https://github.com/XLJFZ/xjtu-siyuanxuetang-grab/releases/latest">下载</a>
@@ -248,14 +248,37 @@ footer a { color: var(--fg-2); }
 
     <div class="col-l">
       <div class="sec">
-        <h2>用法</h2>
-        <p>三步。登录只需做一次，之后反复跑都会自动跳过已下载的文件。</p>
+        <h2>装成 Skill（推荐）</h2>
+        <p>把文件夹放进助手的 skills 目录，之后直接说一句话就行，不用记任何命令。</p>
+<pre><code>帮我把这门课的资料都下载下来，
+课程链接：lms.xjtu.edu.cn/course/&lt;课程ID&gt;/index</code></pre>
+        <p style="margin-top:20px">助手会走完登录、列清单、等你确认、下载、按章归类。使用边界写在 <code>SKILL.md</code> 里，装成 Skill 不会绕过这些约束。</p>
+        <div class="paths" style="margin-top:20px">
+          <div><span class="who">WorkBuddy</span><code>~/.workbuddy/skills/xjtu-siyuanxuetang-grab/</code></div>
+          <div><span class="who">Claude Code</span><code>~/.claude/skills/xjtu-siyuanxuetang-grab/</code></div>
+          <div><span class="who">Codex</span><code>~/.codex/skills/xjtu-siyuanxuetang-grab/</code></div>
+        </div>
+      </div>
+
+      <div class="sec">
+        <h2>不装 Skill 也能用</h2>
+        <p>两条替代路径，都不需要助手支持 Skill 机制。</p>
+        <div class="paths">
+          <div><span class="who">Prompt · 贴进任意对话式 AI</span><code>prompt.md</code></div>
+          <div><span class="who">命令行 · 自己控制每一步</span><code>python scripts/lms_fetch.py ...</code></div>
+        </div>
+        <p style="margin-top:18px">此时 <code>SKILL.md</code> 相当于一份完整操作手册，<code>prompt.md</code> 是可复制的通用 Prompt。</p>
+      </div>
+
+      <div class="sec">
+        <h2>命令行用法</h2>
+        <p>登录只需做一次，之后反复跑都会自动跳过已下载的文件。</p>
 <pre><code>pip install playwright
 
 python scripts/lms_login.py --course &lt;课程ID&gt;
 
-python scripts/lms_fetch.py --course &lt;课程ID&gt; --out "./CV" --dry-run
-python scripts/lms_fetch.py --course &lt;课程ID&gt; --out "./CV"</code></pre>
+python scripts/lms_fetch.py --course &lt;课程ID&gt; --out "./课程资料" --dry-run
+python scripts/lms_fetch.py --course &lt;课程ID&gt; --out "./课程资料"</code></pre>
         <p style="margin-top:20px">加 <code>--organize</code> 就按章分好文件夹。录像动辄几百 MB，只要讲义就加 <code>--no-video</code>。</p>
       </div>
 
@@ -269,7 +292,7 @@ python scripts/lms_fetch.py --course &lt;课程ID&gt; --out "./CV"</code></pre>
           </div>
           <div>
             <span class="who">直播回放 · lecture_live</span>
-            <code>独立流媒体系统，单节 350–440 MB，支持断点续传与双机位</code>
+            <code>独立录播系统，单节几百 MB，支持断点续传与双机位</code>
           </div>
         </div>
         <p style="margin-top:18px">回放默认只下「屏幕录制」机位；加 <code>--all-cameras</code> 连教师机位一起下。</p>
@@ -335,14 +358,38 @@ python scripts/lms_fetch.py --course &lt;课程ID&gt; --out "./CV"</code></pre>
       </div>
 
       <div class="sec">
-        <h2>装成 Skill</h2>
-        <p>把文件夹放进对应目录，之后直接跟 AI 说「帮我把这门课的课件和录像都下载下来」就行。</p>
-        <div class="paths">
-          <div><span class="who">WorkBuddy</span><code>~/.workbuddy/skills/xjtu-siyuanxuetang-grab/</code></div>
-          <div><span class="who">Claude Code</span><code>~/.claude/skills/xjtu-siyuanxuetang-grab/</code></div>
-          <div><span class="who">Codex</span><code>~/.codex/skills/xjtu-siyuanxuetang-grab/</code></div>
+        <h2>为什么装成 Skill</h2>
+        <p>脚本要记参数、记顺序、记端点；Skill 只要说一句话。助手会自己判断该干什么。</p>
+        <div class="faq">
+          <div class="q">
+            <b>什么都不用配</b>
+            <span>文件夹放进 skills 目录即可，不需要额外安装步骤，也不需要把命令抄进对话。</span>
+          </div>
+          <div class="q">
+            <b>自动匹配场景</b>
+            <span>说到「下载这门课的课件」「把课上资料拉下来」时，助手会自动读取并按流程执行。</span>
+          </div>
+          <div class="q">
+            <b>边界跟着一起走</b>
+            <span>使用边界写在 <code>SKILL.md</code> 里，助手执行时会读到并遵守，不会绕过。</span>
+          </div>
+          <div class="q">
+            <b>跨工具通用</b>
+            <span><code>SKILL.md</code> 是通用格式，任何支持该约定的助手都能用，换工具不用改内容。</span>
+          </div>
         </div>
-        <p style="margin-top:18px">不装也能用，脚本是独立的命令行工具。</p>
+      </div>
+
+      <div class="sec">
+        <h2>这一版装的是什么</h2>
+        <p>仓库本身就是可直接放进 skills 目录的文件夹，不需要再打包或转换格式。</p>
+        <div class="paths">
+          <div><span class="who">Skill 入口</span><code>SKILL.md —— 流程、边界、注意事项</code></div>
+          <div><span class="who">脚本</span><code>scripts/ —— 登录 / 下载 / 归类 / 回放</code></div>
+          <div><span class="who">离线测试</span><code>tests/ —— 86 个用例，不需要网络</code></div>
+          <div><span class="who">替代用法</span><code>prompt.md —— 贴进对话的通用 Prompt</code></div>
+        </div>
+        <p style="margin-top:18px">也可以用 Release 里的 zip 包，解压后同样是这个文件夹结构。</p>
       </div>
     </div>
 
