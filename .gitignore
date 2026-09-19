@@ -46,3 +46,7 @@ desktop.ini
 # Release 附件
 dist/
 build/
+
+# 例外：CI 配置以 .txt 形式存放（workflow 文件需要额外权限，
+# 用 enable-ci.bat 还原到 .github/workflows/ci.yml）
+!ci.yml.txt
