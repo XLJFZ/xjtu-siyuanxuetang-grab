@@ -1,0 +1,23 @@
+# 登录态与凭据 —— 绝对不能提交
+state_*.json
+*.state.json
+storage_state.json
+cookies*.json
+
+# 运行产物
+_lms_downloads/
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
