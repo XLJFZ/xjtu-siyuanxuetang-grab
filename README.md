@@ -28,14 +28,24 @@ AI 就会自动走完「登录 → 干跑列清单 → 确认 → 下载 → 归
 
 ## 为什么需要它
 
-思源学堂的附件不在 DOM 里，是 AngularJS 调 API 渲染的，**直接爬页面永远扫不到**。而且附件分两类来源，只看一类会漏掉一半以上：
+思源学堂的附件不在 DOM 里，是 AngularJS 调 API 渲染的，**直接爬页面永远扫不到**。而且附件分几类来源，只看一类会漏掉一半以上：
 
 | 来源 | 位置 | 典型内容 |
 |---|---|---|
-| ① 活动 JSON 的 `uploads` 数组 | `/api/courses/<ID>/activities` | 作业附件 |
+| ① 活动 JSON 的 `uploads` 数组 | `/api/courses/<ID>/activities` | 作业附件、**课堂录像** |
 | ② `type=page` 活动正文 `data.content` 内嵌的 `/api/uploads/<id>` | 需逐个拉 `/api/activities/<id>` 再正则抽取 | **课件 PDF（几乎全在这）** |
+| ③ `type=lecture_live` 活动的 `data.external_live_detail.replay_videos[]` | 指向 `rms-v5.xjtu.edu.cn`，另一套系统 | 教室直播回放（**暂不支持**） |
 
 第二类藏在正文富文本的 `div.ccbb-attachments` 里，`uploads` 字段是 `null`——很容易误判成「这门课没有课件文件」。
+
+**课堂录像（`online_video` 类型）走的是第一类**，和课件共用同一个下载端点，所以断点续传、etag 校验全都适用，落到独立的 `录像/` 目录：
+
+```bash
+python scripts/lms_fetch.py --course <ID> --out ./课程资料              # 含录像
+python scripts/lms_fetch.py --course <ID> --out ./课程资料 --no-video    # 只要讲义
+```
+
+直播回放（`lecture_live`）是另一套系统，本工具不支持——详见 [`SKILL.md`](SKILL.md#课堂录像)。
 
 ## 安装
 
@@ -83,6 +93,16 @@ python scripts/lms_fetch.py --course <课程ID> --out "./CV"
 python scripts/lms_fetch.py --course <课程ID> --out "./CV" --organize --dry-run   # 先看归类对不对
 python scripts/lms_fetch.py --course <课程ID> --out "./CV" --organize
 ```
+
+**有些课带课堂录像**（`online_video` 类型的活动）。它们自动落到独立的 `录像/` 目录，不跟讲义混在一起：
+
+```bash
+python scripts/lms_fetch.py --course <课程ID> --out "./CV" --dry-run    # 输出里会写「其中课堂录像: N」
+python scripts/lms_fetch.py --course <课程ID> --out "./CV" --no-video   # 只要讲义，跳过录像
+```
+
+录像往往几百 MB（某门 CAD 课 17 个视频加起来 1.5 GB），**下之前先看干跑的体积**。
+录像不参与 `--organize`——视频标题认不出章号，硬套只会全堆进 `其他/`。
 
 产物从 `课件/<活动标题>/` 变成：
 
@@ -138,6 +158,7 @@ CV/
 | `--retries N` | 单文件重试次数，默认 3（指数退避） |
 | `--no-verify` | 跳过下载前的登录态探测 |
 | `--exclude "2020\|2021\|2022"` | 文件名正则，命中跳过（清理旧版作业） |
+| `--no-video` | 跳过课堂录像（`online_video`），只要讲义时用 |
 | `--split-projects` | 项目压缩包单独进 `项目/` |
 | `--layout flat` | 平铺，不按活动建子文件夹 |
 | `--dry-run` | 只打清单不下载；配 `-v` 会显示归类后的目标目录 |
@@ -272,6 +293,20 @@ python release.py --version 1.1.0 --title "下载可靠性" --yes       # 正式
 3. **打包白名单** —— 用 `INCLUDE` 显式列出该打进去的东西，新文件必须手动加；
    另有体积上限兜底，防止课程资料误入。
    **这份清单和 CI 用的 `pack.py.txt` 必须保持一致** —— 否则本地发的包和 CI 发的包内容不同。
+
+## 文档站
+
+线上地址：**https://xljfz.github.io/xjtu-siyuanxuetang-grab/**
+
+站点是 `docs/index.html` 一个单页（纯静态、零依赖、无构建），
+由 GitHub Pages 从 `main` 分支的 `/docs` 目录发布。改完推上去即可：
+
+```bash
+python push_docs.py
+```
+
+页面改动相关的完整说明（发布源为什么这么选、设置页的两个坑、响应式布局注意事项、
+怎么验证部署结果）见 **[docs/MAINTAINING.md](docs/MAINTAINING.md)**。
 
 ### 方式 B：GitHub Actions 自动发
 
