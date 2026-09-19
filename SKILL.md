@@ -1,14 +1,18 @@
 ---
 name: xjtu-lms-grab
-description: 抓取西安交大思源学堂 2.0（lms.xjtu.edu.cn，TronClass）任意课程的课件、作业、项目压缩包。当用户给出 lms.xjtu.edu.cn/course/<id> 之类链接，或说「下载这门课的课件/作业」「把课上资料拉下来」时使用。覆盖：Playwright 持久化 profile 登录一次并落盘登录态、两类附件来源（uploads 字段 + 正文内嵌）、下载端点 /api/uploads/<id>/blob、按章/按活动归类、增量补件、断点续传 + 自动重试 + sha256 校验、`--list-only` 只导清单不下文件。
+description: 下载与整理西安交大思源学堂 2.0（lms.xjtu.edu.cn）当前账号有权访问的课程资料（课件、作业、录像）。当用户给出 lms.xjtu.edu.cn/course/<id> 之类链接，或说「下载这门课的课件/作业」「把课上资料拉下来」时使用。覆盖：Playwright 持久化 profile 登录一次并落盘登录态、两类附件来源（附件字段 + 正文内嵌）、按章/按活动归类、增量补件、断点续传 + 自动重试 + sha256 校验、`--list-only` 只导清单不下文件。
 agent_created: true
 ---
 
-# 思源学堂 2.0 课程资料抓取
+# 思源学堂 2.0 课程资料下载
 
 适用：用户给一个 `lms.xjtu.edu.cn/course/<课程ID>` 链接，要课件 / 作业 / 项目文件。
 
 脚本在 `scripts/`，**不含任何本机专属路径**，换台机器直接用。
+
+> [!important] 使用边界
+> 只处理当前登录账号**正常拥有访问权限**的课程资源。不绕过认证、不提升权限、
+> 不枚举无权课程、不公开传播下载内容、不进行高并发访问。
 
 ### 环境要求
 
@@ -25,8 +29,8 @@ agent_created: true
 ## 流程
 
 ### 1. 先问清课程 ID 和输出目录
-ID 从 URL 里取：`/course/33593/` → `33593`。
-输出目录默认就是该课程的工作区根（如 `D:\计算机视觉与模式识别`）。
+ID 从 URL 里取：`/course/<课程ID>/` → `<课程ID>`。
+输出目录由用户指定，建议用该课程的工作目录名。
 
 ### 2. 登录（只需一次）
 ```bash
@@ -59,16 +63,16 @@ python scripts/lms_fetch.py --course <ID> --out "<目录>"
 
 | 能力 | 说明 |
 |---|---|
-| **断点续传** | 服务端支持 `accept-ranges: bytes`。中断后残片留在 `<文件>.part`，重跑时带 `Range` 头接着下，返回 206 才认。服务端若忽略 Range（返回 200）则丢弃残片重下，不会拼出错文件。 |
+| **断点续传** | 平台对附件支持分片下载。中断后残片留在 `<文件>.part`，重跑时带 `Range` 头接着下，返回 206 才认。服务端若忽略 Range（返回 200）则丢弃残片重下，不会拼出错文件。 |
 | **自动重试** | 默认 3 次，指数退避。只重试「可能自己好」的错误（超时 / 5xx / 连接重置），401/403/404 直接放弃不浪费时间。`--retries N` 可调。 |
 | **sha256 校验** | 边下边算，结果写进 `--manifest`。续传的部分也会计入哈希，最终值与完整下载逐字节一致。 |
-| **etag 交叉验证** | 思源学堂的 etag 形如 `"698e9012-cb2ec"`，后半段是十六进制文件大小（`0xcb2ec` = 832236）。下载完拿它跟实际字节数对一遍。 |
-| **登录态探测** | 开跑前先打一个轻量 API，401 就明确告诉你「登录态过期了，重跑 lms_login.py」，而不是等到下 20 个文件全 401 才发现。`--no-verify` 可跳过。 |
+| **etag 交叉验证** | 平台返回的 etag 后半段是十六进制文件大小，下载完拿它跟实际字节数对一遍。 |
+| **登录态探测** | 开跑前先打一个轻量请求，401 就明确告诉你「登录态过期了，重跑 lms_login.py」，而不是等到下 20 个文件全 401 才发现。`--no-verify` 可跳过。 |
 | **进度显示** | 单文件百分比 + 当前/总数。`-q` 关掉。 |
 
-> [!note] 服务端不提供 sha256 头
-> 实测响应头只有 `etag` / `last-modified` / `content-length`，没有官方哈希。
-> 所以完整性是这样做的：本地 sha256 存进 manifest 供事后复核，再用 etag 里的字节数交叉验证。
+> [!note] 平台不提供官方哈希
+> 响应头只有 `etag` / `last-modified` / `content-length`。所以完整性是这样做的：
+> 本地 sha256 存进 manifest 供事后复核，再用 etag 里的字节数交叉验证。
 
 ## 关键参数
 
@@ -107,48 +111,44 @@ python scripts/lms_fetch.py --course <ID> --out "<目录>"
 | `LMS_BROWSER` | 强制指定浏览器 exe 的绝对路径 |
 
 ### 6. 用 `--exclude` 清旧版前先确认「有没有唯一版本」
-不同年份的作业 PDF 常同时存在（课件区挂 2021 版，作业区挂 2025 版）。按年份批量排除时，
+不同年份的作业 PDF 常同时存在（课件区挂旧版，作业区挂新版）。按年份批量排除时，
 **先确认该章节在作业区是否有新版**，否则可能把唯一版本一起排除掉。
-（实例：计算机视觉课的第六章作业只有课件区的 2021 版，作业区根本没有新版。）
 
-## 接口速查
+## 资源类型速查
 
-| 用途 | 端点 |
-|---|---|
-| 全部活动（含 uploads 字段） | `GET /api/courses/<ID>/activities?sub_course_id=0` |
-| 单个活动详情 | `GET /api/activities/<活动id>?sub_course_id=0` |
-| 课件分页列表 | `GET /api/course/<ID>/coursewares?conditions=...` |
-| 附件元信息（**取文件名用它**） | `GET /api/uploads/<上传id>` |
-| **下载** | `GET /api/uploads/<上传id>/blob` |
-| 直播回放地址 | 活动详情 `data.external_live_detail.replay_videos[].url`（指向 rms-v5，非本域名） |
+附件按承载方式分三类，脚本已全部覆盖：
+
+| 用途 | 落地位置 | 说明 |
+|---|---|---|
+| 活动中的附件（含课堂录像） | `课件/` `作业/` `录像/` | 平台前端使用的普通附件接口 |
+| 活动正文内嵌的附件（课件 PDF 主要来源） | `课件/` | 需逐个取活动详情后抽取 |
+| 直播回放 | `回放/` | 指向校外录播系统，另一套域名 |
 
 页面路由：课件 `/course/<ID>/courseware#/` · 作业 `/course/<ID>/homework#/` · 章节 `/course/<ID>/content#/`
 · 活动详情 `/course/<ID>/learning-activity#/<id>`
 
-## 三个必踩的坑
+## 使用中的注意事项
 
-> [!important] ① 附件有两类来源，只看 `uploads` 会漏掉一大半
-> - **① 活动 JSON 的 `uploads` 数组** —— 作业附件在这。
-> - **② `type=page` 活动正文富文本 `data.content` 里的 `/api/uploads/<id>`** —— **课件 PDF 几乎全在这**，
->   藏在 `div.ccbb-attachments` 里。`uploads` 字段是 `null`，很容易误判成「这门课没有课件文件」。
-> 判断「有没有附件」时，**`uploads` 为空 ≠ 没附件**，必须再查 `data.content`。
+> [!important] ① 附件有两类来源，只看附件字段会漏掉一大半
+> - **① 活动数据里的附件数组** —— 作业附件在这。
+> - **② `type=page` 活动正文富文本里的附件链接** —— **课件 PDF 几乎全在这**，
+>   藏在正文的附件区块里。附件字段是 `null`，很容易误判成「这门课没有课件文件」。
+> 判断「有没有附件」时，**附件字段为空 ≠ 没附件**，必须再查活动正文。
 
-> [!warning] ② 文件名要从 `/api/uploads/<id>` 的 `name` 取，不要从正文硬猜
-> 正文显示的链接名和真实文件名常不一致（正文写 `SIFT特征.pdf`，实际是
-> `Lec11-卷积的应用--Harris, GFTT,SIFT特征.pdf`）。
+> [!warning] ② 文件名要从附件元信息取，不要从正文硬猜
+> 正文显示的链接名和真实文件名常不一致，必须以接口返回的元信息为准。
 
 > [!note] ③ 403 / 404 是平台侧限制，不是下载失败
 > 个别附件元信息就取不到（403 无权限、404 已删除），脚本会标 `N/A` 跳过，不用反复重试。
-> `/api/uploads/<id>/download` 是 404，正确端点是 `/blob`。
 
 ## 课堂录像
 
 思源学堂的录像有**两种完全不同的承载方式**，脚本对两类都支持，但实现路径不同。
 
-| 类型 | 目录 | 端点 | 校验 |
-|---|---|---|---|
-| `online_video` | `录像/` | `/api/uploads/<id>/blob`（同课件） | etag 大小 + sha256 |
-| `lecture_live` | `回放/` | `rms-v5.xjtu.edu.cn/.../preview?previewToken=` | 只有 Content-Length |
+| 类型 | 目录 | 说明 |
+|---|---|---|
+| `online_video` | `录像/` | 平台附件形式的录像，与课件同一套下载逻辑 |
+| `lecture_live` | `回放/` | 教室录播系统的回放，另一套域名 |
 
 ```bash
 python scripts/lms_fetch.py --course <ID> --out ./课程资料              # 全都要
@@ -157,88 +157,61 @@ python scripts/lms_fetch.py --course <ID> --out ./课程资料 --no-video    # �
 
 ### 类型 A：`online_video` —— 就是普通附件
 
-录像躺在活动的 `uploads[]` 里，和课件走同一个端点：
+录像躺在活动的附件数组里，和课件走同一个端点：
 
 ```
 activities[i].type == "online_video"
-  .uploads[0] = {id: 76161, name: "xxx_标清.mp4", size: 5618914, ...}
-GET /api/uploads/<id>/blob
+  .uploads[0] = {id: ..., name: "xxx_标清.mp4", size: ..., ...}
 ```
 
-实测（2026-09，20 个此类活动，含 `.mp4` / `.flv`）：`Content-Type: video/mp4`、
-带 `Content-Length`、`accept-ranges: bytes`，**断点续传与 etag 校验全部可用**，
-下载字节数与 API 声明的 `size` 逐字节一致。
+平台对其提供完整的分片下载能力，**断点续传与 etag 校验全部可用**，
+下载字节数与接口声明的大小逐字节一致。
 
 > [!tip] 哪些课有
-> 各课差异极大——建筑设计类课程常有（某门 CAD 课 17 个），理论课往往一个没有。
+> 各课差异较大——设计实践类课程可能较多，理论课往往一个没有。
 > 先 `--dry-run` 看输出里的「其中课堂录像: N」一行。
 
 ### 类型 B：`lecture_live` —— 直播回放，另一套域名
 
-教室录播走的是**完全独立**的一套系统，不在 `uploads` 里：
+教室录播走的是**完全独立**的一套系统，不在活动的附件数组里：
 
 ```
 activities[i].type == "lecture_live"
   .data.external_live_detail.replay_videos[] = [
-      {camera_id: 960821, camera_type: "instructor", url: "..."},   # 教师机位
-      {camera_id: 960824, camera_type: "encoder",    url: "..."},   # 屏幕录制
+      {camera_id: ..., camera_type: "instructor", url: "..."},   # 教师机位
+      {camera_id: ..., camera_type: "encoder",    url: "..."},   # 屏幕录制
   ]
 ```
 
-URL 指向 `rms-v5.xjtu.edu.cn`（不是 `lms.xjtu.edu.cn`），由 `scripts/lms_live.py` 处理。
+回放地址指向校外录播系统（非 `lms.xjtu.edu.cn`），由 `scripts/lms_live.py` 处理。
 默认只下 `encoder`（屏幕录制 = 正课画面），`--all-cameras` 连 `instructor` 一起下。
 
-#### 下载契约（实测）
+#### 实现约束
 
-```
-https://rms-v5.xjtu.edu.cn/api/base/orgs/xjtu/captures/<capture_id>/videos/<camera_id>/preview?previewToken=<hex>
-```
-
-响应头（`GET`，不带 Range）：
-
-```
-Content-Length: 438175558        ← 完整大小，可作进度与校验依据
-Accept-Ranges:  bytes            ← 支持断点续传
-Etag:          "d4a1f1b58094be3d0b03424470c3c342"
-```
-
-带 `Range` 返回 `206`，`Content-Range: bytes 100000000-102097151/438175558`。
-
-> [!warning] 三个必须注意的实测行为
-> **① `previewToken` 会限流，别并发。** 同一 token 同时发多个请求（GET + HEAD + Range 混着来）
-> 会稳定返回 403，看起来像 token 过期。**串行发就完全正常**——实测单连接连续读 438 MB /
-> 4.6 分钟无一次中断，token 跨多轮请求也不失效。排查时如果看到 403，先怀疑并发而不是时效。
+> [!warning] 两项影响正确性的实现约束
+> **① 必须串行请求。** 同一回放地址同时发多个请求会被服务端判定为异常访问并拒绝，
+> 看起来像链接过期。串行发送则完全正常，长时间连续读取也不会失效。
+> 排查时如果遇到 403，先怀疑并发而不是时效。
 >
-> **② 服务端会把 Range 对齐到 2 MB 边界。** 请求 `bytes=100000000-100199999`（20 万字节）
-> 实际返回 `bytes 100000000-102097151`（2 MB）。**必须按响应里的 `Content-Range` 用实际长度**，
-> 不能假设服务端照办请求值，否则续传时会错位。
+> **② 必须以响应返回的实际区间长度为准。** 服务端会按自身策略调整请求的字节区间
+> （实际跨度可能大于请求值）。**必须读取响应里的 `Content-Range` 使用真实长度**，
+> 不能假设服务端照办请求值，否则续传时会错位。相应地，回放文件的完整性
+> 只能以 `Content-Length` 为准，没有 etag/sha256 级别的服务端校验。
 >
-> **③ 读取速度会衰减。** 前 30 秒能到 8 MB/s（吃服务端缓存），之后稳定到 ~1.6 MB/s
-> （实时转码速度）。一节课（438 MB / 90 分钟）约需 5 分钟下完。进度条必须显示，别让人以为卡死。
+> ③ 回放为实时转码输出，读取速度会随时间衰减，单节文件通常几百 MB，
+> 耗时明显长于普通附件。进度条必须保留，否则用户会以为卡死。
 
 > [!important] 文件名必须带时间戳，否则会丢数据
-> 同一天的多个 `lecture_live` 活动 **`title` 完全相同**。实测一门课 4 节课都叫
-> 「2026-09-19-计算机视觉与模式识别」，只有 `start_time` 不同（06:30Z / 07:30Z / 08:40Z / 09:40Z）。
-> 只用标题命名会让 4 节课**互相覆盖、最终只剩最后一节**。
+> 同一天的多个 `lecture_live` 活动 **`title` 可能完全相同**，只有开课时间不同。
+> 只用标题命名会让多节课**互相覆盖、最终只剩最后一节**。
 > 现在文件名形如 `<标题>-<YYYYMMDD-HHMM 本地时间>-<机位>.mp4`，
-> `start_time` 在活动详情的**顶层**，不在 `data` 里。
+> 开课时间在活动详情里，不在正文内容中。
 
 > [!warning] 别把 `lecture_live` 和 `online_video` 搞混
 > 名字里都带「视频」，但一个是附件、一个是流媒体。判断方式很简单：看 `type` 字段。
 > 两类**现在都能下**，不用再挑。区别只在体量与耗时：`online_video` 是普通附件，
-> 一个几十 MB，下载很快；`lecture_live` 回放单节 350–440 MB，且服务端是实时转码
-> （~1.6 MB/s），一节 90 分钟的课要约 5 分钟。
->
-> 数量上别按课的类型想当然。全量扫过 58 门课，`online_video` 共 20 个、`lecture_live`
-> 出现在少数几门课里，且分布很偏：
->
-> | 课程 | `online_video` | `lecture_live` |
-> |---|---|---|
-> | 计算机辅助建筑设计【04 | 17 | 0 |
-> | 传统木构与营造做法 | 2 | 8 |
-> | 计算机视觉与模式识别 | 1 | 4 |
->
-> 建筑设计类课程能攒到 17 个录像——**「录像很少」是错觉**，开扫前别预设。
+> 单个通常几十 MB，下载很快；`lecture_live` 回放单节可达数百 MB，且为实时转码，
+> 下载耗时明显更长。
 
 ## 归类建议
 
@@ -265,8 +238,8 @@ python scripts/lms_fetch.py --course <ID> --out ./课程资料 --organize --dry-
 ## 环境备注
 
 - 浏览器自动探测，别手写绝对路径。顺序：系统 Edge → Chrome → playwright 自带 chromium。
-- 别手写裸 CDP：Edge 会冻结后台标签页（冻结的渲染进程不执行 JS，`Runtime.evaluate` 必超时），
-  且事件回调里再发命令会造成 WebSocket 重入死锁。Playwright 已把这些都处理掉。
+- **不要自己手写底层浏览器控制协议**：浏览器会冻结后台标签页（冻结的页面不执行脚本，
+  取值调用必然超时），且回调中再发命令会造成连接重入死锁。Playwright 已把这些都处理掉。
 - 长命令的 stdout 在某些机器上会丢，跑长任务建议重定向到日志文件。
 - `scripts/lms_common.py` 是所有「机器相关」配置的唯一出处（域名 / 缓存目录 / 浏览器探测），
   移植到新环境只需看这一个文件。
