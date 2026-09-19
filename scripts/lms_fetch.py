@@ -60,6 +60,10 @@ PROJ_HINT = re.compile(r"project|proj[_\-\s]?\d|项目|大作业|课程设计|�
 MAX_STEM = 120
 MAX_EXT = 12                      # 正常扩展名不会超过这个长度
 
+# 以数字开头的「真实扩展名」白名单。split_ext 默认要求扩展名以字母开头，
+# 这里放的是确实存在的例外，补不全没关系，漏掉的一律按「没有扩展名」处理。
+NUM_LEADING_EXT = frozenset(["7z", "7zip", "3gp", "3g2"])
+
 # 退出码 —— 让调用方（AI 或脚本）能区分失败原因
 RC_OK = 0
 RC_NO_STATE = 2                   # 没有登录态文件
@@ -72,6 +76,55 @@ ERR_UNAVAILABLE = "unavailable"   # 403 / 404，确实拿不到，可跳过
 ERR_AUTH = "authentication"       # 401，登录态问题，明确失败
 ERR_TRANSIENT = "transient"       # 超时 / 连接错误 / 5xx / JSON 解析失败，算失败
 
+# 清单里的条目状态。错误语义只有这一份定义 —— 普通下载 / --dry-run /
+# --list-only 三条路径都走 item_status()，不能各自再写一遍分类规则，
+# 否则同一门课在三种模式下会得到不同的 N/A / FAIL 结论。
+STATUS_OK = "ok"
+STATUS_EXISTS = "exists"
+STATUS_PLAN = "plan"
+STATUS_NA = "na"
+STATUS_FAIL = "fail"
+STATUS_EXCLUDED = "excluded"
+
+
+def item_status(it):
+    """出错误的条目在清单里应该是什么状态。
+
+    403 / 404 —— 平台确实没给这个文件（无权限 / 已删除），标 N/A 跳过；
+    401       —— 登录态失效；超时 / 连接错误 / 5xx / 坏 JSON —— 本次获取失败；
+    后两类都是 FAIL，都要计入失败、影响退出码。
+    """
+    if it.get("err_kind") == ERR_UNAVAILABLE:
+        return STATUS_NA
+    return STATUS_FAIL
+
+
+def default_err_msg(kind):
+    return {ERR_UNAVAILABLE: "平台侧无权限或已删除，跳过",
+            ERR_AUTH: "登录态失效，请重新登录",
+            ERR_TRANSIENT: "获取失败"}.get(kind, "获取失败")
+
+
+def count_fail(rows):
+    """清单里有多少条是真失败。N/A 不算 —— 那是平台确实没给。"""
+    return sum(1 for r in rows if r.get("status") == STATUS_FAIL)
+
+
+def error_row(i, it):
+    """把一个「出错条目」整理成清单行 —— 三种模式共用。
+
+    err_kind / stage 必须原样带出去：只留一个 N/A 会把「平台没给」
+    和「这次接口抖了 / 扫描没扫到」混成同一件事，事后无从核对。
+    """
+    kind = it.get("err_kind")
+    row = {"i": i, "kind": it.get("kind"), "activity": it.get("activity"),
+           "uid": it.get("uid"), "name": it.get("name"),
+           "status": item_status(it), "err_kind": kind,
+           "error": it.get("err_msg") or default_err_msg(kind)}
+    if it.get("stage"):
+        row["stage"] = it["stage"]
+    return row
+
 
 # ---------------------------------------------------------------- 工具
 
@@ -83,14 +136,20 @@ def split_ext(name):
         3.5 英寸软盘     -> 同上
         报告 v1.0       -> 不该把 '.0' 当扩展名
 
-    规则：2~12 字符、以字母开头、只含字母数字（可带 + - _）、不是纯数字。
+    规则：2~12 字符、只含字母数字（可带 + - _）、不是纯数字。
+    首字母通常必须是字母，但个别真实扩展名以数字开头（`.7z`），
+    用一个小白名单放行 —— 否则 `Project 2.7z` 会被当成没有扩展名，
+    路径冲突改名时会变成 `Project 2.7z~123`：扩展名坏了，
+    `is_project_pkg()` 认不出它是项目包，`dest_for()` 也就跑到别的目录去了。
     """
     stem, dot, ext = name.rpartition(".")
     if not dot or not (1 < len(ext) <= MAX_EXT):
         return name, ""
-    if not re.fullmatch(r"[A-Za-z][A-Za-z0-9+\-_]*", ext):
-        return name, ""
-    return stem, "." + ext
+    if re.fullmatch(r"[A-Za-z][A-Za-z0-9+\-_]*", ext):
+        return stem, "." + ext
+    if ext.lower() in NUM_LEADING_EXT:
+        return stem, "." + ext
+    return name, ""
 
 
 # Windows 保留设备名。这些名字**带扩展名也照样不能当文件名**
@@ -284,8 +343,31 @@ def api_ok(op):
 
 # ---------------------------------------------------------------- 收集
 
+def scan_error(stage, activity_id, title, exc):
+    """把扫描阶段的一次失败整理成统一结构，**不再就地 continue 掉**。
+
+    ★ 为什么必须记录：以前详情页 500 时只打一行「详情失败」就 continue，
+    于是正文里挂着的附件既不会进 plan、也不会进 fail、也不会出现在清单里，
+    程序最后照样 exit 0 —— 典型的 silent failure。扫描失败也是失败：
+    资源没被发现不等于资源不存在。
+
+    stage 取值:
+        page_detail          —— page 类型活动正文里的内嵌附件（课件 PDF 主要来源）
+        lecture_live_detail  —— lecture_live 活动的回放列表
+    """
+    if isinstance(exc, urllib.error.HTTPError):
+        err = classify_http(exc.code)
+        return {"stage": stage, "activity_id": activity_id,
+                "activity": safe(title) if title else None,
+                "kind": err["kind"], "error": err["msg"]}
+    return {"stage": stage, "activity_id": activity_id,
+            "activity": safe(title) if title else None,
+            "kind": ERR_TRANSIENT,
+            "error": "%s: %s" % (type(exc).__name__, str(exc)[:60])}
+
+
 def collect(op, course, activities=None, want_video=True):
-    """返回 ([(kind, 活动标题, upload_id)], 来源①数量, 来源②数量)
+    """返回 ([(kind, 活动标题, upload_id)], 来源①数量, 来源②数量, 扫描错误列表)
 
     kind 取值:
         课件   —— 讲义 / PDF / 附件
@@ -306,6 +388,7 @@ def collect(op, course, activities=None, want_video=True):
         activities = get_json(op, "%s/api/courses/%s/activities?sub_course_id=0"
                               % (BASE, course))["activities"]
     plan = {}
+    scan_errors = []
 
     def add(kind, act, uid):
         plan.setdefault((kind, safe(act), int(uid)), None)
@@ -331,13 +414,16 @@ def collect(op, course, activities=None, want_video=True):
     n1 = len(plan)
 
     # 来源 ②
+    # ★ 详情取不到时必须记账：一个 page 活动正文里可能挂着好几个 PDF，
+    #   以前 `except: continue` 让它们连 fail 都进不去，最后还是 exit 0。
     for a in activities:
         if a.get("type") != "page":
             continue
         try:
             d = get_json(op, "%s/api/activities/%s?sub_course_id=0" % (BASE, a["id"]))
         except Exception as e:
-            print("  详情失败 %s: %s" % (a["id"], str(e)[:50]))
+            scan_errors.append(scan_error("page_detail", a.get("id"),
+                                          a.get("title"), e))
             continue
         blob = json.dumps(d.get("data") or {}, ensure_ascii=False)
         for uid in set(re.findall(r"/api/uploads/(\d+)", blob)):
@@ -358,14 +444,44 @@ def collect(op, course, activities=None, want_video=True):
             try:
                 d = get_json(op, "%s/api/activities/%s?sub_course_id=0" % (BASE, aid))
             except Exception as e:
-                print("  回放详情失败 %s: %s" % (aid, str(e)[:50]))
+                scan_errors.append(scan_error("lecture_live_detail", aid,
+                                              a.get("title"), e))
                 continue
             reps = lms_live.parse_replay(d)
             if not reps:
                 continue
             # uid 用负数存活动 id —— 它不是 upload，走不了 uploads 端点
             add("回放", a.get("title"), -(int(aid)))
-    return sorted(plan.keys()), n1, n2
+    return sorted(plan.keys()), n1, n2, scan_errors
+
+
+def scan_error_items(scan_errors):
+    """把扫描阶段的错误伪装成「出错条目」，好让它走和下载条目一样的路径。
+
+    为什么要转成条目：这样 scan failure 会自动被计入 fail、写进 manifest、
+    在终端可见、并影响退出码 —— 不用在主流程里再写第二套逻辑。
+    """
+    out = []
+    for e in scan_errors:
+        stage = e.get("stage")
+        act = e.get("activity") or "未知活动"
+        aid = e.get("activity_id")
+        label = {"page_detail": "活动正文",
+                 "lecture_live_detail": "直播回放"}.get(stage, stage)
+        out.append({
+            "kind": "回放" if stage == "lecture_live_detail" else "课件",
+            "activity": act,
+            "uid": aid,
+            "name": "%s-%s" % (act, label),
+            "size": 0,
+            "error": True,
+            "stage": stage,
+            "err_kind": e.get("kind"),
+            "err_msg": "扫描失败（%s），该活动下的资源未被发现：%s"
+                       % (label, e.get("error")),
+            "unavailable": e.get("kind") == ERR_UNAVAILABLE,
+        })
+    return out
 
 
 def meta(op, uid):
@@ -416,23 +532,58 @@ def has_expected_size(size):
         return False
 
 
-def already_complete(path, size):
+def already_complete(path, size, tolerance=0.0):
     """判断某个目标文件是否真的已经下载完。
 
     ★ 以前是 `exists and getsize > 1024` —— 服务器上 100MB 的文件，
     本地只有 20MB（上次下到一半被杀）也会被当成完整文件永远跳过。
-    现在：服务端有明确 size 时必须**大小相等**才算完整，不等就重下。
+    现在：服务端有明确 size 时按大小比对，不等就重下。
+
+    ★ tolerance 必须与「下载时的成功判据」一致。回放允许多达
+    SHORT_TOLERANCE 的自然短读（详见 lms_live），如果这里仍要求严格相等，
+    就会出现「上一轮判成功、下一轮判要重下」——同一个文件在两套判据下
+    反复横跳。所以回放传 lms_live.SHORT_TOLERANCE，**普通附件仍然传 0**：
+    给 PDF / PPTX 放 8% 容差只会掩盖真正的截断。
 
     拿不到声明大小时（size 为 0 / None）退回「存在且非空」的宽松策略。
     返回 (是否完整, 本地大小, 期望大小)。
+
+    ★ os.path.getsize 可能因 stat 失败抛出 OSError，不一定是程序逻辑 bug：
+    网络盘 / NAS / 移动硬盘驱动会偶发 errno 5 / 121 / 433；
+    某块盘处于脱机 / 写保护 / 权限不足状态时 errno 13 / 19；
+    Windows 上文件被占用或正在被另一个进程写入时 errno 13 / 32；
+    以及检查瞬间文件被删除（errno 2）。
+
+    单个文件的 stat 异常不该让整个下载任务崩溃，因此包一层保护。
     """
     if not os.path.exists(path):
         return False, 0, None
-    local = os.path.getsize(path)
-    if has_expected_size(size):
-        exp = int(size)
-        return local == exp, local, exp
-    return local > 1024, local, None
+    try:
+        local = os.path.getsize(path)
+    except OSError:
+        # stat 失败时保守判为「不完整」：宁可重下一次，也不要把一个
+        # 状态不确定的文件当成已完成而永久跳过。
+        return False, 0, int(size) if has_expected_size(size) else None
+
+    if not has_expected_size(size):
+        return local > 1024, local, None
+
+    exp = int(size)
+    if local > exp:
+        return False, local, exp          # 比声明还大，来源可疑，重下
+    try:
+        tol = float(tolerance)
+    except (TypeError, ValueError):
+        tol = 0.0
+    shortfall = (exp - local) / float(exp)
+    return shortfall <= tol, local, exp
+
+
+def complete_tolerance(kind):
+    """某个 kind 允许的短读比例 —— 下载判据与增量判据必须共用这一个值。"""
+    if kind == "回放":
+        return lms_live.SHORT_TOLERANCE
+    return 0.0
 
 
 def is_project_pkg(name):
@@ -704,7 +855,8 @@ def main():
         acts = json.load(open(args.activities, encoding="utf-8")).get("activities")
 
     print("扫描课程 %s ..." % args.course)
-    keys, n1, n2 = collect(op, args.course, acts, want_video=not args.no_video)
+    keys, n1, n2, scan_errors = collect(op, args.course, acts,
+                                        want_video=not args.no_video)
     print("  来源① uploads 字段: %d" % n1)
     print("  来源② 正文内嵌:     %d" % n2)
     n_vid = sum(1 for k in keys if k[0] == "录像")
@@ -715,12 +867,26 @@ def main():
         print("  其中直播回放:       %d 个活动" % n_live)
     print("  去重后共 %d 个附件" % len(keys))
 
+    # 扫描失败必须在这里就亮出来 —— 详情没取到意味着「有没有资源」根本没问清楚，
+    # 沉默下去就会被当成「这门课本来就没有」。
+    if scan_errors:
+        n_skip_scan = sum(1 for e in scan_errors if e["kind"] == ERR_UNAVAILABLE)
+        print("  !! 扫描阶段 %d 个活动的详情没取到（其中 %d 个是不可达）"
+              % (len(scan_errors), n_skip_scan), file=sys.stderr)
+        for e in scan_errors:
+            print("     %-20s 活动 %s: %s"
+                  % (e["stage"], e.get("activity_id"), e["error"]),
+                  file=sys.stderr)
+
     excl = re.compile(args.exclude) if args.exclude else None
 
     # ---- 把回放条目展开成实际文件条目 ----
     # 回放的一个活动有 2 路机位，要展开成 2 个下载项；
     # 其余 kind 的 uid 就是 upload id，直接用。
     items, live_err = expand_items(op, keys, args)
+
+    # 扫描失败伪装成条目，之后自动进 fail / manifest / 退出码
+    items = items + scan_error_items(scan_errors)
 
     # ---- 消解目标路径冲突 ----
     # 必须在列清单和下载之前做，否则第二个同名文件会被静默跳过、悄悄丢文件。
@@ -732,8 +898,15 @@ def main():
     if args.list_only:
         rows = build_rows(op, items, excl, args, quiet=args.quiet)
         write_manifest(args.list_only, rows)
-        print("清单已写入 %s（%d 条）" % (args.list_only, len(rows)))
-        return RC_OK
+        n_fail = count_fail(rows)
+        tag = "（其中 %d 条失败）" % n_fail if n_fail else ""
+        print("清单已写入 %s（%d 条）%s" % (args.list_only, len(rows), tag))
+        # ★ 别固定返回 0：接口抖了却报告成功，比报错更糟。
+        #   --dry-run 同理 —— 三条路径共用一套错误语义与退出码规则。
+        if any(r.get("err_kind") == ERR_AUTH for r in rows):
+            print_auth_hint(sum(1 for r in rows
+                                if r.get("err_kind") == ERR_AUTH), args.course)
+        return RC_PARTIAL if n_fail else RC_OK
 
     ok = fail = skip = 0
     auth_fail = 0
@@ -749,42 +922,40 @@ def main():
             #   登录态失效、超时、5xx、JSON 解析失败都是**获取失败**，
             #   必须计入 fail，否则接口抖动会被伪装成「平台没给这个文件」，
             #   用户看到 fail=0、退出码 0，以为全下完了。
-            if it.get("unavailable"):
-                print("[%2d] N/A   %s (%s)" % (i, it.get("uid"),
-                                               it.get("err_msg") or "不可达，跳过"))
+            #   分类只有一份实现（item_status），三种模式共用。
+            msg = it.get("err_msg") or default_err_msg(it.get("err_kind"))
+            row = error_row(i, it)
+            if row["status"] == STATUS_NA:
+                print("[%2d] N/A   %s (%s)" % (i, it.get("uid"), msg))
                 skip += 1
-                rows.append({"i": i, "kind": kind, "activity": act,
-                             "uid": it.get("uid"), "status": "na",
-                             "error": it.get("err_msg")})
-                continue
-            msg = it.get("err_msg") or "元信息获取失败"
-            print("[%2d] FAIL  %s :: %s" % (i, str(it.get("uid"))[:40], msg))
-            fail += 1
-            rows.append({"i": i, "kind": kind, "activity": act,
-                         "uid": it.get("uid"), "status": "fail",
-                         "error": msg})
-            if it.get("err_kind") == ERR_AUTH:
-                auth_fail += 1
+            else:
+                print("[%2d] FAIL  %s :: %s" % (i, str(it.get("uid"))[:40], msg))
+                fail += 1
+                if it.get("err_kind") == ERR_AUTH:
+                    auth_fail += 1
+            rows.append(row)
             continue
 
         if excl and excl.search(name):
             print("[%2d] EXCLUDE %s" % (i, name))
             skip += 1
             rows.append({"i": i, "kind": kind, "activity": act, "name": name,
-                         "status": "excluded"})
+                         "status": STATUS_EXCLUDED})
             continue
 
         dest = dest_for(kind, act, name, args)
         path = os.path.join(dest, name)
         rel = os.path.relpath(dest, args.out)
 
-        complete, local_size, exp = already_complete(path, size)
+        # 增量判据必须和下载判据用同一个短读容差，否则回放会重复下载
+        complete, local_size, exp = already_complete(
+            path, size, tolerance=complete_tolerance(kind))
         if complete:
             if not args.quiet:
                 print("[%2d] SKIP  %-4s %-30s -> %s" % (i, kind, name[:28], rel))
             skip += 1
             rows.append({"i": i, "kind": kind, "activity": act, "name": name,
-                         "size": local_size, "dir": rel, "status": "exists"})
+                         "size": local_size, "dir": rel, "status": STATUS_EXISTS})
             continue
         if local_size > 0:
             # 有文件但大小对不上 —— 多半是上次中断留下的，重下（.part 会走续传）
@@ -799,7 +970,7 @@ def main():
                 print("[%2d] PLAN  %-9s %-28s %-40s %10s"
                       % (i, kind, act[:26], name[:38], human_size(size)))
             rows.append({"i": i, "kind": kind, "activity": act, "name": name,
-                         "size": size, "dir": rel, "status": "plan"})
+                         "size": size, "dir": rel, "status": STATUS_PLAN})
             continue
 
         if not args.quiet:
@@ -826,7 +997,7 @@ def main():
                       % (res["note"], lms_live.SHORT_TOLERANCE * 100))
             ok += 1
             rows.append({"i": i, "kind": kind, "activity": act, "name": name,
-                         "size": res["size"], "dir": rel, "status": "ok",
+                         "size": res["size"], "dir": rel, "status": STATUS_OK,
                          "sha256": res["sha256"],
                          "server_sha256": res.get("exp_sha"),
                          "retried": res.get("retried", 0),
@@ -836,7 +1007,8 @@ def main():
             print("[%2d] FAIL  %s :: %s" % (i, name[:40], res["err"]))
             fail += 1
             rows.append({"i": i, "kind": kind, "activity": act, "name": name,
-                         "dir": rel, "status": "fail", "error": res["err"]})
+                         "dir": rel, "status": STATUS_FAIL,
+                         "error": res["err"]})
 
     if args.manifest:
         write_manifest(args.manifest, rows)
@@ -845,10 +1017,14 @@ def main():
     tag = " (dry-run)" if args.dry_run else ""
     print("=== done%s ok=%d fail=%d skip=%d ===" % (tag, ok, fail, skip))
     if auth_fail:
-        print("!! 有 %d 项因登录态问题失败，先重新登录再跑: "
-              "python lms_login.py --course %s" % (auth_fail, args.course),
-              file=sys.stderr)
+        print_auth_hint(auth_fail, args.course)
     return RC_PARTIAL if fail else RC_OK
+
+
+def print_auth_hint(n, course):
+    """登录态失效的修复提示 —— 普通下载与 --list-only 共用同一句话。"""
+    print("!! 有 %d 项因登录态问题失败，先重新登录再跑: "
+          "python lms_login.py --course %s" % (n, course), file=sys.stderr)
 
 
 def expand_items(op, keys, args):
@@ -915,11 +1091,21 @@ def expand_items(op, keys, args):
         for r in reps:
             p = lms_live.probe(op, r["url"])
             name = lms_live.safe_name(act, r["camera_type"], stamp=stamp)
+            if p.get("ok"):
+                err_kind = err_msg = None
+            else:
+                # 探测失败也要带上 err_kind —— 否则三处清单生成的地方
+                # 只能统一按 fail 处理，日志里看不出是超时还是没权限。
+                err_kind = (classify_http(p["code"])["kind"]
+                            if p.get("code") else ERR_TRANSIENT)
+                err_msg = "回放探测失败: %s" % (p.get("err") or "未知错误")
             items.append({
                 "kind": kind, "activity": act, "uid": act_id,
                 "name": name, "size": p.get("size") or 0,
                 "url": r["url"], "camera": r["camera_type"],
-                "error": None if p.get("ok") else True,
+                "error": not p.get("ok"),
+                "err_kind": err_kind, "err_msg": err_msg,
+                "unavailable": err_kind == ERR_UNAVAILABLE,
             })
     return items, None
 
@@ -975,7 +1161,17 @@ def resolve_collisions(items, args):
 
 
 def build_rows(op, items, excl, args, quiet=False):
-    """--list-only 用：把条目整理成行"""
+    """三种模式共用：把条目整理成清单行。
+
+    ★ 错误语义必须和下载主流程一模一样（都走 item_status）——
+    以前这里是 `if it.get("error"): status = "na"`，于是 401 / 500 / 超时 /
+    坏 JSON 全被拍成 N/A，`--list-only` 还固定 return 0，
+    接口明显失败时看起来却像一切正常。
+
+    ★ 已有文件的判断也必须用 already_complete（带对应容错），
+    只判 os.path.exists 会让「本地截断文件」在清单里显示成 exists，
+    而主流程里它是要重下的 —— 两种视图对不上。
+    """
     rows = []
     for i, it in enumerate(items, 1):
         kind = it["kind"]
@@ -983,26 +1179,32 @@ def build_rows(op, items, excl, args, quiet=False):
         name = it["name"]
         size = it.get("size") or 0
         if it.get("error"):
-            rows.append({"i": i, "kind": kind, "activity": act, "uid": it.get("uid"),
-                         "status": "na"})
+            row = error_row(i, it)
+            rows.append(row)
             if not quiet:
-                print("[%2d] N/A   %s" % (i, it.get("uid")))
+                print("[%2d] %-7s %-4s %s :: %s"
+                      % (i, row["status"].upper(), kind,
+                         str(it.get("uid"))[:24], row["error"][:44]))
             continue
         dest = dest_for(kind, act, name, args)
+        done, local, _exp = already_complete(
+            os.path.join(dest, name), size,
+            tolerance=complete_tolerance(kind))
         row = {"i": i, "kind": kind, "activity": act, "uid": it.get("uid"),
                "name": name, "size": size,
                "dir": os.path.relpath(dest, args.out),
                "ext": split_ext(name)[1].lstrip(".")}
         if excl and excl.search(name):
-            row["status"] = "excluded"
-        elif os.path.exists(os.path.join(dest, name)):
-            row["status"] = "exists"
+            row["status"] = STATUS_EXCLUDED
+        elif done:
+            row["status"] = STATUS_EXISTS
+            row["size"] = local
         else:
-            row["status"] = "plan"
+            row["status"] = STATUS_PLAN
         rows.append(row)
         if not quiet:
             print("[%2d] %-7s %-4s %-30s %10s"
-                  % (i, row["status"], kind, name[:28], human_size(size)))
+                  % (i, row["status"], kind, name[:28], human_size(row["size"])))
     return rows
 
 
@@ -1032,8 +1234,11 @@ def write_manifest(path, rows):
     ext = os.path.splitext(path)[1].lower()
     if ext == ".csv":
         import csv
+        # err_kind / stage 必须进 CSV：只留一个 N/A 会把「平台没给」
+        # 和「这次接口抖了」混成同一件事，事后排查无从下手。
         cols = ["i", "status", "kind", "activity", "name", "size", "dir",
-                "ext", "sha256", "server_sha256", "uid", "error"]
+                "ext", "sha256", "server_sha256", "uid", "stage",
+                "err_kind", "error"]
         with open(path, "w", newline="", encoding="utf-8-sig") as f:
             w = csv.DictWriter(f, fieldnames=cols, extrasaction="ignore")
             w.writeheader()
