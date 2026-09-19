@@ -25,6 +25,50 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from lms_common import BASE, HOST, find_browser, profile_path, require_playwright, state_path
 
 
+def save_state(ctx, state, course):
+    """只保存下载真正需要的登录态，并收紧文件权限。
+
+    ★ 为什么不直接用 ctx.storage_state()：它会把整个浏览器存储快照都写下来
+    （localStorage / sessionStorage / 所有域名的 cookie），
+    而下载器只需要 LMS 自己域名的 cookie。落盘的东西越少越安全。
+
+    写出的是项目自定义结构（与 Playwright 的原生 storage_state 不同，
+    lms_fetch.load_state 两种都能读）：
+
+        {"version": 1, "base": ..., "host": ..., "course": ...,
+         "created_at": ..., "cookies": [...]}
+
+    POSIX 下把文件权限收成 0600（只有本人可读）。Windows 不做模拟 ——
+    它靠 ACL 而不是 mode 位，chmod 上去没有实际意义。
+    """
+    cookies = ctx.cookies([BASE])
+    # 只留当前 host 的 cookie（ctx.cookies(urls) 已按 URL 过滤，这里再兜一层）
+    keep = []
+    for c in cookies or []:
+        dom = str(c.get("domain") or "").lstrip(".").lower()
+        if not dom or HOST.lower() == dom or HOST.lower().endswith("." + dom):
+            keep.append(c)
+
+    payload = {
+        "version": 1,
+        "base": BASE,
+        "host": HOST,
+        "course": str(course),
+        "created_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "cookies": keep,
+    }
+    tmp = state + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, state)
+    if os.name == "posix":
+        try:
+            os.chmod(state, 0o600)
+        except OSError:
+            pass
+    return keep
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--course", required=True, help="课程 ID（从课程链接里的 /course/<ID>/ 取）")
@@ -79,9 +123,9 @@ def main():
             return 1
         print("登录成功:", page.url[:100])
 
-        ctx.storage_state(path=state)
-        n = len(json.load(open(state, encoding="utf-8")).get("cookies", []))
-        print("登录态已保存: %s (%d cookies)" % (state, n))
+        cookies = save_state(ctx, state, args.course)
+        print("登录态已保存: %s (%d cookies)" % (state, len(cookies)))
+        print("  注意: 该文件等同于你的登录凭据, 不要分享或提交到 Git")
 
         # 顺手把活动清单拉下来, 省得 fetch 阶段再问一次
         try:
