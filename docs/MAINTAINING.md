@@ -73,6 +73,7 @@ Pages 需要**独立的 `Pages: write` 权限**，只有 `Contents: write` 不�
 如果默认显示 Actions，下面会给 Jekyll / Static HTML 两个模板卡片。
 **别点那两个模板的「设置」**——它们会往 `.github/workflows/` 推 workflow 文件，
 而这需要 `Workflows: write` 权限，用 Contents 权限的 token 会 403 失败。
+（仓库里已有自己的 workflow，别让 Pages 模板再写一份进去。）
 
 必须先手动把「来源」改成「从分支部署」，之后才会出现「分支 + 文件夹」两个下拉框。
 
@@ -222,8 +223,9 @@ Pages 的并发策略是**保留最新、取消旧的**，于是"第一个文件
 只要这两条成立，中间有多少红叉都可以忽略。
 
 > 补充：这些 workflow 是 **GitHub 为 Pages 自动生成的**
-> （名字叫 `pages build and deployment`），**不在你的仓库里**——
-> `.github/workflows/` 目录是空的/不存在。所以它们不需要你维护，也无法在仓库里"修"。
+> （名字叫 `pages build and deployment`），**不是你的仓库文件**——
+> 它们不受 `.github/workflows/` 里的配置控制，也无法在仓库里"修"。
+> 仓库自己的 `ci.yml` / `release.yml` 与 Pages 的这两条互不相干。
 
 ### 页面布局的注意事项
 
@@ -333,7 +335,12 @@ token 就必须先经过 AI 的上下文；而且明文文件对同机器任何�
 | 仓库访问 | 勾选 `xjtu-siyuanxuetang-grab` |
 | 存储库权限 → 内容 | 读取和写入 |
 
-**不需要** `Workflows`（CI 配置是以 `.txt` 形式推的）。
+**`.github/workflows/` 下的文件例外**（2026-09-19 起 workflow 已直接放进仓库）：
+推它们需要 **`Workflows: write`** 权限，只有 `Contents: write` 时 Contents API
+会 403。`gh_push_dir.py` 遇到这种情况会**跳过这些文件并明确列出剩余清单**（退出码 0），
+此时在网页端 *Add file → Upload files* 手动上传
+`.github/workflows/ci.yml`、`.github/workflows/release.yml`、`.github/scripts/pack.py`
+即可；或者换带 workflows 权限的 token。日常改代码不需要每次都推 workflows 文件。
 
 > **`Administration` 不需要，但也「改不了」。** 实测（2026-09-19）：
 > 用只有 `Contents: write` 的细粒度 token 调仓库元数据端点，
@@ -356,7 +363,8 @@ token 就必须先经过 AI 的上下文；而且明文文件对同机器任何�
 | `docs/MAINTAINING.md` | 本文件，站点的维护说明 |
 | `push_docs.py` | 推 `docs/` 到 GitHub（在维护者工作区里） |
 | `release.py` | 发版本：版本号自检 → 打包 → 校验 → tag → Release → 附件 |
-| `ci.yml.txt` / `release.yml.txt` | CI 配置，用 `enable-ci.bat` 还原启用 |
+| `.github/workflows/ci.yml` / `release.yml` | CI 与自动发版 workflow，随仓库分发（`release.py` 的 `INCLUDE` 含整个 `.github/`） |
+| `.github/scripts/pack.py` | CI 发版用的打包脚本，`INCLUDE` 必须与 `release.py` 保持同步 |
 | `scripts/lms_selfcheck.py` | 安装后自检；改动它要同步 `tests/test_selfcheck.py` 的 `CORE_SCRIPTS` 断言 |
 
 ### 页面内容与两栏配平的联动
