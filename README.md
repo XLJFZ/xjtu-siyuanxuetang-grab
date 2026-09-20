@@ -160,7 +160,7 @@ python scripts/lms_fetch.py    --course <课程ID> --out "./课程资料"       
 | `--manifest <文件>` | 下载后把清单 + sha256 写入 `.json` 或 `.csv` |
 | `--retries N` | 单文件重试次数，默认 3（指数退避） |
 | `--no-verify` | 跳过下载前的登录态探测 |
-| `--exclude "2020\|2021\|2022"` | 文件名正则，命中跳过（清理旧版作业） |
+| `--exclude "2020\|2021\|2022"` | 文件名正则，命中即在**任何网络请求之前**排除（不发探测、不解析回放地址）。状态记 `excluded`：计入 `skip`，永不计 `FAIL`、不影响退出码（清理旧版作业） |
 | `--no-video` | 跳过录像与回放，只要讲义时用 |
 | `--all-cameras` | 回放连「教师机位」一起下 |
 | `--split-projects` | 项目/大作业压缩包（`Project1.zip`、`大作业.zip` 这类）单独进 `项目/`；普通 zip 如 `资料.zip` 不受影响 |
@@ -222,6 +222,12 @@ PDF 不会被悄悄丢掉——会进 `FAIL`、进清单、让退出码变成 4�
 确认通过的 size 会记进 `.download-index.json`，增量判据与它精确比对 ——
 所以不会出现「上一轮判成功、下一轮判要重下」。
 
+**回放地址是下载前现取的。** 回放地址的查询串里带一次性时效凭据，所以脚本**不把
+它写进任何落盘文件**（条目、索引、清单里都没有 URL）：真正要下载之前才解析一次；
+中途遇到 401 / 403 会重新解析后从 `.part` 继续，重解析次数有上限，不会拿一个
+失效地址死转。刷新前后用长度与 `etag` 复核是不是同一个对象，**不一致就停下并保留
+`.part`** —— 绝不把两份不同内容的字节拼成一个文件。
+
 **续传失败不白丢数据。** 回放服务端下一次给的起点跳到残片末尾之后（出现缺口）时，
 脚本判定这次续传无效：还有重试机会就丢掉残片从零重下；**已经是最后一次则保留
 已经下对的那段 `.part`**，下次运行接着用，不会把几百 MB 的进度白白扔掉。
@@ -236,8 +242,9 @@ Windows 保留设备名（`CON.pdf` / `NUL.txt`）统一加下划线前缀，三
 **三种模式同一套结论。** `--list-only`、`--dry-run`、正式下载共用同一份错误分类：
 403/404 → `N/A`，401 / 超时 / 5xx / 坏 JSON / 扫描失败 → `FAIL`。
 所以 `--list-only` 在接口明显出问题时也会返回退出码 4，而不是永远 0。
-清单 JSON / CSV 里带 `status`、`err_kind`、`error`（扫描失败还带 `stage`），
-事后能一眼分清是「平台没给」还是「这次没取到」。
+清单 JSON / CSV 里带 `status`、`err_kind`、`error`（扫描失败还带 `stage`）。
+`status` 取值有 `ok` / `fail` / `skip`（本地已有）/ `excluded`（被 `--exclude` 命中），
+事后能一眼分清是「平台没给」「这次没取到」还是「你自己排除的」。
 
 ---
 
@@ -306,7 +313,7 @@ Windows 保留设备名（`CON.pdf` / `NUL.txt`）统一加下划线前缀，三
 | `scripts/lms_fetch.py` | 下载主体：列清单 / 下载 / 归类，支持续传、重试、干跑与增量 |
 | `scripts/lms_organize.py` | 章节解析：中文数字转换、多写法匹配、假章号排除 |
 | `scripts/lms_live.py` | 直播回放下载：串行请求、按响应长度校正偏移 |
-| `tests/` | 离线测试，共 330 个用例（无需网络与登录态） |
+| `tests/` | 离线测试，共 370 个用例（无需网络与登录态） |
 | `tools/gh_push_dir.py` | 原子推送：一次源码同步 = 一个 commit（Git Data API） |
 | `tools/release_common.py` | 发布白名单的唯一定义（打包 / 推送 / CI 共用） |
 | `.github/workflows/` | CI 与**手动备用**发版 workflow（发布默认走 `release.py`） |
@@ -317,7 +324,7 @@ Windows 保留设备名（`CON.pdf` / `NUL.txt`）统一加下划线前缀，三
 
 ```bash
 python tests/test_organize.py     # 22 个用例
-python tests/test_fetch.py        # 227 个用例
+python tests/test_fetch.py        # 243 个用例
 python tests/test_selfcheck.py    # 20 个用例
 python tests/test_push.py         # 61 个用例（发布链路，全部用 mock / 子进程）
 ```
@@ -339,6 +346,7 @@ CI 在 main/master push 与 PR 时自动跑三平台 × 三个 Python 版本（�
 
 | 版本 | 变更 |
 |---|---|
+| v1.5.0 | **回放地址 JIT + `--exclude` 优先级。** `--exclude` 改为在任何远端探测 / 地址解析 / 稳定窗口**之前**生效：命中即标 `excluded` 并直接跳过，**一个媒体请求都不发**，因此被排除条目的网络状态（502 / 403 / 超时）再也无法把它升级成 `FAIL` 或影响退出码 —— 排除项始终计入 `skip`，清单里带独立的 `excluded` 状态；匹配语义（对最终文件名做正则）未变。回放地址改为**下载前现取（just-in-time）**：地址带一次性时效凭据，条目 / 索引 / 清单 / 日志从此都不含 URL 与凭据；下载前与每次 401 / 403 时各解析一次（次数有上限），重解析后从 `.part` 现有长度续传；刷新前后复核长度与 `etag`，`size` 不符或两侧 `etag` 都存在且不同 → **fail-closed**（保留 `.part`、绝不拼接、不落最终文件、不更新索引）。新增 `redact_url()` / `redact_text()`：异常文本里可能被 urllib 带出的完整 URL 会先削掉查询串再进日志与清单。**登录态探测修正**：未登录时服务端回的是 `HTTP 200 + 登录页 HTML`（不是 401），旧逻辑把「登录态过期」误报成「接口可达」，现在按响应体内容判定并明确提示重新登录。**索引 `size` 不再丢**：`load_download_index` 曾把条目规范化成只剩 `path` / `name`，导致「经稳定窗口确认的 size」在每轮加载时被抹掉、可信 size 路径成为死代码，增量判定每轮退回远端探测；现在索引写入只有 `merge_index_entry()` 一个入口，同路径重新登记必须保住 `size`。另把 v1.4.2 发布后才暴露的推送器默认值崩溃（未传 `--include` 时 `AttributeError`）纳入本次发版状态。离线测试扩到 370 个 |
 | v1.4.2 | 发布链路专项：推送改为 **Git Data API 原子提交**（N 个文件变化 = 1 个 commit、1 次 ref 更新，不再逐文件 `PUT /contents`，CI 只触发一次）；`tools/gh_push_dir.py` 纳入仓库，`release.py --push-code` 不再依赖仓库外的脚本，推送器不再「跳过无权限文件却仍然返回 0」，改为整体成功或整体失败；**绝不强制（force）更新 main**（`force: false` 的非强制 fast-forward 保护，并发冲突停下重跑）；支持变更/新增/**删除**（只删白名单范围内的文件）；内容未变则不建空 commit、不重复上传 blob；`--push-code` 返回本次 commit SHA，**tag 直接绑定到它**，不再「推送完再读一次 main」；**消除双 publisher**：`release.yml` 不再监听 `v*` tag push，只保留手动备用入口（含版本占用检查），`release.py` 是唯一默认发布方；**artifact identity 校验实际 zip**（zip 内容 vs 源码 commit 的 tree 逐文件比对，工作区漂移不影响结论），并用 sha256 锁定校验过的包、上传前复核；`--resume` 只补缺，不能拿新代码补旧版本；token 不再出现在 curl 命令行（改走临时配置文件）；附件上传的重试真正生效（5xx/网络错误重试，4xx 立即失败）；打包白名单抽到 `tools/release_common.py` 由三处共用，并把 `docs/` 纳入发布包（README 的相对链接在 zip 里可用）；新增 CLI smoke 测试；**workflow 按 SHA 分工**（CI 只验证开发中的 HEAD——PR 事件精确 checkout PR HEAD 而非合成 merge commit、push 只监听 main/master 避免 PR 分支 push+PR 双跑、按 PR/分支取消过期 run；`release.yml` 只发布已冻结的 tag——`git rev-list -n 1` 解析最终 commit SHA、逐 job 复核、不读 main、tag 缺失即失败）；**resource identity 封板**（`.download-index.json` 持久身份索引：`identity_key → canonical_path` 成为严格函数——其他资源增删、meta 瞬时失败、排序变化、同 uid 内容更新、进程重启都不改变已分配路径；等大小资源不再可能互相冒领字节；新身份按 dest_for + 最小 uid 分配，`identity_conflict_target()` 守卫保留为无索引存量文件的迁移保护层；索引只含资源 ID / 文件名 / 相对路径，不含任何凭据；**fail-closed**：索引解析失败 → 坏文件改名 `.corrupt-<时间戳>` 保留现场 + 语义化退出码 5 拒绝下载，绝不静默失忆；加载时逐条验证路径（相对 / 无 `..` 逃逸 / 非绝对 / normalize 后必须在 out 内），**单条 path 越界同样整份 fail-closed**（改名保留现场 + 拒绝下载，绝不「丢单条继续」静默遗忘身份）；索引不是任意路径写入入口；顶层信封 `{version, identity_schema, items}` 双版本号分立（结构版本 / 身份键语义版本），未知 version 或 identity_schema 一律拒绝；身份键 = `course:<course_id>:upload:<uid>` / `course:<course_id>:live:<act_id>:camera:<camera_id>`（camera_id 缺失降级 type:，同活动多路无 camera_id 同类型 → 显式 identity ambiguous 不硬合并））；**内容损坏与格式不认识分立**：JSON 解析失败 / 顶层结构坏 → `.corrupt-<时间戳>` 隔离保留现场，version 或 identity_schema 不认识 → 原文件字节不动、不改名、不迁移、不修复，直接拒绝（退出码 5）；加载器的迁移严格限定为结构性的（`entries` 旧信封 / 裸 map → `items`，且仅当键已带 course namespace），绝不承担任何改变身份含义的迁移（无 course 的旧键拒绝而非猜测归属）；**回放完成判据重写：稳定窗口取代比例容差。** 旧实现拿「响应头声明总长」当完成真值、用 8% 短读容差兜底 —— 而回放转码期间声明值会随时间增长，于是转码中途的快照可能被当成最终文件永久落盘（下次运行还会因「文件已存在」跳过）。现在唯一的完成判据是「**本次实得字节数 == 经稳定窗口确认的远端最终 size**」：下载到 EOF 后周期性探测远端对象的 `(size, ETag/Last-Modified)`，连续 60 秒不变且恰等于本地实得字节数才 rename 成最终 mp4；远端更大 → 续传追平后重新确认（轮数有上限）；远端更小 / 探测 404 / 超时 → 判失败并保留 `.part`，**绝不 rename、绝不更新索引**。探测走 `Range: bytes=0-0` 取 `Content-Range` 总长（与实际下载同一条路径，比 HEAD 更接近真实，也不读 body 以免触发限流）；稳定计时用 `time.monotonic` 的时间戳差，不是「连续 N 次相同」（改探测间隔不会偷偷改判据），测试注入虚拟时钟。`declared` 降级为传输提示，只进 `note` 与清单。**删除 `SHORT_TOLERANCE` 与 `already_complete(tolerance=...)`**：增量判据与下载判据统一为「可信 size 精确相等」——回放读 `.download-index.json` 经稳定窗口确认的 `size`，无索引存量文件用本轮远端探测值精确比对，不再有任何「尺寸差不多就相信」的旁路；`.part` 不再因为「不小于声明总长」被删掉（声明值会变），本地比远端长由 416 与 `remote_smaller` 分支显式判失败而不是截断本地。修正推送器在未传 `--include` 时的崩溃（`release.py` 从不传该参数，真实发布首次执行才暴露），并加回归用例钉住该默认值；离线测试扩到 330 个 |
 | v1.4.1 | 收尾几处 silent failure 与一致性问题：扫描阶段失败不再静默跳过（`collect()` 返回 `scan_errors`，页面正文/回放详情的超时·5xx·坏 JSON 计入 FAIL 并影响退出码，403/404 仍按不可达处理）；`item_status()` 统一三种模式的错误语义，`--list-only` 不再固定返回 0；已有文件判断复用下载侧的短读容差（回放 8%，普通附件仍严格），回放不再重复下载；回放续传缺口在最后一次重试时保留有效 `.part`；`.7z` 等数字开头扩展名被正确识别，冲突改名不再破坏扩展名与项目包判定；清单 CSV/JSON 增加 `stage`、`err_kind`；`already_complete()` 对 `os.path.getsize` 的 OSError 做保守兜底（文件被占用 / 权限不足 / 盘离线时不会整个任务崩溃）；离线测试扩到 212 个 |
 | v1.4.0 | 下载可靠性专项：修回放续传 Range 对齐错位；Range 缺口不再 append 成坏文件；回放严重短读改判失败（保留 `.part`）；元信息错误三分类（403/404→N/A、401→登录态、超时/5xx/坏 JSON→FAIL）；已有文件按声明大小比对；登录态收紧为最小 cookie 集（自定义结构，POSIX 0600，新旧格式兼容）；Cookie 重建保留 domain/path/secure/expires 并按 host 过滤；回放时间戳固定 UTC+8；同名附件加确定性后缀；`--split-projects` 不再把所有 zip 当项目包；`safe()` 处理 Windows 保留设备名；CSV 清单防公式注入；CI 落到 `.github/workflows/`；离线测试扩到 163 个 |

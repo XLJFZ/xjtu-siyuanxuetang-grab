@@ -37,6 +37,7 @@ import os
 import re
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 # 一节课的录像能到 500MB 上下，留点余量
@@ -61,6 +62,15 @@ TAIL_MAX_ROUNDS = 5
 # 单次探测的超时。
 PROBE_TIMEOUT = 45
 
+# ---- replay URL JIT（Round 13）----
+# 回放 URL 的 query 里带一次性**时效凭据**（会随时间失效）：不落盘、不进日志，
+# 只在真正要用之前解析一次。下载中途 401/403（凭据过期）时重新解析，
+# 但刷新次数必须封顶 —— 否则一个永远 403 的 URL 会让循环打转。
+MAX_URL_REFRESHES = 2
+
+# 活动详情端点的默认平台地址。lms_fetch 会把它 `--base` 的值传进来覆盖。
+LMS_BASE = "https://lms.xjtu.edu.cn"
+
 
 def monotonic():
     """时钟钩子 —— 测试注入虚拟时钟，默认 time.monotonic。
@@ -69,6 +79,46 @@ def monotonic():
     后者会让稳定语义跟着探测间隔一起变，调一下间隔就偷偷改了判据。
     """
     return time.monotonic()
+
+
+class LiveResolveError(Exception):
+    """回放 URL 解析失败。
+
+    ★ 异常消息里**绝不能带 URL** —— URL 的 query 里有时效凭据，会被日志与回溯
+    带出去。只报活动 id / 机位与原因。
+    """
+
+
+def redact_url(u):
+    """把 URL 削成 `scheme://host/path` —— 去掉 query（那里放了时效凭据）。
+
+    凡是往日志 / 异常 / note / 清单里写 URL 的地方，都必须先过它。
+    """
+    if not u:
+        return u
+    try:
+        p = urllib.parse.urlsplit(str(u))
+    except ValueError:
+        return "<url>"
+    if not p.scheme and not p.netloc:
+        return "<url>"
+    return "%s://%s%s" % (p.scheme, p.netloc, p.path)
+
+
+_URL_IN_TEXT = re.compile(r"https?://[^\s'\"<>()\[\]]+")
+
+
+def redact_text(s):
+    """把自由文本里出现的 URL 一律削掉 query。
+
+    ★ 为什么必须有：`except Exception` 捕获到的异常，其消息可能**自带完整
+    URL**（urllib 的 InvalidURL / ValueError / URLError 都会）。回放 URL 的
+    query 里就是一次性时效凭据 —— 直接把它拼进 err / 日志就等于把凭据
+    写进了清单与终端输出。所有从异常取来的文本都要先过这里。
+    """
+    if not s:
+        return s
+    return _URL_IN_TEXT.sub(lambda m: redact_url(m.group(0)), str(s))
 
 
 def nap(seconds):
@@ -98,6 +148,83 @@ def parse_replay(activity_data):
     # encoder 优先，其余保持原序
     out.sort(key=lambda x: 0 if x["camera_type"] == "encoder" else 1)
     return out
+
+
+def _detail_request(op, url):
+    """构造活动详情请求。带上 Accept: application/json —— 不声明时服务端
+    会用 HTTP 200 + 登录页 HTML 蒙混过去（见 lms_fetch 的登录态判定）。"""
+    req = urllib.request.Request(url)
+    for k, v in getattr(op, "addheaders", []) or []:
+        req.add_header(k, v)
+    req.add_header("Accept", "application/json")
+    return req
+
+
+def resolve_replay_url(op, act_id, camera_id=None, camera_type=None,
+                       detail=None, base=None, sub_course_id=0, timeout=60):
+    """★ 现取（just-in-time）某一路回放的下载 URL。
+
+    为什么不把 URL 缓存在条目 / 索引里：URL 的 query 是一次性**时效凭据**。
+    缓存它等于把过期风险与凭据一起写进持久状态 —— 下载中途凭据一过期就 403，
+    而落盘的凭据还会随索引 / 日志外泄。这里的做法是「谁要发请求
+    谁现解析」，调用方用完即弃。
+
+    选择规则（确定性，避免两路机位互相冒领身份）：
+      1. 给了 camera_id  → 必须精确命中该 camera_id，否则报错
+      2. 否则 camera_type → 必须**唯一**命中该类型；同类型多路无 id 时无法区分
+      3. 都不给           → 取 encoder 优先的第一路（与 parse_replay 排序一致）
+
+    detail 已给（例如 collect() 缓存过的活动详情）就不再发请求。
+
+    `LiveResolveError` 的消息**只含活动 id / 机位描述，不含 URL 与 token** ——
+    URL 会被日志与回溯带出去。
+    """
+    if detail is None:
+        b = (base or LMS_BASE).rstrip("/")
+        url = "%s/api/activities/%s?sub_course_id=%d" % (b, act_id, sub_course_id)
+        try:
+            r = op.open(_detail_request(op, url), timeout=timeout)
+            raw = r.read()
+        except urllib.error.HTTPError as e:
+            raise LiveResolveError(
+                "活动 %s 详情请求失败（HTTP %d）" % (act_id, e.code))
+        except Exception as e:
+            raise LiveResolveError(
+                "活动 %s 详情请求异常：%s" % (act_id, type(e).__name__))
+        finally:
+            try:
+                r.close()
+            except Exception:
+                pass
+        try:
+            detail = json.loads(raw.decode("utf-8"))
+        except Exception:
+            # 未登录时服务端回 200 + 登录页 HTML。别把它说成「回放不存在」——
+            # 那会把人引去查课程权限，而真正该做的是重新登录。
+            raise LiveResolveError(
+                "活动 %s 详情不是 JSON（登录态可能失效）" % act_id)
+
+    reps = parse_replay(detail)
+    if not reps:
+        raise LiveResolveError("活动 %s 没有可下载的回放" % act_id)
+
+    if camera_id is not None:
+        hits = [x for x in reps if str(x.get("camera_id")) == str(camera_id)]
+        if not hits:
+            raise LiveResolveError(
+                "活动 %s 找不到 camera_id=%s 的回放（共 %d 路）"
+                % (act_id, camera_id, len(reps)))
+        return hits[0]["url"]
+
+    if camera_type is not None:
+        hits = [x for x in reps if x.get("camera_type") == camera_type]
+        if len(hits) != 1:
+            raise LiveResolveError(
+                "活动 %s 的 %s 机位有 %d 路，无法确定身份"
+                % (act_id, camera_type, len(hits)))
+        return hits[0]["url"]
+
+    return reps[0]["url"]
 
 
 def start_stamp(activity):
@@ -173,7 +300,7 @@ def probe_remote(op, url, timeout=PROBE_TIMEOUT):
         out["err"] = "HTTP %d" % e.code
         return out
     except Exception as e:
-        out["err"] = "%s %s" % (type(e).__name__, str(e)[:60])
+        out["err"] = redact_text("%s %s" % (type(e).__name__, str(e)[:60]))
         return out
     try:
         hdr = r.headers
@@ -328,7 +455,9 @@ def _open_range(op, url, offset, timeout=120):
 
 
 def download(op, url, path, expect=None, retries=3, quiet=False,
-             on_progress=None, clock=None, sleep=None):
+             on_progress=None, clock=None, sleep=None,
+             url_provider=None, base_identity=None,
+             max_refreshes=MAX_URL_REFRESHES):
     """下载一段回放：支持断点续传，落盘前必须通过稳定窗口校验。
 
     与 lms_fetch.download 的关键差异：
@@ -342,14 +471,27 @@ def download(op, url, path, expect=None, retries=3, quiet=False,
     clock / sleep : 注入钩子，便于离线测试用虚拟时钟
              （默认 time.monotonic / time.sleep）。
 
+    ---- replay URL JIT（Round 13）----
+    url_provider : 返回「当前有效 URL」的可调用对象。给了它就**不依赖传进来的
+                   url**：进循环前先现取一次（真正要下载时才解析），401/403
+                   再取一次。这样 URL 里的一次性时效凭据从不落盘，也不会被
+                   缓存在条目上。
+    base_identity: 该资源「长什么样」的基准 (size, etag…)，来自计划阶段的探测。
+                   **刷新后**用它判定新 URL 是不是同一个对象：size 不符、
+                   或两侧 ETag 都存在且不同 → fail-closed，绝不把两份字节拼起来。
+                   为 None 时退化为「刷新后探一次、把结果当基准」。
+    max_refreshes: 单次下载允许的刷新次数上限，防止一个永远 403 的 URL 打转。
+
     返回 {ok, size, sha256, verified_size, identity, probes, retried, resumed,
-          declared, shortfall, note}
+          declared, shortfall, note, refreshes}
     verified_size : 经稳定窗口确认的远端最终 size（成功时必等于 size）
     identity      : (size, ETag/Last-Modified)，拿不到校验器时为 (size, None)
     declared      : 响应头里声明的总长（传输提示，拿不到为 None）
     shortfall     : 实得比 declared 少多少比例（诊断用，拿不到为 None）
     note          : 人可读的补充说明，正常时为 None
-    失败返回       {ok: False, err, kept_part, reason, size, declared, shortfall}
+    refreshes     : 本次实际重新解析了几次 URL
+    失败返回       {ok: False, err, kept_part, reason, size, declared,
+                    shortfall, refreshes}
     """
     tmp = path + ".part"
     last_err = None
@@ -357,6 +499,7 @@ def download(op, url, path, expect=None, retries=3, quiet=False,
     declared_hint = None
     attempt = 0
     tail_rounds = 0
+    refreshes = 0
     _nap = sleep or nap
 
     def _spent():
@@ -364,6 +507,32 @@ def download(op, url, path, expect=None, retries=3, quiet=False,
         nonlocal attempt
         attempt += 1
         return attempt >= retries
+
+    # ★ JIT：真正要开始下载了才解析 URL。刷新同样走它 —— 每次都是「现在」的
+    #   有效 URL，调用方不必（也不该）缓存。
+    if url_provider is not None:
+        try:
+            url = url_provider()
+        except Exception as e:
+            return {"ok": False, "reason": "url_resolve_failed",
+                    "err": redact_text("回放 URL 解析失败: %s" % str(e)[:80]),
+                    "kept_part": os.path.exists(tmp), "refreshes": refreshes}
+
+    def _identity_conflict(new_ident):
+        """刷新后的新 URL 与基准是否**实质冲突**。拿不到信息时不算冲突
+        （真的 403 会再走一轮刷新/失败，由上限收口）。"""
+        if not new_ident.get("ok") or new_ident.get("size") is None:
+            return None
+        base = base_identity
+        if not base:
+            return False
+        b_size, b_tag = base[0], (base[1] if len(base) > 1 else None)
+        if b_size is not None and new_ident["size"] != b_size:
+            return ("刷新后长度从 %s 变成 %s" % (b_size, new_ident["size"]))
+        n_tag = new_ident.get("etag")
+        if b_tag and n_tag and b_tag != n_tag:
+            return "刷新后 ETag 变了（对象内容换过）"
+        return False
 
     while True:
         offset = 0
@@ -424,7 +593,7 @@ def download(op, url, path, expect=None, retries=3, quiet=False,
                 #   一段有效前缀。此时删掉等于白白丢掉已经下对的部分，
                 #   用户下次只能从头再来 —— 保留它，并把失败如实报上去。
                 return {"ok": False, "err": last_err, "kept_part": True,
-                        "reason": "gap"}
+                        "reason": "gap", "refreshes": refreshes}
 
             total = None
             cr = r.headers.get("Content-Range")
@@ -441,7 +610,8 @@ def download(op, url, path, expect=None, retries=3, quiet=False,
 
             ct = r.headers.get("Content-Type", "") or ""
             if "text/html" in ct:
-                return {"ok": False, "err": "返回 HTML，非视频（登录态可能失效）"}
+                return {"ok": False, "err": "返回 HTML，非视频（登录态可能失效）",
+                        "refreshes": refreshes}
 
             # 丢弃重叠段：这些字节已经在 .part 里了，不能重复写
             while skip > 0:
@@ -507,7 +677,7 @@ def download(op, url, path, expect=None, retries=3, quiet=False,
                     _nap(3 * attempt)
                     continue
                 return {"ok": False, "err": last_err, "kept_part": True,
-                        "reason": "stalled"}
+                        "reason": "stalled", "refreshes": refreshes}
 
             if got < 1024:
                 try:
@@ -518,7 +688,8 @@ def download(op, url, path, expect=None, retries=3, quiet=False,
                 if not _spent():
                     _nap(3 * attempt)
                     continue
-                return {"ok": False, "err": last_err, "reason": "empty"}
+                return {"ok": False, "err": last_err, "reason": "empty",
+                        "refreshes": refreshes}
 
             # ---- 完成判定：必须先于落盘 ----
             # ★ v1.4.2 起唯一的完成判据：本次实得字节数 == 经稳定窗口确认的
@@ -544,7 +715,7 @@ def download(op, url, path, expect=None, retries=3, quiet=False,
                         "probes": vt["probes"],
                         "retried": attempt, "resumed": used_resume,
                         "declared": declared, "shortfall": shortfall,
-                        "note": note}
+                        "note": note, "refreshes": refreshes}
 
             if vt.get("reason") == "larger":
                 # 远端比本地大 → 续传追平，EOF 后重新进入稳定窗口
@@ -558,12 +729,14 @@ def download(op, url, path, expect=None, retries=3, quiet=False,
                             % (tail_rounds, vt.get("remote"), got))
                 return {"ok": False, "err": last_err, "kept_part": True,
                         "reason": "growing", "size": got,
-                        "declared": declared, "shortfall": shortfall}
+                        "declared": declared, "shortfall": shortfall,
+                        "refreshes": refreshes}
 
             # gone / remote_smaller / timeout：一律失败并保留 .part
             return {"ok": False, "err": vt["err"], "kept_part": True,
                     "reason": vt.get("reason"), "size": got,
-                    "declared": declared, "shortfall": shortfall}
+                    "declared": declared, "shortfall": shortfall,
+                    "refreshes": refreshes}
 
         except urllib.error.HTTPError as e:
             if e.code == 416:
@@ -572,23 +745,62 @@ def download(op, url, path, expect=None, retries=3, quiet=False,
                 return {"ok": False, "kept_part": True,
                         "reason": "remote_smaller",
                         "err": "HTTP 416：本地已下 %d 字节超出远端对象长度"
-                               "（远端换对象或收缩）" % (offset or 0)}
+                               "（远端换对象或收缩）" % (offset or 0),
+                        "refreshes": refreshes}
             if e.code in (401, 403):
                 # 403 多半是并发或 token 限流。等一下再串行重试一次。
                 last_err = "HTTP %d（token 限流或失效）" % e.code
+                # ★ Round 13：这就是「时效凭据过期」的信号。重新解析该条目的
+                #   replay URL 后继续 —— .part 原样保留，下一轮从它的长度续传。
+                if url_provider is not None:
+                    if refreshes >= max_refreshes:
+                        return {"ok": False, "kept_part": True,
+                                "reason": "url_refresh_exhausted",
+                                "err": "HTTP %d 后已重新解析 %d 次仍失败，"
+                                       "停止（不无限重试）"
+                                       % (e.code, refreshes),
+                                "refreshes": refreshes,
+                                "size": offset or None}
+                    try:
+                        new_url = url_provider()
+                    except Exception as ex:
+                        return {"ok": False, "kept_part": True,
+                                "reason": "url_resolve_failed",
+                                "err": "回放 URL 重新解析失败: %s"
+                                       % redact_text(str(ex)[:80]),
+                                "refreshes": refreshes,
+                                "size": offset or None}
+                    new_ident = probe_remote(op, new_url)
+                    why = _identity_conflict(new_ident)
+                    if why:
+                        return {"ok": False, "kept_part": True,
+                                "reason": "identity_conflict",
+                                "err": "刷新后回放身份冲突：%s"
+                                       "（拒绝拼接已下载的 %d 字节）"
+                                       % (why, offset or 0),
+                                "refreshes": refreshes,
+                                "size": offset or None}
+                    if base_identity is None:
+                        base_identity = (new_ident.get("size"),
+                                         new_ident.get("etag"))
+                    refreshes += 1
+                    url = new_url
+                    last_err = None
+                    continue          # 不消耗 attempt：刷新是独立预算
             elif e.code == 404:
-                return {"ok": False, "err": "HTTP 404（回放不存在）", "fatal": True}
+                return {"ok": False, "err": "HTTP 404（回放不存在）",
+                        "fatal": True, "refreshes": refreshes}
             else:
                 last_err = "HTTP %d" % e.code
         except Exception as e:
-            last_err = "%s %s" % (type(e).__name__, str(e)[:60])
+            last_err = redact_text("%s %s" % (type(e).__name__, str(e)[:60]))
 
         if _spent():
             break
         _nap(4 * attempt)
 
     return {"ok": False, "err": last_err or "未知错误", "kept_part": True,
-            "reason": "transport"}
+            "reason": "transport", "refreshes": refreshes}
 
 
 def cam_label(camera_type):

@@ -11,6 +11,7 @@ import hashlib
 import io
 import json
 import os
+import re
 import shutil
 import socket
 import sys
@@ -97,6 +98,16 @@ class FakeOpener:
 
 def http_err(code):
     return urllib.error.HTTPError("http://x", code, "err", {}, io.BytesIO(b""))
+
+
+def req_url(u):
+    """假 opener 收到的可能是 URL 字符串，也可能是 Request 对象。
+
+    `get_json()` / `api_ok()` 现在会带 `Accept: application/json` 发请求，
+    走的是 Request 对象。凡是按 URL 分发的假 opener 都必须先归一化 ——
+    否则 `"/activities?" in url` 会直接在 Request 上抛 TypeError。
+    """
+    return getattr(u, "full_url", u)
 
 
 class Base(unittest.TestCase):
@@ -489,6 +500,7 @@ class TestCollectKinds(Base):
             self.urls = []
 
         def open(self, url, timeout=None, data=None):
+            url = req_url(url)
             self.urls.append(url)
             if "/activities?" in url:
                 payload = {"activities": self.acts}
@@ -1610,6 +1622,121 @@ class TestCookieSecurity(Base):
         self.assertEqual(len(list(jar)), 1)
 
 
+LOGIN_PAGE = (b"<!DOCTYPE html><html><head>"
+              b"<title>Login - \xe8\xa5\xbf\xe5\xae\x89\xe4\xba\xa4\xe9\x80\x9a"
+              b"\xe5\xa4\xa7\xe5\xad\xa6\xe7\xbb\x9f\xe4\xb8\x80\xe8\xba\xab"
+              b"\xe4\xbb\xbd\xe8\xae\xa4\xe8\xaf\x81\xe7\xbd\x91\xe5\x85\xb3"
+              b"</title></head><body>" + b"y" * 800 + b"</body></html>")
+
+
+class TestAuthDetection(Base):
+    """登录态探测必须能真的判出「过期」。
+
+    ★ 回归背景（2026-09-20 实测）：平台对**未认证**的 API 请求回的是
+    `HTTP 200 + 统一身份认证登录页 HTML`，**不是 401**。旧 `api_ok()` 写的是
+    `if r.status == 200 and b'"courses"' in body: ... ; return True, "接口可达"`，
+    于是登录页落进兜底分支被报成「接口可达」—— 预检永远不会失败，
+    `get_json()` 接着抛 `Expecting value: line 1 column 1 (char 0)`，
+    看起来像接口坏了，其实是没登录（当时扫了 58 门课才发现）。
+
+    这条用例的意义就是**让预检有可能失败**。
+    """
+
+    def _api_ok(self, resp):
+        return F.api_ok(FakeOpener([resp]))
+
+    def test_login_page_with_200_is_reported_as_expired(self):
+        """核心回归：200 + 登录页 HTML ≠ 有效。"""
+        valid, why = self._api_ok(FakeResponse(
+            LOGIN_PAGE, {"Content-Type": "text/html;charset=UTF-8"}))
+        self.assertFalse(valid, "200 的登录页被判成了有效登录态")
+        self.assertIn("过期", why)
+
+    def test_login_page_detected_even_without_html_content_type(self):
+        """只看 Content-Type 不够 —— 有的网关会漏掉/写错它，得看响应体。"""
+        valid, _why = self._api_ok(FakeResponse(LOGIN_PAGE, {}))
+        self.assertFalse(valid)
+
+    def test_html_by_doctype_without_login_keyword(self):
+        """别的 HTML（比如网关错误页）也要拦住，但**不能说成「登录过期」**。"""
+        valid, why = self._api_ok(FakeResponse(
+            b"<!doctype html><html><body>502 bad gateway</body></html>",
+            {"Content-Type": "text/html"}))
+        self.assertFalse(valid, "非 JSON 的 200 不该放行")
+        self.assertNotIn("过期", why,
+                         "别把网关错误说成登录过期 —— 用户会白做一次重新登录")
+        self.assertIn("JSON", why)
+
+    def test_generic_html_is_not_turned_into_401_by_get_json(self):
+        """★ 边界：只有**登录页**才是鉴权失败。
+
+        v1.4.1 定的语义是「200 但 body 不是 JSON → ERR_TRANSIENT」，
+    不能因为这次修 bug 就顺手把所有 HTML 都升级成 auth。
+        """
+        op = FakeOpener([FakeResponse(b"<html>oops</html>", {})] * 3)
+        m, err = F.meta(op, 1)
+        self.assertIsNone(m)
+        self.assertEqual(err["kind"], F.ERR_TRANSIENT)
+
+    def test_valid_json_still_passes(self):
+        """别修过头：正常 JSON 必须继续判有效。"""
+        valid, why = self._api_ok(FakeResponse(
+            b'{"courses":[{"id":1}]}', {"Content-Type": "application/json"}))
+        self.assertTrue(valid)
+        self.assertIn("有效", why)
+
+    def test_401_and_403_are_expired(self):
+        for code in (401, 403):
+            valid, why = self._api_ok(http_err(code))
+            self.assertFalse(valid, "HTTP %d 应判为失效" % code)
+
+    def test_benign_http_error_still_tolerated(self):
+        """5xx 只是抖动，不该把用户赶去重新登录（保持原有的宽容语义）。"""
+        valid, _why = self._api_ok(http_err(502))
+        self.assertTrue(valid)
+
+    def test_network_error_still_tolerated(self):
+        valid, _why = self._api_ok(OSError("connection reset"))
+        self.assertTrue(valid)
+
+    def test_api_ok_sends_json_accept(self):
+        """必须显式声明 Accept: application/json —— 声明后服务端会回 401，
+        而不是用 HTML 200 打哑谜；这也是让上面这些判断成立的前提。"""
+        op = FakeOpener([FakeResponse(b'{"courses":[]}',
+                                      {"Content-Type": "application/json"})])
+        seen = {}
+
+        def spy(url, timeout=None, data=None):
+            req = url
+            seen["accept"] = dict(getattr(req, "headers", {}) or {}).get("Accept")
+            seen["is_request"] = hasattr(req, "headers")
+            return op.open(url, timeout, data)
+
+        class Spy:
+            addheaders = [("User-Agent", "t"), ("Referer", "http://r")]
+
+            def open(self, url, timeout=None, data=None):
+                return spy(url, timeout, data)
+
+        F.api_ok(Spy())
+        self.assertTrue(seen.get("is_request"), "应该用 Request 对象以便加头")
+        self.assertIn("application/json", seen.get("accept") or "")
+
+    def test_get_json_turns_login_page_into_401(self):
+        """HTML 200 要被转成 401（清晰、且不重试），而不是 JSONDecodeError。"""
+        op = FakeOpener([FakeResponse(
+            LOGIN_PAGE, {"Content-Type": "text/html;charset=UTF-8"})])
+        with self.assertRaises(urllib.error.HTTPError) as cm:
+            F.get_json(op, "http://x/api/whatever", retries=3)
+        self.assertEqual(cm.exception.code, 401)
+        self.assertEqual(op.calls, 1, "401 不该重试")
+
+    def test_get_json_still_parses_valid_json(self):
+        op = FakeOpener([FakeResponse(b'{"activities":[]}',
+                                      {"Content-Type": "application/json"})])
+        self.assertEqual(F.get_json(op, "http://x/api/a"), {"activities": []})
+
+
 class TestPathCollision(Base):
     """目标路径冲突 —— 同名附件撞到同一路径会让第二个被静默跳过。
 
@@ -2070,6 +2197,109 @@ class TestDownloadIndex(Base):
         idx2 = F.load_download_index(out)
         self.assertEqual(idx2, idx1, "两次运行的分配必须逐字节一致")
 
+    # ---- ★ 索引 size 跨轮存活（loader 曾把它抹掉）----
+
+    def _replay_item(self, uid=9, cam="c7"):
+        return {"kind": "回放", "activity": "第1章", "uid": uid,
+                "camera_id": cam, "name": "a.mp4", "size": 133691967}
+
+    def test_index_size_survives_save_load_round_trip(self):
+        """★ 回归：loader 以前把条目规范化成 {"path", "name"} 两项，
+        `size` 在**每一次加载**时都被抹掉。
+
+        后果比「少个字段」重得多：indexed_size() 因此在任何真实运行里都
+        返回 None —— 「回放优先用索引里经稳定窗口确认的 size」这条路径
+        整个成了死代码，增量判定每轮都退回「依赖本轮远端探测」，
+        而远端在转码期/抖动时给出的值正是索引要替代的东西。
+        """
+        key = "course:1:live:9:camera:c7"
+        F.save_download_index(self.tmp, {key: {"name": "a.mp4",
+                                               "path": "回放/x/a.mp4",
+                                               "size": 133691967}})
+        back = F.load_download_index(self.tmp)
+        self.assertEqual(back[key].get("size"), 133691967,
+                         "size 必须原样带出来")
+        self.assertEqual(F.indexed_size(self._replay_item(), back, "1"),
+                         133691967, "加载后的索引必须能给出可信 size")
+
+    def test_index_size_stable_across_repeated_runs(self):
+        """★ 点名场景：下载完成后再来一轮（哪怕整轮全跳过），
+        索引里的 verified_size 必须还在，且值不变。
+
+        run1 分配身份 + 模拟下载成功写下 verified_size → 落盘
+        run2 重新 load（这里曾丢 size）→ 再分配一次 → 落盘
+        run3 再 load → size 必须仍等于 run1 写下的值
+        """
+        key = "course:1:live:9:camera:c7"
+
+        index = F.load_download_index(self.tmp)
+        F.assign_canonical_paths([self._replay_item()], index,
+                                 self._args(), "1")
+        rec = dict(index[key])
+        rec["size"] = 133691967          # 下载成功分支写下的 verified_size
+        index[key] = rec
+        F.save_download_index(self.tmp, index)
+
+        index2 = F.load_download_index(self.tmp)
+        self.assertEqual(index2[key].get("size"), 133691967,
+                         "加载后 size 不得丢失")
+        F.assign_canonical_paths([self._replay_item()], index2,
+                                 self._args(), "1")
+        F.save_download_index(self.tmp, index2)
+
+        index3 = F.load_download_index(self.tmp)
+        self.assertEqual(index3[key].get("size"), 133691967,
+                         "跳过的一轮不能把已验证的 size 冲掉")
+        self.assertEqual(F.indexed_size(self._replay_item(), index3, "1"),
+                         133691967)
+
+    def test_index_bad_size_dropped_not_fatal(self):
+        """坏 size 只丢这个字段，不能让整份索引 fail-closed。
+
+        path 坏了 = 身份漂移（必须拒绝下载）；size 坏了 = 只是「没有可信
+        size」，退回本轮远端探测精确比对即可 —— 为它拒绝下载是过度反应。
+        """
+        key = "course:1:live:9:camera:c7"
+        for bad in ("abc", -5, 0, None, True, 3.5, ""):
+            F.save_download_index(self.tmp, {key: {"name": "a.mp4",
+                                                   "path": "回放/x/a.mp4",
+                                                   "size": bad}})
+            back = F.load_download_index(self.tmp)      # 不得抛异常
+            self.assertNotIn("size", back[key],
+                             "坏值 %r 必须被丢弃" % (bad,))
+            self.assertIsNone(F.indexed_size(self._replay_item(), back, "1"))
+
+    def test_index_numeric_string_size_accepted(self):
+        """索引是允许人工核对的落盘文件：size 写成字符串不该作废整份，
+        按数值收下。非数字字符串仍然丢弃（见上一条）。"""
+        key = "course:1:live:9:camera:c7"
+        F.save_download_index(self.tmp, {key: {"name": "a.mp4",
+                                               "path": "回放/x/a.mp4",
+                                               "size": "133691967"}})
+        back = F.load_download_index(self.tmp)
+        self.assertEqual(F.indexed_size(self._replay_item(), back, "1"),
+                         133691967)
+
+    def test_merge_index_entry_preserves_size_unless_path_moves(self):
+        """★ 索引写入只有 merge_index_entry 一个入口。
+
+        理由：以前是「三处各自赋值整条记录」，要同时都写对才不漏 size ——
+        漏一处就等于 index 里那条可信 size 被无关代码路径顺手抹掉。
+        语义：原地重新登记（同 path）保住 size；路径真的搬了
+        （换名另存 / 重新分配）则旧 size 不再指同一个文件，必须丢弃。
+        """
+        key = "course:1:live:9:camera:c7"
+        idx = {}
+        F.merge_index_entry(idx, key, "回放/x/a.mp4", "a.mp4", size=133691967)
+        self.assertEqual(idx[key]["size"], 133691967)
+
+        F.merge_index_entry(idx, key, "回放/x/a.mp4", "a.mp4")
+        self.assertEqual(idx[key]["size"], 133691967, "同路径不得丢 size")
+
+        F.merge_index_entry(idx, key, "回放/x/a~9.mp4", "a~9.mp4")
+        self.assertNotIn("size", idx[key], "换名另存必须丢弃旧 size")
+        self.assertEqual(idx[key]["path"], "回放/x/a~9.mp4")
+
 
 class TestIdentityHardening(Base):
     """resource identity 封板前的最后三条边界：
@@ -2405,6 +2635,7 @@ class TestCollectScanFailure(Base):
             self.details = details
 
         def open(self, url, timeout=None, data=None):
+            url = req_url(url)
             if "/activities?" in url:
                 payload = {"activities": self.acts}
             else:
@@ -2607,6 +2838,7 @@ class MainOpener:
         self.uploads = uploads or {}
 
     def open(self, url, timeout=None, data=None):
+        url = req_url(url)
         if "/activities?" in url:
             return FakeResponse(json.dumps({"activities": self.acts}).encode())
         if "/uploads/" in url:
@@ -2963,6 +3195,502 @@ class TestSevenZipCollision(Base):
             got, _n = F.resolve_collisions(items, FakeArgs())
             self.assertTrue(got[1]["name"].endswith(tail),
                             "%s 改名后丢了扩展名: %r" % (nm, got[1]["name"]))
+
+
+# ---------------------------------------------------------------- --exclude
+
+REPLAY_MEDIA = "https://rms.test/captures/c1/videos/1/preview"
+REPLAY_NAME = "第1章-20260919-1430-encoder.mp4"
+
+
+class ReplayMainOpener:
+    """能跑通「回放」全流程的假 opener，并**逐条记录媒体请求**。
+
+    用途：验证被 `--exclude` 排除的条目是否真的一次媒体请求都没发。
+
+    - `/api/courses/<id>/activities?` → 活动列表
+    - `/api/activities/<id>`          → 活动详情（含 replay_videos）
+    - 媒体 URL（rms.test 域）          → 探针回响应头 / 下载回 body
+
+    media_error 非 None 时，任何媒体请求都抛它（模拟 502 / 403 / 超时）。
+    """
+
+    MEDIA_HOST = "rms.test"
+
+    def __init__(self, acts, details, media_size=4096, media_error=None):
+        self.acts = acts
+        self.details = details
+        self.media_size = media_size
+        self.media_error = media_error
+        self.media_requests = []          # ★ 媒体请求逐条记账
+        self.detail_requests = []         # 活动详情请求
+        self.body = b"x" * media_size
+
+    def open(self, url, timeout=None, data=None):
+        u = req_url(url)
+        if "/activities?" in u:
+            return FakeResponse(json.dumps({"activities": self.acts}).encode())
+        if self.MEDIA_HOST in u:
+            self.media_requests.append(u)
+            if self.media_error is not None:
+                raise self.media_error
+            hd = {k.lower(): v for k, v in
+                  (getattr(url, "headers", None) or {}).items()}
+            if hd.get("range") == "bytes=0-0":
+                return FakeResponse(b"x", status=206, headers={
+                    "Content-Type": "video/mp4",
+                    "Content-Range": "bytes 0-0/%d" % self.media_size,
+                    "ETag": '"v1"'})
+            return FakeResponse(self.body, status=206, headers={
+                "Content-Type": "video/mp4",
+                "Content-Range": "bytes 0-%d/%d"
+                                 % (len(self.body) - 1, self.media_size)})
+        self.detail_requests.append(u)
+        aid = int(u.split("/activities/")[1].split("?")[0])
+        item = self.details.get(aid, {"data": {}})
+        if isinstance(item, Exception):
+            raise item
+        return FakeResponse(json.dumps(item).encode())
+
+
+def replay_fixture(url=None):
+    """一个 lecture_live 活动 + 一路 encoder 机位。
+
+    最终文件名（safe_name）= `第1章-20260919-1430-encoder.mp4`。
+    """
+    acts = [{"id": 777, "type": "lecture_live", "title": "第1章"}]
+    det = {777: {
+        "start_time": "2026-09-19T14:30:00+08:00",
+        "data": {"external_live_detail": {"replay_videos": [
+            {"camera_id": "c1", "camera_type": "encoder",
+             "url": url or (REPLAY_MEDIA + "?previewToken=FAKE_TOKEN")}]}},
+    }}
+    return acts, det
+
+
+class TestExcludePrecedence(Base):
+    """★ `--exclude` 必须在任何远端探测 / URL 解析 / 稳定窗口之前生效。
+
+    回归背景：`expand_items()` 对回放**无条件 probe**，被排除的条目也照探；
+    而 `build_rows()` / 下载循环都**先判 error 再判 exclude** —— 于是一个
+    用户明确排除的条目，只因为它的 URL 恰好 502，就把整轮判成 fail、
+    退出码 4。实测踩到过（58 门课扫一遍时，一个被排除条目 502 触发 exit 4）。
+    """
+
+    def _items(self, op, excl, cache=None):
+        keys = [("回放", "第1章", -777)]
+        args = FakeArgs(all_cameras=False)
+        return F.expand_items(op, keys, args, excl=excl,
+                              detail_cache=cache)[0]
+
+    def test_excluded_replay_is_never_probed(self):
+        """被排除的回放：一个媒体请求都不发，且不被标成 error。"""
+        acts, det = replay_fixture()
+        op = ReplayMainOpener(acts, det)
+        items = self._items(op, re.compile("1430-encoder"))
+        self.assertEqual(op.media_requests, [], "被排除条目不得发媒体请求")
+        self.assertEqual(len(items), 1)
+        self.assertTrue(items[0].get("excluded"), items[0])
+        self.assertFalse(items[0].get("error"), "不得标成 error")
+
+    def test_not_excluded_still_probes(self):
+        """对照组：不排除时照常探测 —— 证明上一条不是因为压根没扫到。"""
+        acts, det = replay_fixture()
+        op = ReplayMainOpener(acts, det)
+        items = self._items(op, None)
+        self.assertTrue(op.media_requests, "未排除的条目必须正常探测")
+        self.assertFalse(items[0].get("excluded"))
+        self.assertEqual(items[0]["size"], 4096)
+
+    def test_exclude_matching_semantics_unchanged(self):
+        """匹配语义不动：仍是「对最终文件名做 re.search」。
+
+        用真实文件名 `第1章-20260919-1430-encoder.mp4` 验证：
+        能匹配子串的命中，匹配不上的不命中。
+        """
+        acts, det = replay_fixture()
+        hit = self._items(ReplayMainOpener(acts, det), re.compile("1430"))
+        self.assertTrue(hit[0].get("excluded"), "子串命中应被排除")
+
+        op2 = ReplayMainOpener(acts, det)
+        miss = self._items(op2, re.compile("20260919-1530"))
+        self.assertFalse(miss[0].get("excluded"), "匹配不上就不该被排除")
+        self.assertTrue(op2.media_requests)
+
+    def test_excluded_flag_beats_error_in_build_rows(self):
+        """不变量：带 error 的条目只要被标记 excluded，就绝不能报 fail。
+
+        （当前实现下这条路径已不可达 —— expand 不会再探测被排除条目；
+        但清单视图必须自己守住「排除优先于错误」，不能依赖上游顺序。）
+        """
+        args = FakeArgs(out=self.tmp, layout="flat")
+        items = [{"kind": "回放", "activity": "第1章", "uid": 777,
+                  "name": REPLAY_NAME, "excluded": True, "error": True,
+                  "err_kind": F.ERR_TRANSIENT, "err_msg": "探测失败"}]
+        rows = F.build_rows(None, items, re.compile("1430"), args,
+                            quiet=True, index={})
+        self.assertEqual(rows[0]["status"], F.STATUS_EXCLUDED)
+        self.assertEqual(F.count_fail(rows), 0)
+
+    def test_lecture_live_detail_fetched_once(self):
+        """lecture_live 详情只取一次：collect() 取到的要复用给 expand_items()。
+
+        以前 collect() 为了枚举机位取一次、expand_items() 又取一次 —— 同一份
+        详情两次请求，失败面翻倍，被排除条目也无谓地多一次请求。
+        """
+        acts, det = replay_fixture()
+        op = ReplayMainOpener(acts, det)
+        cache = {}
+        F.collect(op, "1", activities=acts, detail_cache=cache)
+        self.assertEqual(len(op.detail_requests), 1)
+        self._items(op, None, cache=cache)
+        self.assertEqual(len(op.detail_requests), 1, "详情被取了第二次")
+
+    def test_excluded_replay_with_dead_url_keeps_rc_ok(self):
+        """★ 点名场景：被排除条目的 URL 会 502 → 整轮仍 rc=0。
+
+        对照组（同一份 URL、同样 502，但不排除）必须 rc=4 ——
+        证明这条断言不是在「反正没事」的空场景里通过的。
+        """
+        err = urllib.error.HTTPError(REPLAY_MEDIA, 502, "Bad Gateway", {}, None)
+
+        acts, det = replay_fixture()
+        op = ReplayMainOpener(acts, det, media_error=err)
+        rc, out = run_main(self.tmp, op,
+                           ["--exclude", "1430-encoder",
+                            "--manifest", os.path.join(self.tmp, "m1.json")])
+        self.assertEqual(rc, F.RC_OK, out[-1200:])
+        self.assertEqual(op.media_requests, [], "被排除条目不得发媒体请求")
+        with open(os.path.join(self.tmp, "m1.json"), encoding="utf-8") as f:
+            rows = json.load(f)["files"]
+        self.assertEqual([r["status"] for r in rows], [F.STATUS_EXCLUDED])
+
+        acts2, det2 = replay_fixture()
+        op2 = ReplayMainOpener(acts2, det2, media_error=err)
+        rc2, out2 = run_main(self.tmp, op2, ["--manifest",
+                                             os.path.join(self.tmp, "m2.json")])
+        self.assertEqual(rc2, F.RC_PARTIAL,
+                         "不排除时 502 必须如实计入失败：%s" % out2[-600:])
+        self.assertTrue(op2.media_requests)
+
+    def test_excluded_replay_timeout_keeps_rc_ok(self):
+        """超时同理：排除项的网络状态不能影响退出码。"""
+        acts, det = replay_fixture()
+        op = ReplayMainOpener(acts, det, media_error=socket.timeout("t"))
+        rc, out = run_main(self.tmp, op, ["--exclude", "1430-encoder"])
+        self.assertEqual(rc, F.RC_OK, out[-1200:])
+        self.assertEqual(op.media_requests, [])
+
+    def test_excluded_replay_403_keeps_rc_ok(self):
+        """403 同理（不能因为「不可达」被记成 N/A 或 fail）。"""
+        err = urllib.error.HTTPError(REPLAY_MEDIA, 403, "Forbidden", {}, None)
+        acts, det = replay_fixture()
+        op = ReplayMainOpener(acts, det, media_error=err)
+        rc, out = run_main(self.tmp, op, ["--exclude", "1430-encoder"])
+        self.assertEqual(rc, F.RC_OK, out[-1200:])
+        self.assertEqual(op.media_requests, [])
+
+
+# ---------------------------------------------------------------- Round 13 JIT
+
+class JitServer:
+    """Round 13 用的假回放服务端：Range 感知 + 按 token 403 + 可切换对象。
+
+    - 请求 URL 里出现 `bad_tokens` 中的任意一个 → 403（模拟时效凭据过期）
+    - URL 里出现 `alt_marker` → 返回 `alt_data`（模拟「刷新后拿到另一个对象」）
+    - `Range: bytes=0-0` → 只回响应头（size / ETag）
+    - 其它 Range → 返回 `data[start:]`，并按真实语义回 `Content-Range`
+
+    逐条记录 `(method, url, range)`，供「零请求 / 不泄漏 / 未用 HEAD」类断言。
+    """
+
+    def __init__(self, data, bad_tokens=(), alt_data=None, alt_marker="ALT",
+                 etag='"v1"'):
+        self.data = data
+        self.bad_tokens = list(bad_tokens)
+        self.alt_data = alt_data
+        self.alt_marker = alt_marker
+        self.etag = etag
+        self.requests = []
+
+    def open(self, req, timeout=None):
+        u = req_url(req)
+        method = req.get_method() if hasattr(req, "get_method") else "GET"
+        hd = {k.lower(): v for k, v in
+              (getattr(req, "headers", None) or {}).items()}
+        rng = hd.get("range")
+        self.requests.append((method, u, rng))
+
+        for t in self.bad_tokens:
+            if t and t in u:
+                raise urllib.error.HTTPError(u, 403, "Forbidden", {}, None)
+
+        data = self.data
+        if self.alt_data is not None and self.alt_marker in u:
+            data = self.alt_data
+
+        if rng == "bytes=0-0":
+            return FakeResponse(b"x", status=206, headers={
+                "Content-Type": "video/mp4",
+                "Content-Range": "bytes 0-0/%d" % len(data),
+                "ETag": self.etag,
+                "Last-Modified": "Wed, 22 Oct 2025 03:00:12 GMT"})
+
+        start = int(rng.split("=")[1].split("-")[0]) if rng else 0
+        body = data[start:]
+        h = {"Content-Type": "video/mp4",
+             "Content-Range": "bytes %d-%d/%d" % (start, len(data) - 1, len(data)),
+             "ETag": self.etag}
+        return FakeResponse(body, status=206, headers=h)
+
+    def media_urls(self):
+        return [u for _m, u, _r in self.requests]
+
+
+class TestReplayUrlJit(Base):
+    """★ Round 13：replay URL 只在真正要用之前才解析，且从不落盘。
+
+    不变量：
+      · 条目 / 索引 / 清单 / 日志都不带 replay URL 与 previewToken
+      · 下载前 JIT 解析；.part 续传同样 JIT
+      · 401/403 → 重新解析后继续，**保留 .part**
+      · 刷新有上限，禁止无限循环
+      · 刷新后 stable identity 实质冲突 → fail-closed，绝不拼接
+    """
+
+    DATA = b"0123456789" * 512          # 5120 字节，>1024 避开「疑似空响应」
+
+    def setUp(self):
+        super().setUp()
+        self.clock = LiveClock()
+
+    def dl(self, op, path, url=None, **kw):
+        import lms_live
+        kw.setdefault("retries", 1)
+        kw.setdefault("quiet", True)
+        return lms_live.download(op, url, path,
+                                 clock=self.clock.now, sleep=self.clock.sleep,
+                                 **kw)
+
+    def _part(self, path, prefix):
+        with open(path + ".part", "wb") as f:
+            f.write(prefix)
+
+    # ---- 1. URL 不落盘 / 不泄漏 ----
+
+    def test_replay_item_carries_no_url(self):
+        """回放条目不得携带 URL —— 它是时效凭据，不能进任何落盘路径。"""
+        acts, det = replay_fixture()
+        op = ReplayMainOpener(acts, det)
+        items = F.expand_items(op, [("回放", "第1章", -777)],
+                               FakeArgs(all_cameras=False))[0]
+        j = json.dumps(items, ensure_ascii=False)
+        self.assertNotIn("url", items[0], "条目里不该有 url 字段")
+        self.assertNotIn("previewToken", j)
+        self.assertNotIn("FAKE_TOKEN", j)
+
+    def test_token_never_in_manifest_or_output(self):
+        """清单与输出里不得出现 previewToken。"""
+        acts, det = replay_fixture()
+        err = urllib.error.HTTPError(REPLAY_MEDIA, 502, "Bad Gateway", {}, None)
+        op = ReplayMainOpener(acts, det, media_error=err)
+        mf = os.path.join(self.tmp, "m.json")
+        _rc, out = run_main(self.tmp, op, ["--manifest", mf])
+        self.assertNotIn("previewToken", out)
+        self.assertNotIn("FAKE_TOKEN", out)
+        with open(mf, encoding="utf-8") as f:
+            self.assertNotIn("previewToken", f.read())
+
+    def test_token_never_in_download_result_or_log(self):
+        """download() 的返回值与日志同样不得带 token。"""
+        import contextlib
+        import lms_live
+        op = JitServer(self.DATA)
+        path = os.path.join(self.tmp, "a.mp4")
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            res = self.dl(op, path, url="http://r/x?previewToken=SECRET_T",
+                          quiet=False)
+        self.assertTrue(res["ok"], res.get("err"))
+        blob = json.dumps(res, ensure_ascii=False, default=str)
+        self.assertNotIn("SECRET_T", blob)
+        self.assertNotIn("SECRET_T", buf.getvalue())
+
+    # ---- 2/4. 403 → 刷新 → 成功；续传起点正确 ----
+
+    def test_first_403_then_refresh_succeeds(self):
+        import lms_live
+        op = JitServer(self.DATA, bad_tokens=["T_BAD"])
+        path = os.path.join(self.tmp, "b.mp4")
+        seq = iter(["http://r/x?previewToken=T_BAD",
+                    "http://r/x?previewToken=T_GOOD"])
+        res = self.dl(op, path, url_provider=lambda: next(seq))
+        self.assertTrue(res["ok"], res.get("err"))
+        self.assertEqual(res["refreshes"], 1)
+        with open(path, "rb") as f:
+            self.assertEqual(f.read(), self.DATA)
+        self.assertFalse(os.path.exists(path + ".part"))
+
+    def test_part_resume_after_refresh_uses_part_offset(self):
+        """★ 关键：刷新后必须从 .part 现有大小续传，不得从头再来、不得丢内容。"""
+        op = JitServer(self.DATA, bad_tokens=["T_BAD"])
+        path = os.path.join(self.tmp, "c.mp4")
+        self._part(path, self.DATA[:1024])
+        seq = iter(["http://r/x?previewToken=T_BAD",
+                    "http://r/x?previewToken=T_GOOD"])
+        res = self.dl(op, path, url_provider=lambda: next(seq))
+        self.assertTrue(res["ok"], res.get("err"))
+        self.assertEqual(res["refreshes"], 1)
+        with open(path, "rb") as f:
+            self.assertEqual(f.read(), self.DATA, "续传后内容必须完整正确")
+        good = [r for m, u, r in op.requests
+                if "T_GOOD" in u and r and r != "bytes=0-0"]
+        self.assertTrue(good, "刷新后应发出续传请求")
+        self.assertEqual(good[0], "bytes=1024-",
+                         "续传起点必须等于 .part 大小")
+
+    # ---- 3. 刷新上限 ----
+
+    def test_refresh_exhausted_fails_clearly_and_keeps_part(self):
+        import lms_live
+        op = JitServer(self.DATA, bad_tokens=["T_BAD"])
+        path = os.path.join(self.tmp, "d.mp4")
+        self._part(path, self.DATA[:1024])
+        calls = []
+
+        def provider():
+            calls.append(1)
+            return "http://r/x?previewToken=T_BAD"
+
+        res = self.dl(op, path, url_provider=provider, max_refreshes=2)
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["reason"], "url_refresh_exhausted")
+        self.assertTrue(res["kept_part"], "失败必须保留 .part")
+        with open(path + ".part", "rb") as f:
+            self.assertEqual(f.read(), self.DATA[:1024], ".part 内容不得被清掉")
+        self.assertFalse(os.path.exists(path))
+        self.assertEqual(len(calls), 3, "初始 1 次 + 上限 2 次刷新")
+
+    def test_max_refreshes_is_bounded_constant(self):
+        import lms_live
+        self.assertIsInstance(lms_live.MAX_URL_REFRESHES, int)
+        self.assertGreater(lms_live.MAX_URL_REFRESHES, 0)
+
+    # ---- 5. identity 冲突 fail-closed ----
+
+    def test_identity_conflict_fails_closed_without_splicing(self):
+        """刷新后对象长度变了 → 必须 fail-closed，绝不把两份字节拼起来。"""
+        op = JitServer(self.DATA, bad_tokens=["T_BAD"],
+                       alt_data=self.DATA + b"EXTRA")
+        path = os.path.join(self.tmp, "e.mp4")
+        self._part(path, self.DATA[:1024])
+        seq = iter(["http://r/x?previewToken=T_BAD",
+                    "http://r/x?previewToken=T_GOOD&ALT=1"])
+        res = self.dl(op, path, url_provider=lambda: next(seq),
+                      base_identity=(len(self.DATA), '"v1"'))
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["reason"], "identity_conflict", res)
+        self.assertTrue(res["kept_part"])
+        with open(path + ".part", "rb") as f:
+            self.assertEqual(f.read(), self.DATA[:1024], "不得拼接、不得截断")
+        self.assertFalse(os.path.exists(path), "冲突时不得落最终文件")
+
+    def test_identity_etag_change_fails_closed(self):
+        """同一长度但 ETag 变了：也是实质冲突（内容换了对象）。"""
+        op = JitServer(self.DATA, bad_tokens=["T_BAD"], etag='"v2"')
+        path = os.path.join(self.tmp, "f.mp4")
+        self._part(path, self.DATA[:1024])
+        seq = iter(["http://r/x?previewToken=T_BAD",
+                    "http://r/x?previewToken=T_GOOD"])
+        res = self.dl(op, path, url_provider=lambda: next(seq),
+                      base_identity=(len(self.DATA), '"v1"'))
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["reason"], "identity_conflict", res)
+
+    def test_same_identity_refresh_is_not_a_conflict(self):
+        """对照组：ETag / size 一致时刷新必须正常继续（别过度 fail-closed）。"""
+        op = JitServer(self.DATA, bad_tokens=["T_BAD"])
+        path = os.path.join(self.tmp, "g.mp4")
+        seq = iter(["http://r/x?previewToken=T_BAD",
+                    "http://r/x?previewToken=T_GOOD"])
+        res = self.dl(op, path, url_provider=lambda: next(seq),
+                      base_identity=(len(self.DATA), '"v1"'))
+        self.assertTrue(res["ok"], res.get("err"))
+        self.assertEqual(res["refreshes"], 1)
+
+    # ---- 解析器 ----
+
+    def test_resolve_picks_camera_by_id(self):
+        import lms_live
+        acts, det = replay_fixture()
+        op = ReplayMainOpener(acts, det)
+        u = lms_live.resolve_replay_url(op, 777, camera_id="c1")
+        self.assertIn("previewToken=", u)
+
+    def test_resolve_reports_missing_item_without_url(self):
+        import lms_live
+        acts, det = replay_fixture()
+        op = ReplayMainOpener(acts, det)
+        with self.assertRaises(lms_live.LiveResolveError) as cm:
+            lms_live.resolve_replay_url(op, 777, camera_id="nope")
+        self.assertNotIn("previewToken", str(cm.exception))
+
+    def test_no_head_request_in_replay_path(self):
+        """HEAD 不是本站可依赖的路径 —— 真实探测必须走 Range: bytes=0-0。"""
+        op = JitServer(self.DATA)
+        path = os.path.join(self.tmp, "h.mp4")
+        self.assertTrue(self.dl(op, path, url="http://r/x?t=1")["ok"])
+        self.assertNotIn("HEAD", [m for m, _u, _r in op.requests])
+
+    # ---- 6. 异常文本不得把 URL 带出去 ----
+
+    def test_redact_text_strips_query_anywhere(self):
+        """自由文本里的 URL 必须被削掉 query —— token 就住在那里。"""
+        import lms_live
+        s = lms_live.redact_text(
+            "boom https://rms.test/a/b?previewToken=ABC123 tail")
+        self.assertNotIn("ABC123", s)
+        self.assertNotIn("previewToken", s)
+        self.assertIn("https://rms.test/a/b", s)
+        self.assertEqual(lms_live.redact_text(None), None)
+
+    def test_transport_error_text_has_no_token(self):
+        """★ urllib 的部分异常会把完整 URL 拼进消息。
+
+        ValueError("unknown url type: <url>") 这类文本一旦被原样塞进 err，
+        previewToken 就会顺着返回值 / 清单 / 终端输出漏出去。
+        """
+        import lms_live
+
+        class Boom:
+            addheaders = []
+
+            def open(self, req, timeout=None):
+                raise ValueError("unknown url type: %s" % req_url(req))
+
+        path = os.path.join(self.tmp, "boom.mp4")
+        res = self.dl(Boom(), path,
+                      url_provider=lambda: "http://r/x?previewToken=SECRET_Z")
+        self.assertFalse(res["ok"])
+        blob = json.dumps(res, ensure_ascii=False, default=str)
+        self.assertNotIn("SECRET_Z", blob, blob)
+        self.assertNotIn("previewToken", blob, blob)
+
+    def test_probe_error_text_has_no_token(self):
+        """探测失败的 err 会进条目的 err_msg → 清单，同样不能带 token。"""
+        import lms_live
+
+        class Boom:
+            addheaders = []
+
+            def open(self, req, timeout=None):
+                raise ValueError("bad url %s" % req_url(req))
+
+        p = lms_live.probe_remote(Boom(), "http://r/p?previewToken=SECRET_P")
+        self.assertFalse(p["ok"])
+        blob = json.dumps(p, ensure_ascii=False, default=str)
+        self.assertNotIn("SECRET_P", blob, blob)
+        self.assertNotIn("previewToken", blob, blob)
 
 
 if __name__ == "__main__":

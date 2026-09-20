@@ -310,12 +310,85 @@ def opener(state):
     return op
 
 
+JSON_ACCEPT = "application/json, text/plain, */*"
+
+_HTML_HEAD = 1024
+
+# 统一身份认证登录页的特征串（都按小写比对）。宁可窄一点：
+# 把「网关返回的其它 HTML」也一律叫成「登录态过期」，会把用户支去白做一次登录。
+_LOGIN_MARKERS = (
+    b"login",
+    b"signin",
+    b"keycloak",
+    "统一身份认证".encode("utf-8"),
+    "身份认证".encode("utf-8"),
+    b"cas/",
+)
+
+
+def _looks_like_html(resp, body):
+    """响应体像「HTML 页面」而不是 API JSON 吗。
+
+    ★ 为什么必须按响应体内容判断，而不能只看状态码：这个平台对**未认证**的
+    API 请求回的是 `HTTP 200 + 统一身份认证登录页 HTML`，**不是 401**。
+    只看状态码会把「登录态过期」读成「接口可达」，随后 JSON 解析器抛
+    `Expecting value: line 1 column 1 (char 0)` —— 看起来像接口坏了，其实是
+    没登录。（2026-09-20 实测：扫 58 门课的 activities 全部报这个错。）
+    """
+    ct = str(resp.headers.get("Content-Type") or "").lower()
+    if "html" in ct:
+        return True
+    head = body[:_HTML_HEAD].lstrip().lower()
+    return head.startswith(b"<!doctype html") or head.startswith(b"<html")
+
+
+def _is_login_page(resp, body):
+    """是不是**统一身份认证的登录页**（而不是任意 HTML）。
+
+    ★ 为什么要和「任意 HTML」分开：`meta()` 那套语义（v1.4.1 定的）明确要求
+    「200 但 body 不是 JSON」按 ERR_TRANSIENT 处理，不能算鉴权失败。
+    但登录页是**确定无疑的鉴权失效**，必须报成 auth。
+    两者混为一谈，要么把网络抖动说成「你登录过期了」，要么把过期说成「网络抖动」。
+    """
+    if not _looks_like_html(resp, body):
+        return False
+    head = body[:_HTML_HEAD].lower()
+    return any(m in head for m in _LOGIN_MARKERS)
+
+
+def _json_request(op, url):
+    """建一个带 Accept: application/json 的请求。
+
+    ★ 为什么要显式声明 Accept：实测同一个端点，声明之后服务端用 **401 明确拒绝**
+    未认证请求；不声明则塞一个 HTML 登录页过来（HTTP 200）。把「哑谜」变成
+    可判定的状态码 —— 万一登录页改版到认不出来，401 这条兜底仍在。
+    注意 `op.addheaders` 不会自动作用到 Request 对象上，必须手工搬过来。
+    """
+    req = urllib.request.Request(url)
+    for k, v in getattr(op, "addheaders", []) or []:
+        req.add_header(k, v)
+    req.add_header("Accept", JSON_ACCEPT)
+    return req
+
+
 def get_json(op, url, timeout=60, retries=3):
-    """GET 并解析 JSON，带重试（只重试网络类错误，4xx 立即返回）"""
+    """GET 并解析 JSON，带重试（只重试网络类错误，4xx 立即返回）。
+
+    ★ 只有**登录页**才被翻译成 401（不重试、直接冒到上层）。
+    其它「200 但 body 不是 JSON」保持原语义：交给 `json.loads` 抛错 → 上层按
+    ERR_TRANSIENT 记账（v1.4.1 的契约，别顺手改掉）。
+    """
     last = None
     for i in range(retries):
         try:
-            return json.loads(op.open(url, timeout=timeout).read())
+            r = op.open(_json_request(op, url), timeout=timeout)
+            body = r.read()
+            if _is_login_page(r, body):
+                raise urllib.error.HTTPError(
+                    url, 401,
+                    "登录态已过期（服务端返回统一身份认证登录页）",
+                    getattr(r, "headers", None) or {}, None)
+            return json.loads(body)
         except urllib.error.HTTPError as e:
             if e.code in (401, 403, 404):
                 raise                       # 不该重试
@@ -328,13 +401,41 @@ def get_json(op, url, timeout=60, retries=3):
 
 
 def api_ok(op):
-    """探测登录态是否仍然有效。返回 (是否有效, 说明)"""
+    """探测登录态是否仍然有效。返回 (是否有效, 说明)。
+
+    ★ 旧实现是 `if r.status == 200 and b'"courses"' in body: ... ;
+    return True, "接口可达"` —— 而登录页恰恰是 200 且不含 courses，
+    于是落进兜底分支返回 True：**过期被报成「接口可达」**，
+    `main()` 里那句「别让『过期』伪装成『平台没权限』」的预检自己失效。
+    现在按响应体判断，并且**把两件事分开说**：
+      · 登录页（统一身份认证特征）→ 「登录态已过期」，请重新登录；
+      · 其它非 JSON 的 200 → 「接口返回的不是 JSON」，多半是网关/代理拦了。
+    两种情况都不再往下跑（继续只会得到一屏 JSON 解析错），但提示不同 ——
+    否则用户会被支去白做一次重新登录。
+
+    仍然**故意宽容**的两种情况（不该因为一次抖动就把用户赶去重新登录）：
+    非 401/403 的 HTTP 错误、以及网络异常。
+    """
     try:
-        r = op.open("%s/api/my-courses?sub_course_id=0" % BASE, timeout=30)
+        r = op.open(_json_request(op, "%s/api/my-courses?sub_course_id=0" % BASE),
+                    timeout=30)
         body = r.read()
-        if r.status == 200 and b'"courses"' in body:
+        if _is_login_page(r, body):
+            return False, "登录态已过期（被转到统一身份认证登录页）"
+        try:
+            json.loads(body)
+            parsed = True
+        except ValueError:
+            parsed = False
+        if not parsed:
+            # 不是登录页、但也不是 JSON —— 继续跑只会让后面每个请求都抛
+            # 「Expecting value: line 1 column 1」，所以在这里停住；
+            # 但**不要说成「登录过期」**，否则用户会白做一次重新登录。
+            return False, ("接口返回的不是 JSON（HTTP 200），可能被网关/代理拦截，"
+                           "先不继续")
+        if b'"courses"' in body:
             return True, "登录态有效"
-        return True, "接口可达"
+        return True, "接口可达（响应里没有 courses，但是合法 JSON）"
     except urllib.error.HTTPError as e:
         if e.code in (401, 403):
             return False, "服务端返回 %d，登录态已失效" % e.code
@@ -368,7 +469,7 @@ def scan_error(stage, activity_id, title, exc):
             "error": "%s: %s" % (type(exc).__name__, str(exc)[:60])}
 
 
-def collect(op, course, activities=None, want_video=True):
+def collect(op, course, activities=None, want_video=True, detail_cache=None):
     """返回 ([(kind, 活动标题, upload_id)], 来源①数量, 来源②数量, 扫描错误列表)
 
     kind 取值:
@@ -385,6 +486,12 @@ def collect(op, course, activities=None, want_video=True):
 
     两个计数都是「进 plan 的去重增量」，来源③（回放）不计入其中，
     想拿回放条数请按 kind == "回放" 数。用 len(keys) 相减推来源②会把回放算进去。
+
+    detail_cache : 可选 dict。传入时，成功取到的活动详情会写进它，
+    `expand_items()` 可以复用，省掉「同一份详情取两次」的第二次请求
+    （回放条目尤其吃亏：collect 为了枚举机位取一次、expand 又取一次）。
+    **只缓存成功结果** —— 取失败的活动本来就不会把 key 交给 expand，
+    所以缓存不会掩盖任何失败。
     """
     if activities is None:
         activities = get_json(op, "%s/api/courses/%s/activities?sub_course_id=0"
@@ -443,12 +550,17 @@ def collect(op, course, activities=None, want_video=True):
             aid = a.get("id")
             if not aid:
                 continue                        # 残缺数据，跳过而不是崩
-            try:
-                d = get_json(op, "%s/api/activities/%s?sub_course_id=0" % (BASE, aid))
-            except Exception as e:
-                scan_errors.append(scan_error("lecture_live_detail", aid,
-                                              a.get("title"), e))
-                continue
+            d = (detail_cache or {}).get(str(aid))
+            if d is None:
+                try:
+                    d = get_json(op, "%s/api/activities/%s?sub_course_id=0"
+                                     % (BASE, aid))
+                except Exception as e:
+                    scan_errors.append(scan_error("lecture_live_detail", aid,
+                                                  a.get("title"), e))
+                    continue
+                if detail_cache is not None:
+                    detail_cache[str(aid)] = d
             reps = lms_live.parse_replay(d)
             if not reps:
                 continue
@@ -926,8 +1038,10 @@ def main():
         acts = json.load(open(args.activities, encoding="utf-8")).get("activities")
 
     print("扫描课程 %s ..." % args.course)
+    detail_cache = {}
     keys, n1, n2, scan_errors = collect(op, args.course, acts,
-                                        want_video=not args.no_video)
+                                        want_video=not args.no_video,
+                                        detail_cache=detail_cache)
     print("  来源① uploads 字段: %d" % n1)
     print("  来源② 正文内嵌:     %d" % n2)
     n_vid = sum(1 for k in keys if k[0] == "录像")
@@ -954,7 +1068,8 @@ def main():
     # ---- 把回放条目展开成实际文件条目 ----
     # 回放的一个活动有 2 路机位，要展开成 2 个下载项；
     # 其余 kind 的 uid 就是 upload id，直接用。
-    items, live_err = expand_items(op, keys, args)
+    items, live_err = expand_items(op, keys, args, excl=excl,
+                                   detail_cache=detail_cache)
 
     # 扫描失败伪装成条目，之后自动进 fail / manifest / 退出码
     items = items + scan_error_items(scan_errors)
@@ -1000,6 +1115,15 @@ def main():
         act = it["activity"]
         name = it["name"]
         size = it.get("size") or 0
+
+        # ★ 排除优先于错误（同 build_rows）：被排除条目的网络状态不能影响退出码。
+        if it.get("excluded"):
+            if not args.quiet:
+                print("[%2d] EXCLUDE %s" % (i, name))
+            skip += 1
+            rows.append({"i": i, "kind": kind, "activity": act, "name": name,
+                         "status": STATUS_EXCLUDED})
+            continue
 
         if it.get("error"):
             # ★ 关键分流：只有 403 / 404（确实没权限或已删除）才算「跳过」。
@@ -1076,9 +1200,9 @@ def main():
                 name = os.path.basename(target)
                 path = target
                 it["name"] = name      # 与索引记录保持一致
-                index[identity_key(it, args.course)] = {
-                    "path": _rel_split(os.path.relpath(path, args.out)),
-                    "name": name}
+                merge_index_entry(
+                    index, identity_key(it, args.course),
+                    _rel_split(os.path.relpath(path, args.out)), name)
             elif local_size > 0:
                 # 有残迹但大小对不上且没有可另存的冲突 —— 多半是上次中断留下的
                 # 空文件 / .part，重下（.part 会走续传）
@@ -1100,8 +1224,23 @@ def main():
             print("[%2d] GET   %-4s %-30s %10s" % (i, kind, name[:28], human_size(size)))
 
         if kind == "回放":
-            res = lms_live.download(op, it["url"], path, expect=size,
-                                    retries=args.retries, quiet=args.quiet)
+            # ★ Round 13：条目里**不带** replay URL —— 它是时效凭据。真正要下载
+            #   之前才现解析一次（`url_provider`），401/403 时 download() 会再
+            #   调一次。这样 token 从不落进条目 / 索引 / 清单 / 日志。
+            _aid = it.get("uid")
+            _cid = it.get("camera_id")
+            _cty = it.get("camera")
+
+            def _provider(_aid=_aid, _cid=_cid, _cty=_cty):
+                return lms_live.resolve_replay_url(
+                    op, _aid, camera_id=_cid, camera_type=_cty,
+                    detail=detail_cache.get(str(_aid)), base=BASE)
+
+            res = lms_live.download(
+                op, None, path, expect=size,
+                retries=args.retries, quiet=args.quiet,
+                url_provider=_provider,
+                base_identity=(size or None, None))
         else:
             res = download(op, it["uid"], path, size,
                            retries=args.retries, quiet=args.quiet)
@@ -1127,11 +1266,10 @@ def main():
             #   这里，所以索引里的 size 天然可信。
             if kind == "回放" and res.get("verified_size"):
                 key = identity_key(it, args.course)
-                rec = dict(index.get(key) or {})
-                rec.update({"path": _rel_split(os.path.relpath(path, args.out)),
-                            "name": name,
-                            "size": int(res["verified_size"])})
-                index[key] = rec
+                merge_index_entry(
+                    index, key,
+                    _rel_split(os.path.relpath(path, args.out)), name,
+                    size=res["verified_size"])
             rows.append({"i": i, "kind": kind, "activity": act, "name": name,
                          "size": res["size"], "dir": rel, "status": STATUS_OK,
                          "sha256": res["sha256"],
@@ -1165,14 +1303,28 @@ def print_auth_hint(n, course):
           "python lms_login.py --course %s" % (n, course), file=sys.stderr)
 
 
-def expand_items(op, keys, args):
+def expand_items(op, keys, args, excl=None, detail_cache=None):
     """把 collect() 的 (kind, act, uid) 展开成可下载条目。
 
     - 普通附件：uid 就是 upload id，取一次元信息拿文件名和大小
     - 回放（uid 是负数）：每个负数对应一个 lecture_live 活动，展开成多路机位
 
     返回 (items, errors)。每个 item 形如
-        {kind, activity, name, uid, size, url?, error?, err_kind?}
+        {kind, activity, name, uid, size, error?, err_kind?}
+
+    ★ `--exclude` 在这里就生效（excl 是编译好的正则）：**命名先于探测** ——
+    文件名只依赖活动元数据（title + start_time + 机位），不需要探测，所以命中
+    排除的条目直接标 `excluded=True` 并**立刻返回，不 probe、不碰 replay URL**。
+    以前是「先无条件 probe 再判排除」，于是被排除条目也会探测，探测一失败就
+    带上 error → 之后被判 fail → 影响退出码（实测一个被排除条目 502 触发 exit 4）。
+
+    匹配语义与以前完全一致：同一条正则、同一个最终文件名、同样 re.search。
+
+    可达边界（记录在案，不修）：条目的文件名来自平台元数据，所以「判断是否
+    被排除」必然发生在元数据之后。保证的是「元数据落定后零媒体请求」。
+    元数据本身取不到的活动（scan_error_items 的 `<title>-回放` 占位名）不标
+    excluded → 仍按 fail 报出来 —— 我们无法证明它的最终文件名会命中正则，
+    「可能被排除」不等于「被排除」，不能让接口抖动借排除之名消失。
 
     error 字段：None 正常；ERR_UNAVAILABLE 的资源标 unavailable=True（跳过）；
     其余错误（ERR_AUTH / ERR_TRANSIENT）标 error=True，调用方必须计入失败。
@@ -1188,32 +1340,42 @@ def expand_items(op, keys, args):
                               "err_kind": kind_err, "err_msg": err.get("msg"),
                               "unavailable": kind_err == ERR_UNAVAILABLE})
                 continue
+            name = safe(m.get("name") or ("upload_%s" % uid))
+            if excl and excl.search(name):
+                items.append({"kind": kind, "activity": act, "uid": uid,
+                              "name": name, "size": 0, "excluded": True})
+                continue
             items.append({
                 "kind": kind, "activity": act, "uid": uid,
-                "name": safe(m.get("name") or ("upload_%s" % uid)),
+                "name": name,
                 "size": m.get("size") or 0,
             })
             continue
 
         # 回放：uid 存的是活动 id 的负数
         act_id = -uid
-        try:
-            d = get_json(op, "%s/api/activities/%s?sub_course_id=0" % (BASE, act_id))
-        except urllib.error.HTTPError as e:
-            err = classify_http(e.code)
-            items.append({"kind": kind, "activity": act, "uid": act_id,
-                          "name": "%s-回放" % act, "error": True,
-                          "err_kind": err["kind"], "err_msg": err["msg"],
-                          "unavailable": err["kind"] == ERR_UNAVAILABLE})
-            continue
-        except Exception as e:
-            print("  回放详情失败 %s: %s" % (act_id, str(e)[:50]))
-            items.append({"kind": kind, "activity": act, "uid": act_id,
-                          "name": "%s-回放" % act, "error": True,
-                          "err_kind": ERR_TRANSIENT,
-                          "err_msg": "%s: %s" % (type(e).__name__, str(e)[:50]),
-                          "unavailable": False})
-            continue
+        d = (detail_cache or {}).get(str(act_id))
+        if d is None:
+            try:
+                d = get_json(op, "%s/api/activities/%s?sub_course_id=0"
+                                 % (BASE, act_id))
+            except urllib.error.HTTPError as e:
+                err = classify_http(e.code)
+                items.append({"kind": kind, "activity": act, "uid": act_id,
+                              "name": "%s-回放" % act, "error": True,
+                              "err_kind": err["kind"], "err_msg": err["msg"],
+                              "unavailable": err["kind"] == ERR_UNAVAILABLE})
+                continue
+            except Exception as e:
+                print("  回放详情失败 %s: %s" % (act_id, str(e)[:50]))
+                items.append({"kind": kind, "activity": act, "uid": act_id,
+                              "name": "%s-回放" % act, "error": True,
+                              "err_kind": ERR_TRANSIENT,
+                              "err_msg": "%s: %s" % (type(e).__name__, str(e)[:50]),
+                              "unavailable": False})
+                continue
+            if detail_cache is not None:
+                detail_cache[str(act_id)] = d
 
         reps = lms_live.parse_replay(d)
         if not reps:
@@ -1237,8 +1399,18 @@ def expand_items(op, keys, args):
         stamp = lms_live.start_stamp(d)
 
         for r in reps:
-            p = lms_live.probe(op, r["url"])
+            # ★ 命名先于探测：文件名只依赖元数据，先算出来才能判断 exclude。
+            #   命中排除的条目在这里就返回 —— **不 probe、不碰 replay URL**，
+            #   于是它的网络状态（502 / 403 / 超时）永远够不到 fail 与退出码。
             name = lms_live.safe_name(act, r["camera_type"], stamp=stamp)
+            if excl and excl.search(name):
+                items.append({"kind": kind, "activity": act, "uid": act_id,
+                              "name": name, "size": 0, "excluded": True,
+                              "camera": r["camera_type"],
+                              "camera_id": r.get("camera_id")})
+                continue
+
+            p = lms_live.probe(op, r["url"])
             if p.get("ok"):
                 err_kind = err_msg = None
             else:
@@ -1250,7 +1422,7 @@ def expand_items(op, keys, args):
             item = {
                 "kind": kind, "activity": act, "uid": act_id,
                 "name": name, "size": p.get("size") or 0,
-                "url": r["url"], "camera": r["camera_type"],
+                "camera": r["camera_type"],
                 "camera_id": r.get("camera_id"),
                 "error": not p.get("ok"),
                 "err_kind": err_kind, "err_msg": err_msg,
@@ -1420,6 +1592,58 @@ def _refuse(msg):
     raise IndexCorruptError("%s（原文件未改动）" % msg)
 
 
+def _entry_size(raw):
+    """索引条目里的「经稳定窗口确认的 size」；拿不出可信整数就返回 None。
+
+    ★ 为什么 size 不做 fail-closed（不像 path 越界那样拒绝整份）：
+    path 坏了 = 该身份的 canonical_path 被遗忘 = 资源可能被别的东西
+    冒领，必须停下；而 size 只是「有没有可信完成值」，丢了它只会退回
+    「本轮远端探测 + 精确比对」——那正是老索引（只有 path/name）走的路，
+    不会让任何字节写错。为它拒绝下载属于过度反应。
+
+    ★ 为什么必须容忍字符串：索引是给人看、也允许人工核对的落盘文件，
+    手改成 "133691967" 不该让整份索引作废，按数值收下即可。
+    非正数 / 非数字 / bool 一律当作「无可信 size」丢弃，绝不猜。
+    """
+    if isinstance(raw, bool):
+        return None
+    if isinstance(raw, int):
+        return raw if raw > 0 else None
+    if isinstance(raw, str):
+        s = raw.strip()
+        if s.isdigit():
+            n = int(s)
+            return n if n > 0 else None
+    return None
+
+
+def merge_index_entry(index, key, rel, name, size=None):
+    """写入 / 更新一条索引记录，并保留与身份仍然相关的已有字段。
+
+    ★ 索引条目是「这个身份的字段集合」，不是「当前位置的快照」：
+    `size` 是下载侧经稳定窗口确认的完成真值，不能因为某条无关代码路径
+    重新算了一次 path 就被顺手抹掉 —— loader 正是这么把 size 弄丢的
+    （把条目规范化成 {path, name} 两项），后果是 indexed_size() 永远
+    返回 None、可信 size 路径整个失效。
+
+    ★ 只有一处入口，是为了不再出现「三个地方各自记得保留 size」这种
+    必须同时正确才不会漏的约定。路径真的变了（换名另存 / 重新分配）
+    意味着旧 size 不再指向同一个文件，显式丢弃。
+    """
+    old = index.get(key) or {}
+    rec = dict(old)
+    rec.update({"path": rel, "name": name})
+    if size is not None:
+        rec["size"] = int(size)
+    else:
+        n = _entry_size(old.get("size")) if old.get("path") == rel else None
+        if n is not None:
+            rec["size"] = n
+        else:
+            rec.pop("size", None)
+    index[key] = rec
+
+
 def load_download_index(out_dir):
     """读输出目录里的身份索引。
 
@@ -1440,6 +1664,10 @@ def load_download_index(out_dir):
     单条 path 越界 / 非法：属于已知格式中的坏数据，整份 fail-closed
     （改名保留现场 + 拒绝下载）——「丢弃单条」等于静默遗忘该身份的
     canonical_path，违反 fail-closed。
+
+    ★ 字段往返完整性：loader 必须把条目里的 `size`（下载侧经稳定窗口
+    确认的完成真值）原样带出来。它只经过 _entry_size() 的形状校验，
+    坏值按「无可信 size」丢弃而不是拒绝整份（理由见 _entry_size）。
     """
     p = os.path.join(out_dir, INDEX_NAME)
     if not os.path.exists(p):
@@ -1505,7 +1733,18 @@ def load_download_index(out_dir):
             problems.append("条目 %s 的 canonical path 越界或非法（%r）"
                             % (k, v.get("path")))
             continue
-        out[k] = {"path": rel, "name": str(v.get("name") or "")}
+        # ★ size 必须原样带出来：它是 verify_tail() 确认过的完成真值，
+        #   是后续增量判据的唯一可信来源。以前这里把条目规范化成
+        #   {"path", "name"} 两项，等于每轮加载都把上一轮写下的
+        #   verified_size 抹掉 —— indexed_size() 因此永远返回 None，
+        #   「回放优先用索引里的可信 size」这条路径整个成了死代码，
+        #   增量判定每次都退回「依赖本轮远端探测」，转码期远端抖动就会
+        #   让已经完成的文件被判重下 / 判失败。
+        rec = {"path": rel, "name": str(v.get("name") or "")}
+        n = _entry_size(v.get("size"))
+        if n is not None:
+            rec["size"] = n
+        out[k] = rec
     if problems:
         _rename_and_raise("; ".join(problems[:5]))
     return out
@@ -1590,7 +1829,7 @@ def assign_canonical_paths(items, index, args, course):
         it["_fresh"] = True        # 下载时走覆盖守卫（防存量文件误伤）
         rel = _rel_split(os.path.relpath(
             os.path.join(dest, it["name"]), args.out))
-        index[identity_key(it, course)] = {"path": rel, "name": it["name"]}
+        merge_index_entry(index, identity_key(it, course), rel, it["name"])
     return items, fixed
 
 
@@ -1612,6 +1851,18 @@ def build_rows(op, items, excl, args, quiet=False, index=None):
         act = it["activity"]
         name = it["name"]
         size = it.get("size") or 0
+        # ★ 排除优先于错误：被排除条目的网络状态不得把它升级成 fail。
+        #   判的是 expand_items 标下的 `excluded` 标记（那时文件名已是最终名），
+        #   不是在这里重跑一次正则 —— 重跑会让扫描失败的占位名
+        #   （`<title>-回放`）也可能被排除，把接口抖动伪装成「用户排除了」。
+        if it.get("excluded"):
+            rows.append({"i": i, "kind": kind, "activity": act,
+                         "uid": it.get("uid"), "name": name,
+                         "status": STATUS_EXCLUDED})
+            if not quiet:
+                print("[%2d] %-7s %-4s %-30s %10s"
+                      % (i, STATUS_EXCLUDED, kind, name[:28], human_size(size)))
+            continue
         if it.get("error"):
             row = error_row(i, it)
             rows.append(row)
