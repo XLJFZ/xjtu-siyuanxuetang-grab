@@ -57,8 +57,12 @@ build/
 
 # 维护侧文件 —— 只在本机工作区用，不进仓库、不进 Release 包。
 # （release.py 本身是例外：它随包分发，所以不在下面这组里。）
+#
+# ★ 必须写成 /gh_push_dir.py 而不是 gh_push_dir.py：不带斜杠的写法会匹配
+#   任意层级，把随仓库分发的 tools/gh_push_dir.py 一起忽略掉（v1.4.2 起
+#   推送器已挪进仓库 tools/，仓库根这份是旧版遗留，留着只为对照）。
 _notes/
-gh_push_dir.py
+/gh_push_dir.py
 push_docs.py
 _tmp/
 _local_backup/

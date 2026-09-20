@@ -16,12 +16,19 @@
   ③ **速度会衰减。** 起始阶段能吃服务端缓存，之后降到实时转码速度。
      单节录像可达数百 MB，耗时明显长于普通附件。
 
-关于完整性：服务端声明的 Content-Length 与实得字节数可能存在小幅差异。
-处理方式：不静默吞掉，而是显式比对「服务端声明的总长」与「实得字节数」。
-差异在 SHORT_TOLERANCE 以内视作正常下载；**超出阈值直接判失败**，不落盘成
-最终文件、保留 .part 供下次续传 —— 否则截断的视频会被当成完整文件永久留下，
-下次运行还会因为「文件已存在」被跳过。校验只能用「实得字节数 vs 声明总长」
-这种相对判据 —— 拿不到官方哈希。
+关于完整性（v1.4.2 起是「稳定窗口校验」）：服务端声明的 Content-Length /
+Content-Range 总长**不是**完成真值 —— 回放还在转码时这个数会随时间增长，
+一次 GET 读到 EOF 与紧随其后的一次探测完全可能看到同一个旧长度。
+所以完成判据只有一个：
+
+    本次实得字节数 == 经稳定窗口确认的远端最终 size
+
+下载到 EOF 后周期性探测远端对象的 (size, ETag/Last-Modified)，只有它连续
+TAIL_STABLE_SECONDS 不再变化、且 size 恰等于本地实得字节数，才允许把 .part
+改名成最终文件。**任何「尺寸差不多就相信」的比例容差都已删除** —— 旧版按
+8% 短读容差接受，会把转码中途的快照永久留在磁盘上，下次运行还会因为
+「文件已存在」被跳过。校验只能用「远端对象身份」这种相对判据 ——
+拿不到官方哈希。
 """
 import hashlib
 import datetime
@@ -40,9 +47,33 @@ CHUNK = 256 * 1024
 # 用固定偏移而非 zoneinfo：兼容 Python 3.8，且不依赖 Windows 上的 tzdata。
 _CST = datetime.timezone(datetime.timedelta(hours=8))
 
-# 实得字节数相对 Content-Length 允许少多少而不判失败。
-# 观察到的自然短读通常在 8% 以内，取此值留出余量；超出就说明这次真的没下完。
-SHORT_TOLERANCE = 0.08
+# ---- 完成判据：稳定窗口（v1.4.2 起，取代旧的短读比例容差）----
+# 远端对象必须连续这么久不再变化，它的 size 才被认定为「最终大小」。
+TAIL_STABLE_SECONDS = 60
+# 两次探测之间的间隔（秒）。
+TAIL_PROBE_INTERVAL = 20
+# 单次稳定窗口校验的最长等待。超时即判失败并保留 .part（下次续传）——
+# 不把「还在转码」硬等成完成。
+TAIL_MAX_WAIT = 300
+# 一次下载里「远端比本地大 → 续传追平 → 重新校验」的最大轮数：
+# 转码中的对象会持续增长，轮数用来兜住「永远追不上」的情况。
+TAIL_MAX_ROUNDS = 5
+# 单次探测的超时。
+PROBE_TIMEOUT = 45
+
+
+def monotonic():
+    """时钟钩子 —— 测试注入虚拟时钟，默认 time.monotonic。
+
+    稳定窗口的判定必须基于**时间戳差**，不能写成「连续 N 次探测相同」：
+    后者会让稳定语义跟着探测间隔一起变，调一下间隔就偷偷改了判据。
+    """
+    return time.monotonic()
+
+
+def nap(seconds):
+    """等待钩子 —— 测试注入假 sleeper，默认 time.sleep。"""
+    time.sleep(seconds)
 
 
 def parse_replay(activity_data):
@@ -102,27 +133,172 @@ def start_stamp(activity):
     return None
 
 
-def probe(op, url, timeout=45):
-    """轻量探测：拿 Content-Length 判断体积，用于干跑。
+def probe_remote(op, url, timeout=PROBE_TIMEOUT):
+    """探测远端对象当前的 size 与校验器 —— 完成判定的唯一真值来源。
 
-    只发一个请求，取完头部就断开——不要读 body，否则触发限流。
+    ★ 为什么用 `Range: bytes=0-0` 而不是 HEAD：HEAD 在这个 LMS/CDN 上不保证
+    可靠，而 Range 请求走的是与实际下载**同一条路径**，返回的
+    `Content-Range: bytes 0-0/N` 里的 N 就是对象当前总长，比 HEAD 的
+    Content-Length 更接近真实。服务端忽略 Range 时退化为整体 Content-Length。
+
+    只取响应头就断开，不读 body（读 body 会触发限流，见模块开头 ①）。
+
+    返回 {"ok", "size", "etag", "mtime", "err", "code"}
+      ok=False 只表示「没拿到响应」（HTTP 错误 / 网络异常）；
+      ok=True 且 size=None 表示响应正常但响应头里没有可用长度。
     """
+    out = {"ok": False, "size": None, "etag": None, "mtime": None,
+           "err": None, "code": None}
     req = urllib.request.Request(url)
     for k, v in getattr(op, "addheaders", []) or []:
         req.add_header(k, v)
+    req.add_header("Range", "bytes=0-0")
     try:
         r = op.open(req, timeout=timeout)
-        size = r.headers.get("Content-Length")
+    except urllib.error.HTTPError as e:
+        out["code"] = e.code
+        if e.code == 416:
+            # 416 = 请求区间不可满足。RFC 7233 要求此时带
+            # `Content-Range: bytes */N`，N 就是对象长度（0 长度对象也会回 416）。
+            # 这是标准获取长度的途径，不能当成「探测失败」。
+            hdr = getattr(e, "headers", None) or {}
+            m = re.search(r"/(\d+)\s*$",
+                          str(hdr.get("Content-Range", "") or "").strip())
+            if m:
+                out["ok"] = True
+                out["size"] = int(m.group(1))
+                out["etag"] = hdr.get("ETag")
+                out["mtime"] = hdr.get("Last-Modified")
+                return out
+        out["err"] = "HTTP %d" % e.code
+        return out
+    except Exception as e:
+        out["err"] = "%s %s" % (type(e).__name__, str(e)[:60])
+        return out
+    try:
+        hdr = r.headers
+        size = None
+        cr = hdr.get("Content-Range")
+        if cr:
+            m = re.search(r"/(\d+)\s*$", cr.strip())
+            if m:
+                size = int(m.group(1))
+        if size is None and hdr.get("Content-Length"):
+            try:
+                size = int(hdr["Content-Length"])
+            except ValueError:
+                size = None
+        out["ok"] = True
+        out["size"] = size
+        out["etag"] = hdr.get("ETag")
+        out["mtime"] = hdr.get("Last-Modified")
+    finally:
         try:
             r.close()
         except Exception:
             pass
-        return {"ok": True, "size": int(size) if size else None,
-                "ranges": bool(r.headers.get("Accept-Ranges"))}
-    except urllib.error.HTTPError as e:
-        return {"ok": False, "err": "HTTP %d" % e.code, "code": e.code}
-    except Exception as e:
-        return {"ok": False, "err": str(e)[:80]}
+    return out
+
+
+def probe(op, url, timeout=PROBE_TIMEOUT):
+    """干跑 / 清单阶段的体积探测 —— 与 probe_remote 走同一条路径。
+
+    保持旧返回形状（ok / size / err / code），调用方（lms_fetch.expand_items）
+    不需要知道探测细节。拿不到长度不是错误：size 留 None，
+    交给 has_expected_size() 判定「没有可靠声明大小」。
+    """
+    r = probe_remote(op, url, timeout=timeout)
+    if r["ok"]:
+        return {"ok": True, "size": r["size"]}
+    return {"ok": False, "size": None, "err": r["err"], "code": r["code"]}
+
+
+def verify_tail(op, url, got, quiet=False, clock=None, sleep=None,
+                stable_seconds=None, interval=None, max_wait=None):
+    """稳定窗口校验 —— 回放下载的**唯一**完成判据。
+
+    ★ 为什么必须有时间窗口：「读到 EOF」不是完成证据。回放服务端在转码期间
+    会持续追加对象字节，一次 GET 的 EOF 与紧随其后的一次探测完全可能看到
+    同一个旧长度，10 秒后对象才变成 N+Δ。只探一次就把转码中途的快照认成
+    最终文件，这正是旧版 8% 短读容差漏洞的等价形式。
+    所以：远端 (size, ETag/Last-Modified) 必须连续 stable_seconds 不变。
+
+    ★ 稳定计时用时钟时间戳（默认 time.monotonic，测试注入虚拟时钟），
+    不是「连续 N 次探测结果相同」—— 后者会让稳定语义随探测间隔漂移。
+
+    返回
+      {"ok": True,  "size", "identity", "probes"}
+      {"ok": False, "reason": "larger",         "remote", "err"}  远端更大 → 调用方续传
+      {"ok": False, "reason": "remote_smaller", "remote", "err"}  远端更小 → 不截断本地
+      {"ok": False, "reason": "gone",           "err"}            404 / 410
+      {"ok": False, "reason": "timeout",        "remote", "err"}  窗口内未稳定 / 探测失败
+    """
+    _clock = clock or monotonic
+    _nap = sleep or nap
+    stable_seconds = (TAIL_STABLE_SECONDS if stable_seconds is None
+                      else stable_seconds)
+    interval = TAIL_PROBE_INTERVAL if interval is None else interval
+    max_wait = TAIL_MAX_WAIT if max_wait is None else max_wait
+
+    start = _clock()
+    last_key = None
+    stable_since = None
+    prev_time = None
+    probes = 0
+    last_size = None
+    last_err = None
+
+    while True:
+        p = probe_remote(op, url)
+        probes += 1
+        now = _clock()
+
+        if not p["ok"]:
+            if p.get("code") in (404, 410):
+                return {"ok": False, "reason": "gone", "remote": None,
+                        "err": "远端对象已消失（HTTP %d）" % p["code"]}
+            # 探测失败不是「稳定」的证据：清掉稳定计时，继续等到超时
+            last_err = p.get("err") or "远端探测失败"
+            stable_since = None
+            last_key = None
+        elif p["size"] is None:
+            last_err = "远端未给出长度（响应头里没有可用的 size）"
+            stable_since = None
+            last_key = None
+        else:
+            size = p["size"]
+            last_size = size
+            if size < got:
+                return {"ok": False, "reason": "remote_smaller", "remote": size,
+                        "err": "远端对象 %d 字节 < 本次实得 %d 字节"
+                               "（远端换对象或收缩，不截断本地后接受）"
+                               % (size, got)}
+            if size > got:
+                return {"ok": False, "reason": "larger", "remote": size,
+                        "err": "远端 %d 字节 > 本地 %d 字节" % (size, got)}
+            key = (size, p.get("etag") or p.get("mtime"))
+            if key == last_key:
+                if stable_since is None:
+                    stable_since = prev_time
+            else:
+                # 对象换了（哪怕长度相同也可能换了内容）→ 稳定计时重来
+                stable_since = None
+                last_key = key
+            if stable_since is not None and (now - stable_since) >= stable_seconds:
+                return {"ok": True, "size": size, "identity": key,
+                        "probes": probes}
+
+        prev_time = now
+        if (now - start) >= max_wait:
+            return {"ok": False, "reason": "timeout", "remote": last_size,
+                    "err": "远端在 %d 秒内未稳定（最后 size=%s%s）"
+                           % (max_wait,
+                              last_size if last_size is not None else "未知",
+                              ("，" + last_err) if last_err else "")}
+        if not quiet:
+            print("      远端校验中（%d 次探测，已等 %ds/%ds）"
+                  % (probes, int(now - start), int(max_wait)), flush=True)
+        _nap(interval)
 
 
 def _open_range(op, url, offset, timeout=120):
@@ -152,33 +328,50 @@ def _open_range(op, url, offset, timeout=120):
 
 
 def download(op, url, path, expect=None, retries=3, quiet=False,
-             on_progress=None):
-    """下载一段回放，支持断点续传。
+             on_progress=None, clock=None, sleep=None):
+    """下载一段回放：支持断点续传，落盘前必须通过稳定窗口校验。
 
     与 lms_fetch.download 的关键差异：
       - 串行请求，失败后退避重试（绝不并发）
       - Range 起点以 Content-Range 为准（服务端会扩大）
-      - 不做整体 sha256 比对（拿不到官方哈希），只做大小合理性检查
+      - 不做整体 sha256 比对（拿不到官方哈希）
+      - ★ 完成判据是「远端最终 size == 本次实得字节数」，见 verify_tail()
 
-    返回 {ok, size, sha256, err, retried, resumed, declared, shortfall, note}
-    declared  : 服务端声明的总字节数（Content-Range 总长，拿不到为 None）
-    shortfall : 实得比声明少了多少比例（拿不到声明总长时为 None）
-    note      : 人可读的补充说明，正常时为 None
+    expect : 声明总长的**提示值**，只用于诊断。它不参与完成判定 —— 回放转码
+             期间这个数会变，拿它当完成真值就是旧版 8% 容差漏洞的根源。
+    clock / sleep : 注入钩子，便于离线测试用虚拟时钟
+             （默认 time.monotonic / time.sleep）。
+
+    返回 {ok, size, sha256, verified_size, identity, probes, retried, resumed,
+          declared, shortfall, note}
+    verified_size : 经稳定窗口确认的远端最终 size（成功时必等于 size）
+    identity      : (size, ETag/Last-Modified)，拿不到校验器时为 (size, None)
+    declared      : 响应头里声明的总长（传输提示，拿不到为 None）
+    shortfall     : 实得比 declared 少多少比例（诊断用，拿不到为 None）
+    note          : 人可读的补充说明，正常时为 None
+    失败返回       {ok: False, err, kept_part, reason, size, declared, shortfall}
     """
     tmp = path + ".part"
     last_err = None
     used_resume = False
+    declared_hint = None
+    attempt = 0
+    tail_rounds = 0
+    _nap = sleep or nap
 
-    for attempt in range(retries):
+    def _spent():
+        """transport 级失败记账：返回 True 表示重试次数已用尽。"""
+        nonlocal attempt
+        attempt += 1
+        return attempt >= retries
+
+    while True:
         offset = 0
         if os.path.exists(tmp):
+            # ★ 不再因为「.part 已经不小于声明总长」就删掉它：声明值在转码期间
+            #   会变，删掉等于把已经下对的前缀白白扔掉。真出现「本地比远端还长」
+            #   由 416 与稳定窗口的 remote_smaller 分支显式判失败。
             offset = os.path.getsize(tmp)
-            if expect and offset >= expect:
-                offset = 0
-                try:
-                    os.remove(tmp)
-                except OSError:
-                    pass
 
         try:
             r, start, status = _open_range(op, url, offset)
@@ -218,19 +411,20 @@ def download(op, url, path, expect=None, retries=3, quiet=False,
                 except Exception:
                     pass
                 last_err = "续传缺口（请求 %d 服务端从 %d 起）" % (offset, start)
-                if attempt < retries - 1:
+                if not _spent():
                     # 还有机会：残片已经和任何请求都对不齐了，留着只会让下一轮
                     # 继续撞缺口，丢掉、下一轮从 0 完整重下。
                     try:
                         os.remove(tmp)
                     except OSError:
                         pass
-                    time.sleep(3 * (attempt + 1))
+                    _nap(3 * attempt)
                     continue
                 # ★ 已经是最后一次：这次响应不能用，但原有的 .part 仍是
                 #   一段有效前缀。此时删掉等于白白丢掉已经下对的部分，
                 #   用户下次只能从头再来 —— 保留它，并把失败如实报上去。
-                return {"ok": False, "err": last_err, "kept_part": True}
+                return {"ok": False, "err": last_err, "kept_part": True,
+                        "reason": "gap"}
 
             total = None
             cr = r.headers.get("Content-Range")
@@ -309,10 +503,11 @@ def download(op, url, path, expect=None, retries=3, quiet=False,
                         break
 
             if stalled:
-                if attempt < retries - 1:
-                    time.sleep(3 * (attempt + 1))
+                if not _spent():
+                    _nap(3 * attempt)
                     continue
-                return {"ok": False, "err": last_err, "kept_part": True}
+                return {"ok": False, "err": last_err, "kept_part": True,
+                        "reason": "stalled"}
 
             if got < 1024:
                 try:
@@ -320,44 +515,64 @@ def download(op, url, path, expect=None, retries=3, quiet=False,
                 except OSError:
                     pass
                 last_err = "只有 %d 字节，疑似空响应" % got
-                if attempt < retries - 1:
-                    time.sleep(3 * (attempt + 1))
+                if not _spent():
+                    _nap(3 * attempt)
                     continue
-                return {"ok": False, "err": last_err}
+                return {"ok": False, "err": last_err, "reason": "empty"}
 
-            # ---- 完整性判定：必须先于落盘 ----
-            # 拿得到服务端声明总长时，短读超过容差就不算成功：
-            #   * 不 rename 成最终 mp4（否则下次运行会因「文件已存在」跳过，
-            #     截断的视频被当完整文件永久留在磁盘上）
-            #   * 保留 .part，下次可续传
-            declared = None
+            # ---- 完成判定：必须先于落盘 ----
+            # ★ v1.4.2 起唯一的完成判据：本次实得字节数 == 经稳定窗口确认的
+            #   远端最终 size。declared 只是传输提示（差异写进 note 供诊断），
+            #   不再有任何「比例容差」旁路。
+            declared = total or expect or declared_hint
             shortfall = None
             note = None
-            truncated = False
-            if total and total > 0:
-                declared = total
-                shortfall = max(0.0, (total - got) / float(total))
-                if shortfall > SHORT_TOLERANCE:
-                    truncated = True
-                    note = ("实得 %d 字节，服务端声明 %d 字节，少 %.1f%%"
-                            % (got, total, shortfall * 100))
+            if declared:
+                declared_hint = declared
+                if declared > 0:
+                    shortfall = max(0.0, (declared - got) / float(declared))
+                    if shortfall > 0:
+                        note = ("实得 %d 字节，响应头声明 %d 字节（少 %.1f%%）；"
+                                "完成与否以稳定窗口确认的远端 size 为准"
+                                % (got, declared, shortfall * 100))
 
-            if truncated:
-                last_err = note
-                if attempt < retries - 1:
-                    time.sleep(3 * (attempt + 1))
-                    continue
-                # 重试用尽仍是残缺：判定失败，把 .part 留给下次续传
-                return {"ok": False, "err": note, "kept_part": True,
+            vt = verify_tail(op, url, got, quiet=quiet, clock=clock, sleep=sleep)
+            if vt["ok"]:
+                os.replace(tmp, path)
+                return {"ok": True, "size": got, "sha256": h.hexdigest(),
+                        "verified_size": vt["size"], "identity": vt["identity"],
+                        "probes": vt["probes"],
+                        "retried": attempt, "resumed": used_resume,
                         "declared": declared, "shortfall": shortfall,
-                        "size": got, "partial": True}
+                        "note": note}
 
-            os.replace(tmp, path)
-            return {"ok": True, "size": got, "sha256": h.hexdigest(),
-                    "retried": attempt, "resumed": used_resume,
-                    "declared": declared, "shortfall": shortfall, "note": note}
+            if vt.get("reason") == "larger":
+                # 远端比本地大 → 续传追平，EOF 后重新进入稳定窗口
+                tail_rounds += 1
+                if tail_rounds < TAIL_MAX_ROUNDS:
+                    if not quiet:
+                        print("      远端 %s 字节 > 本地 %s 字节，继续续传（第 %d 轮）"
+                              % (vt.get("remote"), got, tail_rounds), flush=True)
+                    continue
+                last_err = ("远端仍在增长：%d 轮续传未收敛（远端 %s / 本地 %s）"
+                            % (tail_rounds, vt.get("remote"), got))
+                return {"ok": False, "err": last_err, "kept_part": True,
+                        "reason": "growing", "size": got,
+                        "declared": declared, "shortfall": shortfall}
+
+            # gone / remote_smaller / timeout：一律失败并保留 .part
+            return {"ok": False, "err": vt["err"], "kept_part": True,
+                    "reason": vt.get("reason"), "size": got,
+                    "declared": declared, "shortfall": shortfall}
 
         except urllib.error.HTTPError as e:
+            if e.code == 416:
+                # 请求的起点已经在对象之外：本地 .part 比远端对象还长。
+                # 远端换了对象 / 收缩了 —— 不截断本地后接受，显式失败。
+                return {"ok": False, "kept_part": True,
+                        "reason": "remote_smaller",
+                        "err": "HTTP 416：本地已下 %d 字节超出远端对象长度"
+                               "（远端换对象或收缩）" % (offset or 0)}
             if e.code in (401, 403):
                 # 403 多半是并发或 token 限流。等一下再串行重试一次。
                 last_err = "HTTP %d（token 限流或失效）" % e.code
@@ -368,10 +583,12 @@ def download(op, url, path, expect=None, retries=3, quiet=False,
         except Exception as e:
             last_err = "%s %s" % (type(e).__name__, str(e)[:60])
 
-        if attempt < retries - 1:
-            time.sleep(4 * (attempt + 1))
+        if _spent():
+            break
+        _nap(4 * attempt)
 
-    return {"ok": False, "err": last_err or "未知错误", "kept_part": True}
+    return {"ok": False, "err": last_err or "未知错误", "kept_part": True,
+            "reason": "transport"}
 
 
 def cam_label(camera_type):

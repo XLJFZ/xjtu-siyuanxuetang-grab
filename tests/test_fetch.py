@@ -750,111 +750,354 @@ class TestManifest(Base):
         self.assertIn("status", head)
 
 
-class TestLiveShortRead(Base):
-    """回放下载的短读判定 —— lms_live 没有官方哈希可用，只能靠声明总长比对。
+class LiveClock:
+    """虚拟时钟 —— 稳定窗口的测试不需要真的等 60 秒。
 
-    回归背景：服务端声明的 Content-Length 与自然 EOF 实得字节数之间存在小幅差异，
-    旧实现静默接受，调用方无法分辨「正常的自然短读」和「真的没下完」。
+    verify_tail 用 time.monotonic 的时间戳差判定稳定，这里把「时间推进」
+    交给假 sleeper：sleep(n) 就是把虚拟时间往前推 n 秒。
     """
 
-    class _Op:
-        """假的 opener：直接给出 _open_range 的返回值形状。"""
+    def __init__(self):
+        self.t = 0.0
+        self.sleeps = 0
 
-        def __init__(self, body, content_range=None, headers=None):
-            self.body = body
-            self.content_range = content_range
-            self.headers = headers or {}
+    def now(self):
+        return self.t
 
-        def open(self, req, timeout=None):
-            h = {"Content-Type": "video/mp4"}
-            h.update(self.headers)
-            if self.content_range:
-                h["Content-Range"] = self.content_range
-            return FakeResponse(self.body, headers=h, status=206)
+    def sleep(self, seconds):
+        self.sleeps += 1
+        self.t += max(0.0, float(seconds))
 
-    def _dl(self, body_len, declared):
+
+class LiveServer:
+    """回放服务端的可编程假实现。
+
+    区分两类请求（回放服务端在真实环境里也是两条路径）：
+      - 下载请求（无 Range，或 Range: bytes=N-）→ 返回下一个 body
+      - 探测请求（Range: bytes=0-0）→ 只回响应头，size 取 probe_sizes 序列
+
+    probe_sizes / etags / lasts 耗尽后停在最后一个值（模拟「稳定」）；
+    也可以塞 Exception 进去模拟探测炸掉。
+    """
+
+    def __init__(self, bodies, probe_sizes=None, etags=None, lasts=None,
+                 declared=None, content_type="video/mp4"):
+        if isinstance(bodies, bytes):
+            bodies = [bodies]
+        self.bodies = list(bodies)
+        self.probe_sizes = None if probe_sizes is None else list(probe_sizes)
+        self.etags = None if etags is None else list(etags)
+        self.lasts = None if lasts is None else list(lasts)
+        self.declared = declared
+        self.content_type = content_type
+        self.gets = 0
+        self.probes = 0
+        self.range_headers = []
+
+    def _next(self, seq, n):
+        if seq is None:
+            return None
+        if not seq:
+            return None
+        return seq[min(n, len(seq) - 1)]
+
+    def open(self, req, timeout=None):
+        headers = {k.lower(): v for k, v in (req.headers or {}).items()}
+        rng = headers.get("range")
+        self.range_headers.append(rng)
+        if rng == "bytes=0-0":
+            size = self._next(self.probe_sizes, self.probes)
+            self.probes += 1
+            if isinstance(size, Exception):
+                raise size
+            if size is None:
+                return FakeResponse(b"", headers={
+                    "Content-Type": "video/mp4"}, status=206)
+            h = {"Content-Type": self.content_type,
+                 "Content-Range": "bytes 0-0/%d" % size}
+            tag = self._next(self.etags, self.probes - 1)
+            if tag:
+                h["ETag"] = tag
+            lm = self._next(self.lasts, self.probes - 1)
+            if lm:
+                h["Last-Modified"] = lm
+            return FakeResponse(b"x", headers=h, status=206)
+
+        body = self._next(self.bodies, self.gets)
+        self.gets += 1
+        if isinstance(body, Exception):
+            raise body
+        total = self.declared if self.declared is not None else len(body)
+        h = {"Content-Type": self.content_type,
+             "Content-Range": "bytes 0-%d/%d" % (len(body) - 1, total)}
+        return FakeResponse(body, headers=h, status=206)
+
+
+class LiveWindowBase(Base):
+    """注入虚拟时钟的回放测试基类 —— 窗口语义可断言，且不真等。"""
+
+    def setUp(self):
+        super().setUp()
+        self.clock = LiveClock()
+
+    def dl(self, op, path, **kw):
         import lms_live
-        op = self._Op(b"x" * body_len,
-                      content_range="bytes 0-%d/%d" % (body_len - 1, declared))
-        path = os.path.join(self.tmp, "r.mp4")
-        return lms_live.download(op, "http://r/x", path, retries=1, quiet=True)
+        kw.setdefault("retries", 1)
+        kw.setdefault("quiet", True)
+        return lms_live.download(op, "http://r/x", path,
+                                 clock=self.clock.now, sleep=self.clock.sleep,
+                                 **kw)
 
-    def test_normal_short_read_is_tolerated(self):
-        """实测的自然短读（约 5.6%）落在阈值内：算成功，但不给 note。"""
-        res = self._dl(944000, 1000000)          # 少 5.6%
-        self.assertTrue(res["ok"])
-        self.assertEqual(res["size"], 944000)
-        self.assertEqual(res["declared"], 1000000)
-        self.assertAlmostEqual(res["shortfall"], 0.056, places=3)
-        self.assertIsNone(res["note"])
 
-    def test_excessive_short_read_fails(self):
-        """少得太多（超过阈值）必须判失败。
+class TestLiveTailVerification(LiveWindowBase):
+    """★ 回放完成判据：只有「实得字节 == 经稳定窗口确认的远端 size」才算完成。
 
-        回归背景：以前无论少多少都 return ok=True，还先 os.replace 落盘，
-        于是截断的视频被当成完整文件写进最终路径，下次运行因为「文件已存在」
-        直接跳过 —— 用户永远拿不到完整视频，日志里却是一片 OK。
+    回归背景：旧实现按「实得字节 vs 响应头声明总长」的比例容差判断
+    （8% 以内算成功）。声明值在转码期间会变，于是同一次下载在两套判据下
+    反复横跳，截断的视频也可能被当成完整文件永久留下。
+    """
+
+    def test_exact_body_needs_stable_window(self):
+        """等长也要过窗口 —— 只探一次不算数（转码端可能还要长）。"""
+        import lms_live
+        op = LiveServer(b"x" * 4096, probe_sizes=[4096], etags=["v1"])
+        path = os.path.join(self.tmp, "a.mp4")
+        res = self.dl(op, path)
+        self.assertTrue(res["ok"], res.get("err"))
+        self.assertEqual(res["verified_size"], 4096)
+        self.assertEqual(res["identity"], (4096, "v1"))
+        self.assertGreaterEqual(res["probes"], 2, "必须探测两次以上")
+        self.assertGreaterEqual(self.clock.t, lms_live.TAIL_STABLE_SECONDS,
+                                "接受前必须真的等满稳定窗口")
+        self.assertEqual(os.path.getsize(path), 4096)
+        self.assertEqual(op.gets, 1, "确认通过不该再重下整份")
+
+    def test_transport_failures_still_use_retry_budget(self):
+        """稳定窗口的引入不能吃掉 transport 级重试：超时仍按 retries 重来。"""
+        op = LiveServer([socket.timeout("t"), socket.timeout("t"),
+                         b"x" * 4096], probe_sizes=[4096])
+        path = os.path.join(self.tmp, "retry.mp4")
+        res = self.dl(op, path, retries=3)
+        self.assertTrue(res["ok"], res.get("err"))
+        self.assertEqual(res["retried"], 2, "两次超时都应被如实记账")
+        self.assertEqual(op.gets, 3)
+
+    def test_window_is_time_based_not_probe_count(self):
+        """稳定语义按**时间差**，不是「连续 N 次一样」。
+
+        探测间隔 70s > 稳定阈值 60s 时，第二次探测就应认定稳定 ——
+        如果实现写成「连续 3 次相同」，这个用例会失败。
         """
-        res = self._dl(500000, 1000000)          # 少 50%
-        self.assertFalse(res["ok"])
-        self.assertIn("500000", res["err"])
-        self.assertIn("1000000", res["err"])
+        import lms_live
+        op = LiveServer(b"x" * 100, probe_sizes=[100])
+        r = lms_live.verify_tail(op, "http://r/x", 100,
+                                 clock=self.clock.now, sleep=self.clock.sleep,
+                                 stable_seconds=60, interval=70, max_wait=300)
+        self.assertTrue(r["ok"], r.get("err"))
+        self.assertEqual(r["probes"], 2, "按时间差判定时两次探测即够")
+
+    def test_short_read_is_not_tolerated_when_remote_is_bigger(self):
+        """★ 声明 1000000、实得 944000、远端仍是 1000000 → 必须判失败。
+
+        旧行为：944000/1000000 少 5.6%，落在 8% 容差内 → 判成功落盘。
+        新行为：远端最终 size 是 1000000，本地只有 944000 → 不给过。
+        """
+        op = LiveServer(b"x" * 944000, probe_sizes=[1000000],
+                        declared=1000000)
+        path = os.path.join(self.tmp, "short.mp4")
+        res = self.dl(op, path)
+        self.assertFalse(res["ok"], "远端 1000000 > 本地 944000，不能算完成")
+        self.assertFalse(os.path.exists(path), "不许落盘成最终文件")
+        self.assertTrue(os.path.exists(path + ".part"), ".part 必须保留续传")
+
+    def test_declared_smaller_than_body_is_ok(self):
+        """反向情形：响应头声明 1000000，但远端对象真的只有 944000。
+
+        旧行为按声明判「少 5.6%」可能放行或反复重试；新行为直接问远端 ——
+        远端就是 944000，与实得一致 → 完成。
+        """
+        op = LiveServer(b"x" * 944000, probe_sizes=[944000], declared=1000000)
+        path = os.path.join(self.tmp, "decl.mp4")
+        res = self.dl(op, path)
+        self.assertTrue(res["ok"], res.get("err"))
+        self.assertEqual(res["size"], 944000)
+        self.assertEqual(res["verified_size"], 944000)
         self.assertEqual(res["declared"], 1000000)
-        self.assertAlmostEqual(res["shortfall"], 0.5, places=3)
-        self.assertTrue(res.get("partial"))
+        self.assertIsNotNone(res["note"], "声明与实得的差异要记进 note")
+        self.assertAlmostEqual(res["shortfall"], 0.056, places=3)
 
-    def test_excessive_short_read_keeps_part(self):
-        """失败时不能落盘成最终文件，且 .part 要保留供下次续传。"""
+    def test_no_size_header_times_out(self):
+        """远端连长度都不给 → 无法确认完成，超时判失败（不猜）。"""
         import lms_live
-        op = self._Op(b"x" * 500000,
-                      content_range="bytes 0-499999/1000000")
-        path = os.path.join(self.tmp, "trunc.mp4")
-        res = lms_live.download(op, "http://r/x", path, retries=1, quiet=True)
+        op = LiveServer(b"x" * 5000, probe_sizes=[])
+        path = os.path.join(self.tmp, "nosize.mp4")
+        res = self.dl(op, path)
         self.assertFalse(res["ok"])
-        self.assertFalse(os.path.exists(path), "残缺文件不许落盘成最终文件")
-        self.assertTrue(os.path.exists(path + ".part"), ".part 应保留以便续传")
+        self.assertEqual(res["reason"], "timeout")
+        self.assertTrue(os.path.exists(path + ".part"))
+        self.assertFalse(os.path.exists(path))
 
-    def test_excessive_short_read_retries_then_fails(self):
-        """重试次数用尽后仍是残缺 → 失败。"""
+    def test_remote_smaller_fails_without_truncating(self):
+        """远端对象比本地还小 → 身份异常，失败；绝不截断本地后接受。"""
+        op = LiveServer(b"x" * 4096, probe_sizes=[3600])
+        path = os.path.join(self.tmp, "smaller.mp4")
+        res = self.dl(op, path)
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["reason"], "remote_smaller")
+        self.assertFalse(os.path.exists(path))
+        self.assertEqual(os.path.getsize(path + ".part"), 4096)
+
+    def test_probe_404_is_gone(self):
+        op = LiveServer(b"x" * 4096,
+                        probe_sizes=[http_err(404)])
+        path = os.path.join(self.tmp, "gone.mp4")
+        res = self.dl(op, path)
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["reason"], "gone")
+        self.assertTrue(os.path.exists(path + ".part"))
+
+    def test_probe_error_never_accepts(self):
+        """探测一直炸 → 不能「没证据就当完成」，超时失败。"""
+        op = LiveServer(b"x" * 4096, probe_sizes=[socket.timeout("x")])
+        path = os.path.join(self.tmp, "err.mp4")
+        res = self.dl(op, path)
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["reason"], "timeout")
+        self.assertFalse(os.path.exists(path))
+
+    def test_etag_change_resets_stability(self):
+        """长度相同但 ETag 变了（对象被替换）→ 稳定计时必须重来。"""
         import lms_live
-        calls = []
+        op = LiveServer(b"x" * 1000, probe_sizes=[1000],
+                        etags=["a", "a", "b", "b", "b", "b"])
+        r = lms_live.verify_tail(op, "http://r/x", 1000,
+                                 clock=self.clock.now, sleep=self.clock.sleep)
+        self.assertTrue(r["ok"], r.get("err"))
+        self.assertEqual(r["identity"], (1000, "b"))
+        self.assertEqual(r["probes"], 6, "换 ETag 之前累计的稳定时间不算数")
+
+    def test_identity_falls_back_to_last_modified(self):
+        """没有 ETag 时退化成 Last-Modified 当校验器。"""
+        import lms_live
+        op = LiveServer(b"x" * 100, probe_sizes=[100],
+                        lasts=["Wed, 01 Jan 2025 00:00:00 GMT"])
+        r = lms_live.verify_tail(op, "http://r/x", 100,
+                                 clock=self.clock.now, sleep=self.clock.sleep)
+        self.assertTrue(r["ok"], r.get("err"))
+        self.assertEqual(r["identity"],
+                         (100, "Wed, 01 Jan 2025 00:00:00 GMT"))
+
+    def test_growth_triggers_resume_then_accepts(self):
+        """远端比本地大 → 续传追平 → 重新走窗口，最终接受完整文件。"""
+        op = LiveServer([b"x" * 4096, b"x" * 4400],
+                        probe_sizes=[4096, 4400, 4400, 4400, 4400],
+                        etags=["v1"])
+        path = os.path.join(self.tmp, "grow.mp4")
+        res = self.dl(op, path)
+        self.assertTrue(res["ok"], res.get("err"))
+        self.assertEqual(res["size"], 4400)
+        self.assertEqual(res["verified_size"], 4400)
+        self.assertGreaterEqual(op.gets, 2, "应当续传一次")
+
+    def test_runaway_growth_bounded(self):
+        """远端一直比本地大 → 轮数用尽后失败，保留 .part，不无限追。"""
+        import lms_live
+        op = LiveServer(b"x" * 4096, probe_sizes=[99999999])
+        path = os.path.join(self.tmp, "runaway.mp4")
+        res = self.dl(op, path)
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["reason"], "growing")
+        self.assertEqual(op.gets, lms_live.TAIL_MAX_ROUNDS,
+                         "追平轮数必须受 TAIL_MAX_ROUNDS 约束")
+        self.assertFalse(os.path.exists(path))
+        self.assertTrue(res.get("kept_part"))
+
+    def test_416_means_remote_smaller(self):
+        """本地 .part 已经超出远端对象长度 → 416 → 判失败且保留本地字节。"""
+        op = LiveServer([http_err(416)], probe_sizes=[1600])
+        path = os.path.join(self.tmp, "p416.mp4")
+        with open(path + ".part", "wb") as f:
+            f.write(b"y" * 4096)
+        res = self.dl(op, path)
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["reason"], "remote_smaller")
+        self.assertFalse(os.path.exists(path))
+        self.assertEqual(os.path.getsize(path + ".part"), 4096,
+                         "本地有效前缀不能被删掉")
+
+    def test_no_part_left_after_accept(self):
+        op = LiveServer(b"x" * 2048, probe_sizes=[2048])
+        path = os.path.join(self.tmp, "clean.mp4")
+        res = self.dl(op, path)
+        self.assertTrue(res["ok"], res.get("err"))
+        self.assertFalse(os.path.exists(path + ".part"))
+
+    def test_probe_follows_416_content_range(self):
+        """416 带 `Content-Range: bytes */N` 时 N 就是对象长度（RFC 7233）。
+
+        0 长度对象也会回 416 —— 不能把它当「探测失败」，否则明明可下载的
+        资源会被标成错误。
+        """
+        import lms_live
+        err = urllib.error.HTTPError("http://r/x", 416, "range", {
+            "Content-Range": "bytes */12345",
+            "ETag": "e1"}, io.BytesIO(b""))
 
         class _Op:
             def open(self, req, timeout=None):
-                calls.append(1)
-                return FakeResponse(b"x" * 500000, status=206, headers={
-                    "Content-Type": "video/mp4",
-                    "Content-Range": "bytes 0-499999/1000000"})
+                raise err
 
-        path = os.path.join(self.tmp, "r2.mp4")
-        res = lms_live.download(_Op(), "http://r/x", path, retries=3, quiet=True)
-        self.assertFalse(res["ok"])
-        self.assertEqual(len(calls), 3, "三次重试都要用上")
+        p = lms_live.probe_remote(_Op(), "http://r/x")
+        self.assertTrue(p["ok"])
+        self.assertEqual(p["size"], 12345)
+        self.assertEqual(p["etag"], "e1")
 
-    def test_exact_length_has_no_shortfall(self):
-        res = self._dl(1000000, 1000000)
-        self.assertTrue(res["ok"])
-        self.assertEqual(res["shortfall"], 0.0)
-        self.assertIsNone(res["note"])
-
-    def test_no_declared_length_stays_silent(self):
-        """拿不到声明总长时不该瞎判，shortfall / note 都留空。"""
+    def test_probe_416_without_content_range_is_failure(self):
+        """416 但没给 Content-Range → 拿不到长度，当探测失败（保守）。"""
         import lms_live
-        op = self._Op(b"x" * 4096)               # 没有 Content-Range
-        path = os.path.join(self.tmp, "n.mp4")
-        res = lms_live.download(op, "http://r/x", path, retries=1, quiet=True)
-        self.assertTrue(res["ok"])
-        self.assertIsNone(res["declared"])
-        self.assertIsNone(res["shortfall"])
-        self.assertIsNone(res["note"])
+        err = urllib.error.HTTPError("http://r/x", 416, "range", {},
+                                     io.BytesIO(b""))
 
-    def test_tolerance_constant_reasonable(self):
-        """阈值本身要大于实测的 5.6%，否则正常回放天天告警。"""
+        class _Op:
+            def open(self, req, timeout=None):
+                raise err
+
+        p = lms_live.probe_remote(_Op(), "http://r/x")
+        self.assertFalse(p["ok"])
+        self.assertIsNone(p["size"])
+
+    def test_probe_uses_range_not_head(self):
+        """探测必须走 Range: bytes=0-0（与实际下载同一条路径）。"""
+        op = LiveServer(b"x" * 4096, probe_sizes=[4096])
+        self.dl(op, os.path.join(self.tmp, "range.mp4"))
+        self.assertTrue(op.range_headers, "探测请求没发出来")
+        self.assertIn("bytes=0-0", op.range_headers)
+
+
+class LiveFastBase(Base):
+    """lms_live 测试基类：把稳定窗口压成 0 秒。
+
+    这些用例验的是断点续传与落盘正确性，没必要真等 60 秒；
+    窗口本身的语义（时间差、ETag 重置、超时）由 TestLiveTailVerification
+    用虚拟时钟专门覆盖。
+    """
+
+    def setUp(self):
+        super().setUp()
         import lms_live
-        self.assertGreater(lms_live.SHORT_TOLERANCE, 0.056)
+        self._live_saved = (lms_live.TAIL_STABLE_SECONDS,
+                            lms_live.TAIL_PROBE_INTERVAL)
+        lms_live.TAIL_STABLE_SECONDS = 0.0
+        lms_live.TAIL_PROBE_INTERVAL = 0.0
+
+    def tearDown(self):
+        import lms_live
+        (lms_live.TAIL_STABLE_SECONDS,
+         lms_live.TAIL_PROBE_INTERVAL) = self._live_saved
+        super().tearDown()
 
 
-class TestLiveRangeAlignment(Base):
+class TestLiveRangeAlignment(LiveFastBase):
     """回放断点续传的 Range 对齐 —— lms_live 下载最容易写坏文件的地方。
 
     回归背景：回放服务端会按自己的策略调整请求的字节区间（实测常按 4MB /
@@ -959,8 +1202,9 @@ class TestLiveRangeAlignment(Base):
             got = f.read()
         self.assertEqual(len(got), total, "缺口情形下文件长度不对")
         self.assertEqual(got, bytes([(i % 251) for i in range(total)]))
-        # 第二次请求不应再带 Range（残片已作废）
-        self.assertEqual(op.calls[-1][0], 0, "缺口后应重下全量")
+        # 第二次请求不应再带 Range（残片已作废）—— 注意后面还有探测请求，
+        # 所以这里看第 2 次调用而不是最后一次
+        self.assertEqual(op.calls[1][0], 0, "缺口后应重下全量")
 
     def test_gap_keeps_part_when_no_retry_left(self):
         """★ 缺口但已无重试机会时：不落盘、**保留**有效前缀的 .part。
@@ -1003,6 +1247,27 @@ class TestLiveRangeAlignment(Base):
             self.assertEqual(f.read(),
                              bytes([(i % 251) for i in range(total)]))
         self.assertFalse(os.path.exists(path + ".part"), "成功后不该留 .part")
+
+    def test_part_at_declared_size_is_not_deleted(self):
+        """★ `.part` 已经等于声明总长时不再被删掉重下 —— 声明值会变。
+
+        旧行为：`if expect and offset >= expect` → os.remove(tmp) 从零重下，
+        把已经下对的前缀白白扔掉（回放转码期间声明值随时会涨，这个判断本身
+        就是错的）。新行为：照常按 .part 大小续传。
+        """
+        import lms_live
+        total = 300000
+        path = os.path.join(self.tmp, "expect.mp4")
+        self._part_with_bytes(path, total)
+
+        op = self._Op(total, serve_from=None)
+        res = lms_live.download(op, "http://r/x", path, expect=total,
+                                retries=1, quiet=True)
+
+        self.assertTrue(res["ok"], res.get("err"))
+        self.assertTrue(res["resumed"], "应走续传，而不是从零重下")
+        self.assertEqual(op.calls[0][0], total, "请求应带 offset=300000")
+        self.assertEqual(os.path.getsize(path), total)
 
     def test_normal_resume_unchanged(self):
         """start == offset 的正常续传不能被上面的逻辑误伤。"""
@@ -1402,6 +1667,645 @@ class TestPathCollision(Base):
         _, n = F.resolve_collisions(items, FakeArgs(layout="flat"))
         self.assertEqual(n, 1)
 
+    # ---- resource identity：plain 名的归属由「最小 uid」决定，不是顺序 ----
+
+    def test_winner_is_min_uid_not_list_order(self):
+        """列表顺序在后的最小 uid 保留 plain 名 —— 身份决定，不是位置。"""
+        items = [
+            {"kind": "课件", "activity": "A", "name": "x.pdf", "uid": 200},
+            {"kind": "课件", "activity": "B", "name": "x.pdf", "uid": 100},
+        ]
+        _, n = F.resolve_collisions(items, FakeArgs(layout="flat"))
+        self.assertEqual(n, 1)
+        by_uid = {it["uid"]: it["name"] for it in items}
+        self.assertEqual(by_uid[100], "x.pdf")
+        self.assertEqual(by_uid[200], "x~200.pdf")
+
+    def test_append_higher_uid_keeps_existing_assignment(self):
+        """★ 追加稳定性：集合新增更大 uid 时，已有分配一个都不变。"""
+        run1 = [
+            {"kind": "课件", "activity": "A", "name": "x.pdf", "uid": 100},
+            {"kind": "课件", "activity": "B", "name": "x.pdf", "uid": 101},
+        ]
+        F.resolve_collisions(run1, FakeArgs(layout="flat"))
+        run2 = run1 + [
+            {"kind": "课件", "activity": "C", "name": "x.pdf", "uid": 102},
+        ]
+        F.resolve_collisions(run2, FakeArgs(layout="flat"))
+        r1 = {it["uid"]: it["name"] for it in run1}
+        r2 = {it["uid"]: it["name"] for it in run2}
+        self.assertEqual(r2[100], r1[100])
+        self.assertEqual(r2[101], r1[101])
+        self.assertEqual(r2[102], "x~102.pdf")
+
+    def test_smaller_uid_takes_over_deterministically(self):
+        """新出现的更小 uid 会接管 plain 名 —— 行为确定、可预期，
+        且旧文件由下载守卫保住（见 TestResourceIdentityGuard）。"""
+        items = [
+            {"kind": "课件", "activity": "A", "name": "x.pdf", "uid": 100},
+            {"kind": "课件", "activity": "B", "name": "x.pdf", "uid": 50},
+        ]
+        _, n = F.resolve_collisions(items, FakeArgs(layout="flat"))
+        self.assertEqual(n, 1)
+        by_uid = {it["uid"]: it["name"] for it in items}
+        self.assertEqual(by_uid[50], "x.pdf")
+        self.assertEqual(by_uid[100], "x~100.pdf")
+
+    def test_renamed_name_dodges_other_groups_plain_name(self):
+        """~uid 后缀撞上另一组的原始文件名时要继续加计数，不能覆盖它。"""
+        items = [
+            {"kind": "课件", "activity": "A", "name": "x.pdf", "uid": 100},
+            {"kind": "课件", "activity": "B", "name": "x.pdf", "uid": 200},
+            # 平台上真有叫 `x~200.pdf` 的文件 —— flat 布局同目录
+            {"kind": "课件", "activity": "B", "name": "x~200.pdf", "uid": 300},
+        ]
+        _, n = F.resolve_collisions(items, FakeArgs(layout="flat"))
+        # 只有 uid=200 需要改名；uid=300 的原始名本来就不冲突
+        self.assertEqual(n, 1)
+        by_uid = {it["uid"]: it["name"] for it in items}
+        self.assertEqual(by_uid[100], "x.pdf")
+        self.assertEqual(by_uid[200], "x~200-2.pdf",
+                         "~uid 候选撞上 uid300 的原始名，要继续加计数")
+        self.assertEqual(by_uid[300], "x~200.pdf", "原始名不能被改名者抢走")
+
+
+class TestResourceIdentityGuard(Base):
+    """resource identity 守卫：目标已有「完整但与本资源不符」的文件时绝不覆盖。
+
+    回归背景：瞬时错误会把已下载条目的名字槽让出来（meta 失败 → 合成名
+    不占位），同目录的另一资源顺势拿走 plain 名并原地覆盖 ——
+    前一个 uid 的数据被后一个 uid 的字节替换，且下次运行又翻回来。
+    守卫的判定只读文件系统，下载 / --dry-run / --list-only 三处共用。
+    """
+
+    KIND = "课件"
+
+    def _dest(self):
+        d = os.path.join(self.tmp, self.KIND)
+        os.makedirs(d, exist_ok=True)
+        return d
+
+    def _put(self, name, size):
+        p = os.path.join(self._dest(), name)
+        with open(p, "wb") as f:
+            f.write(b"x" * size)
+        return p
+
+    def _guard(self, name, size, uid=100, kind=None):
+        """kind 已不再影响守卫（容差被彻底删除），保留参数只为让调用点读起来
+        清楚是在测哪一类资源。"""
+        return F.identity_conflict_target(
+            self._dest(), name, size, uid)
+
+    # ---- 基本分流 ----
+
+    def test_clean_target_uses_plain_name(self):
+        action, p = self._guard("讲义.pdf", 10)
+        self.assertEqual(action, "use")
+        self.assertTrue(p.endswith(os.path.join(self.KIND, "讲义.pdf")))
+
+    def test_matching_file_is_use(self):
+        """大小相符 → 原路 use（调用方随后按 exists 跳过）。"""
+        self._put("讲义.pdf", 10)
+        action, p = self._guard("讲义.pdf", 10)
+        self.assertEqual((action, os.path.basename(p)), ("use", "讲义.pdf"))
+
+    def test_part_file_bypasses_guard(self):
+        """.part 残片是本资源的断点 → 原路 use，交给续传。"""
+        p = self._put("讲义.pdf", 4)
+        with open(p + ".part", "wb") as f:
+            f.write(b"y" * 6)
+        action, got = self._guard("讲义.pdf", 10)
+        self.assertEqual((action, got), ("use", p))
+
+    def test_empty_file_treated_as_junk(self):
+        """空文件视为垃圾，原地重下覆盖。"""
+        self._put("讲义.pdf", 0)
+        action, p = self._guard("讲义.pdf", 10)
+        self.assertEqual(os.path.basename(p), "讲义.pdf")
+
+    # ---- 核心守卫 ----
+
+    def test_foreign_file_gets_suffix_and_survives(self):
+        """★ 别的资源的文件不能被覆盖：另存 ~uid，原文件字节原样保留。"""
+        foreign = self._put("讲义.pdf", 999)
+        with open(foreign, "rb") as f:
+            before = f.read()
+        action, p = self._guard("讲义.pdf", 10, uid=200)
+        self.assertEqual(action, "use")
+        self.assertEqual(os.path.basename(p), "讲义~200.pdf")
+        with open(foreign, "rb") as f:
+            self.assertEqual(f.read(), before, "原文件被改动了")
+
+    def test_previous_guard_copy_is_skip(self):
+        """上次守卫分流下去的那份就是本资源 → skip，不重复下载。"""
+        self._put("讲义.pdf", 999)
+        self._put("讲义~200.pdf", 10)
+        action, p = self._guard("讲义.pdf", 10, uid=200)
+        self.assertEqual(action, "skip")
+        self.assertEqual(os.path.basename(p), "讲义~200.pdf")
+
+    def test_second_conflict_gets_counter_suffix(self):
+        """~uid 候选也被别的文件占了且大小不符 → 继续加计数。"""
+        self._put("讲义.pdf", 999)
+        self._put("讲义~200.pdf", 888)
+        action, p = self._guard("讲义.pdf", 10, uid=200)
+        self.assertEqual(action, "use")
+        self.assertEqual(os.path.basename(p), "讲义~200-2.pdf")
+
+    # ---- 回放不再有容差：大小差一点也算不相符 ----
+
+    def test_replay_short_file_is_not_the_same_resource(self):
+        """★ 回放 95/100 少 5% —— 旧实现落在 8% 容差内会 use（把截断的字节
+        当成本资源固化）；现在比对是精确的 → 走守卫另存，原文件不动。
+        """
+        self._put("直播.mp4", 95)
+        action, p = self._guard("直播.mp4", 100, uid=7, kind="回放")
+        self.assertEqual(action, "use")
+        self.assertEqual(os.path.basename(p), "直播~7.mp4")
+        self.assertEqual(os.path.getsize(os.path.join(self._dest(), "直播.mp4")),
+                         95, "原文件被动过")
+
+    def test_replay_exact_match_is_use(self):
+        """字节数完全一致才算本资源。"""
+        self._put("直播.mp4", 100)
+        action, p = self._guard("直播.mp4", 100, uid=7, kind="回放")
+        self.assertEqual((action, os.path.basename(p)), ("use", "直播.mp4"))
+
+    # ---- 跨运行收敛（瞬时错误 → 恢复） ----
+
+    def test_convergence_after_transient_error(self):
+        """★ 三轮仿真：错误释放名字槽 → 守卫另存 → 恢复后零下载收敛。
+
+        run1: uid=100 下载成功（plain 名，10 字节）
+        run2: uid=100 meta 瞬时失败（合成名不占位），uid=200 同名同目录
+              → 守卫把 200 分流到 ~200，100 的文件原样还在
+        run3: 两个都恢复 → 最小 uid 100 保留 plain 名且大小相符，
+              200 落在 ~200 且大小相符 → 没有任何字节需要重下
+        """
+        args = FakeArgs(out=self.tmp, layout="flat")
+        dest = self._dest()
+
+        # run1：只有 100
+        it100 = {"kind": self.KIND, "activity": "A",
+                 "name": "讲义.pdf", "uid": 100, "size": 10}
+        F.resolve_collisions([dict(it100)], args)
+        p100 = os.path.join(dest, "讲义.pdf")
+        with open(p100, "wb") as f:
+            f.write(b"a" * 10)
+
+        # run2：100 报错（合成名，不占位），200 要下载
+        it200 = {"kind": self.KIND, "activity": "B",
+                 "name": "讲义.pdf", "uid": 200, "size": 12}
+        action, target = F.identity_conflict_target(
+            dest, "讲义.pdf", 12, 200)
+        self.assertEqual(action, "use")
+        self.assertEqual(os.path.basename(target), "讲义~200.pdf")
+        with open(target, "wb") as f:
+            f.write(b"b" * 12)
+
+        # run3：都恢复
+        items = [dict(it100), dict(it200)]
+        F.resolve_collisions(items, args)
+        plan = {}
+        for it in items:
+            d = F.dest_for(it["kind"], it["activity"], it["name"], args)
+            action, target = F.identity_conflict_target(
+                d, it["name"], it["size"], it["uid"])
+            plan[it["uid"]] = (action, target)
+        self.assertEqual(plan[100], ("use", p100))
+        self.assertEqual(os.path.getsize(p100), 10, "100 的文件被动过")
+        self.assertEqual(os.path.basename(plan[200][1]), "讲义~200.pdf")
+        self.assertEqual(os.path.getsize(plan[200][1]), 12, "200 的文件被动过")
+
+
+class TestDownloadIndex(Base):
+    """★ resource identity 封板回归：identity_key → canonical_path 必须是严格函数。
+
+    不变量（任一被破坏即回归）：
+        其他资源新增 / 删除、其他资源 meta 失败、排序变化、
+        同 UID 内容更新、进程重启 —— 都不改变 canonical_path。
+
+    回归背景：min-uid + 覆盖守卫仍留有一个洞 —— size(uid100)==size(uid200)
+    时，uid100 瞬时 meta 失败会让 uid200 把 100 的字节当成自己的
+    （already_complete 按大小比对，大小相同无法区分）。持久身份索引
+    .download-index.json 让报错条目仍占位，洞从根上堵死。
+    """
+
+    KIND = "课件"
+
+    def _args(self):
+        return FakeArgs(out=self.tmp, layout="flat")
+
+    def _dest(self):
+        d = os.path.join(self.tmp, self.KIND)
+        os.makedirs(d, exist_ok=True)
+        return d
+
+    def _item(self, uid, name="讲义.pdf", size=10, **kw):
+        it = {"kind": self.KIND, "activity": "第1章",
+              "name": name, "uid": uid, "size": size}
+        it.update(kw)
+        return it
+
+    COURSE = "1"
+
+    def _assign(self, items):
+        """一轮「扫描 → 分配 → 落盘索引」，模拟真实 main() 的索引生命周期。"""
+        index = F.load_download_index(self.tmp)
+        F.assign_canonical_paths(items, index, self._args(), self.COURSE)
+        F.save_download_index(self.tmp, index)
+        return index
+
+    def _write(self, path, size, byte=b"a"):
+        with open(path, "wb") as f:
+            f.write(byte * size)
+
+    def _index_paths(self):
+        idx = F.load_download_index(self.tmp)
+        return {k: v["path"] for k, v in idx.items()}
+
+    # ---- 封板回归：瞬时错误 + 等大小 ----
+
+    def test_harsh_convergence_equal_sizes(self):
+        """★ 用户点名的固定回归：
+        run1: uid100 + uid200（同名同大小）
+        run2: uid100 meta 失败，且 size100 == size200
+        run3: uid100 恢复
+        必须证明：两个 uid 的 canonical_path 三轮不漂移；100 的字节从未
+        被当成 200；200 的字节从未覆盖 100；run3 无不必要重下。
+        """
+        # run1：两个都下载成功
+        r1 = [self._item(100, size=10), self._item(200, size=10)]
+        idx = self._assign(r1)
+        self.assertEqual(idx["course:1:upload:100"]["path"], "%s/讲义.pdf" % self.KIND)
+        self.assertEqual(idx["course:1:upload:200"]["path"], "%s/讲义~200.pdf" % self.KIND)
+        paths_run1 = self._index_paths()
+        p100 = os.path.join(self._dest(), "讲义.pdf")
+        p200 = os.path.join(self._dest(), "讲义~200.pdf")
+        self._write(p100, 10, b"a")
+        self._write(p200, 10, b"b")
+
+        # run2：100 meta 失败（合成名 + error），200 可见，大小相同
+        r2 = [self._item(100, name="upload_100", size=10, error=True,
+                         err_kind=F.ERR_TRANSIENT),
+              self._item(200, size=10)]
+        idx2 = self._assign(r2)
+        self.assertEqual(idx2["course:1:upload:200"]["path"],
+                         "%s/讲义~200.pdf" % self.KIND,
+                         "等大小也不能让 200 冒领 plain 名 —— 索引占位")
+        # 100 报错不可见，但其身份路径仍被占位
+        self.assertEqual(idx2["course:1:upload:100"]["path"], "%s/讲义.pdf" % self.KIND)
+        with open(p100, "rb") as f:
+            self.assertEqual(f.read(), b"a" * 10, "100 的字节被动过")
+        with open(p200, "rb") as f:
+            self.assertEqual(f.read(), b"b" * 10, "200 的字节被动过")
+
+        # run3：100 恢复 —— 路径不变，文件已完整，无不必要重下
+        r3 = [self._item(100, size=10), self._item(200, size=10)]
+        idx3 = self._assign(r3)
+        self.assertEqual(self._index_paths(), paths_run1,
+                         "三轮之后 canonical_path 必须与 run1 完全一致")
+        for it in r3:
+            self.assertTrue(it.get("_canon"), "恢复后走索引权威，不重新分配")
+            d = F.item_dest(it, self._args())
+            done, _, _ = F.already_complete(
+                os.path.join(d, it["name"]), it["size"])
+            self.assertTrue(done, "run3 不应有任何重下")
+        with open(p100, "rb") as f:
+            self.assertEqual(f.read(), b"a" * 10)
+        with open(p200, "rb") as f:
+            self.assertEqual(f.read(), b"b" * 10)
+
+    def test_meta_fail_does_not_free_plain_slot(self):
+        """等大小场景的单点：报错条目经索引占位，plain 名不被后来的抢走。"""
+        self._assign([self._item(100, size=7)])
+        self._write(os.path.join(self._dest(), "讲义.pdf"), 7)
+        r2 = [self._item(100, name="upload_100", size=7, error=True,
+                         err_kind=F.ERR_TRANSIENT),
+              self._item(200, size=7)]
+        idx = self._assign(r2)
+        self.assertEqual(idx["course:1:upload:200"]["path"], "%s/讲义~200.pdf" % self.KIND)
+
+    def test_new_uid_after_index_gets_own_suffix(self):
+        """索引时代之后新增的同名资源也拿自己的后缀，plain 名属于先到身份。"""
+        self._assign([self._item(100)])
+        r2 = [self._item(100), self._item(300)]
+        idx = self._assign(r2)
+        self.assertEqual(idx["course:1:upload:300"]["path"], "%s/讲义~300.pdf" % self.KIND)
+
+    def test_same_uid_update_keeps_canonical_path(self):
+        """同 uid 内容更新（大小变了）：canonical_path 不漂移，原地覆盖。"""
+        idx = self._assign([self._item(100, size=10)])
+        r2 = [self._item(100, size=15)]
+        idx2 = self._assign(r2)
+        self.assertEqual(idx2["course:1:upload:100"]["path"], idx["course:1:upload:100"]["path"])
+        self.assertTrue(r2[0].get("_canon"))
+        self.assertFalse(r2[0].get("_fresh", False), "不走覆盖守卫 —— 是自己的文件")
+
+    def test_canonical_path_ignores_layout_toggle(self):
+        """分配过的身份不随 --organize / 布局参数变化而搬家。"""
+        self._assign([self._item(100)])
+        r2 = [self._item(100)]
+        F.assign_canonical_paths(r2, F.load_download_index(self.tmp),
+                                 FakeArgs(out=self.tmp, organize=True), "1")
+        self.assertEqual(r2[0]["_dest"], self._dest(),
+                         "布局切换不能移动已分配的身份")
+
+    # ---- 索引文件本身 ----
+
+    def test_index_file_contains_no_credentials(self):
+        """索引是下载数据库，不是凭据：绝不出现 cookie / token 字样。"""
+        self._assign([self._item(100), self._item(200)])
+        with open(os.path.join(self.tmp, F.INDEX_NAME), encoding="utf-8") as f:
+            body = f.read().lower()
+        self.assertNotIn("cookie", body)
+        self.assertNotIn("token", body)
+        self.assertNotIn("authorization", body)
+
+    def test_corrupt_index_fails_closed_then_recovers_deterministically(self):
+        """索引损坏 → 抛 IndexCorruptError（不静默当空索引）；清理现场后
+        重新分配仍得到确定的 min-uid 布局，覆盖守卫保护存量文件。"""
+        self._assign([self._item(100), self._item(200)])
+        with open(os.path.join(self.tmp, F.INDEX_NAME), "w", encoding="utf-8") as f:
+            f.write("{not json")
+        with self.assertRaises(F.IndexCorruptError):
+            F.load_download_index(self.tmp)
+        leftovers = [f for f in os.listdir(self.tmp)
+                     if f.startswith(F.INDEX_NAME + ".corrupt-")]
+        self.assertEqual(len(leftovers), 1, "坏文件保留现场")
+        # 模拟维护者确认后清理坏文件 → 重新分配，规则确定性
+        idx = {}
+        r2 = [self._item(100), self._item(200)]
+        F.assign_canonical_paths(r2, idx, self._args(), self.COURSE)
+        self.assertEqual(idx["course:1:upload:100"]["path"],
+                         "%s/讲义.pdf" % self.KIND)
+        self.assertEqual(idx["course:1:upload:200"]["path"],
+                         "%s/讲义~200.pdf" % self.KIND)
+
+    def test_replay_key_distinguishes_cameras(self):
+        """回放一个活动多路机位共用活动 id —— 键必须带机位，否则互抢身份。"""
+        k1 = F.identity_key({"kind": "回放", "uid": 456,
+                             "camera": "encoder", "camera_id": "c1"}, "1")
+        k2 = F.identity_key({"kind": "回放", "uid": 456,
+                             "camera": "instructor", "camera_id": "c2"}, "1")
+        self.assertNotEqual(k1, k2)
+
+    # ---- main() 集成：--dry-run 也要持久化索引，两次运行分配稳定 ----
+
+    def test_dry_run_persists_index(self):
+        acts = [{"id": 1, "type": "lesson", "title": "第1章",
+                 "uploads": [{"id": 100}, {"id": 200}]}]
+        ups = {100: {"name": "讲义.pdf", "size": 10},
+               200: {"name": "讲义.pdf", "size": 10}}
+        out = os.path.join(self.tmp, "OUT")
+        rc1, _ = run_main(self.tmp, MainOpener(acts, uploads=ups),
+                          ["--dry-run", "--layout", "flat"])
+        self.assertEqual(rc1, F.RC_OK)
+        idx1 = F.load_download_index(out)
+        self.assertIn("course:1:upload:100", idx1)
+        rc2, _ = run_main(self.tmp, MainOpener(acts, uploads=ups),
+                          ["--dry-run", "--layout", "flat"])
+        self.assertEqual(rc2, F.RC_OK)
+        idx2 = F.load_download_index(out)
+        self.assertEqual(idx2, idx1, "两次运行的分配必须逐字节一致")
+
+
+class TestIdentityHardening(Base):
+    """resource identity 封板前的最后三条边界：
+
+    1. live 身份用 camera_id（同类型多机位不串身份），缺失才降级 type；
+       同活动多路无 camera_id 同类型 → 显式 identity ambiguous，绝不硬合并
+    2. identity key 带 course namespace —— 多课程共用 --out 不串身份
+    3. 索引 fail-closed：损坏不静默重建；路径越界条目丢弃，索引不是任意写入口
+    """
+
+    COURSE = "1"
+
+    # ---- live identity ----
+
+    def test_live_key_uses_camera_id(self):
+        """同活动两个同类型机位，camera_id 不同 → 身份不同。"""
+        a = F.identity_key({"kind": "回放", "uid": 456,
+                            "camera": "encoder", "camera_id": "cam1"}, "1")
+        b = F.identity_key({"kind": "回放", "uid": 456,
+                            "camera": "encoder", "camera_id": "cam2"}, "1")
+        self.assertNotEqual(a, b)
+        self.assertIn("camera:cam1", a)
+
+    def test_live_key_falls_back_to_type_without_camera_id(self):
+        cid_missing = F.identity_key({"kind": "回放", "uid": 456,
+                                      "camera": "instructor"}, "1")
+        self.assertEqual(cid_missing, "course:1:live:456:type:instructor")
+
+    def test_ambiguous_replays_fail_loudly(self):
+        """同活动多路无 camera_id 且同类型 → 显式 FAIL，绝不硬合并。"""
+        detail = {"data": {"external_live_detail": {"replay_videos": [
+            {"camera_type": "encoder", "url": "http://x/1.mp4"},
+            {"camera_type": "encoder", "url": "http://x/2.mp4"},
+        ]}}}
+        op = MainOpener([], details={7: detail})
+        keys = [("回放", "直播", -7)]   # collect 约定：回放 uid = -活动id
+        items, _err = F.expand_items(op, keys, FakeArgs(all_cameras=True))
+        self.assertEqual(len(items), 2)
+        for it in items:
+            self.assertTrue(it.get("error"), "身份歧义必须显式失败")
+            self.assertEqual(it.get("err_kind"), F.ERR_IDENTITY)
+            self.assertIn("歧义", it.get("err_msg") or "")
+            self.assertFalse(it.get("unavailable"))
+
+    def test_course_namespace_separates_same_uid(self):
+        """两个课程共用 --out 时，同 uid 不串身份。"""
+        a = F.identity_key({"kind": "课件", "uid": 123}, "1")
+        b = F.identity_key({"kind": "课件", "uid": 123}, "2")
+        self.assertNotEqual(a, b)
+        self.assertEqual(a, "course:1:upload:123")
+
+    def test_assign_scopes_index_by_course(self):
+        idx = {}
+        F.assign_canonical_paths(
+            [{"kind": "课件", "activity": "A", "name": "x.pdf", "uid": 9}],
+            idx, FakeArgs(out=self.tmp, layout="flat"), "77")
+        self.assertIn("course:77:upload:9", idx)
+
+    # ---- 索引 fail-closed ----
+
+    def _corrupt(self):
+        p = os.path.join(self.tmp, F.INDEX_NAME)
+        with open(p, "w", encoding="utf-8") as f:
+            f.write("{not json")
+        return p
+
+    def test_corrupt_index_fails_closed_and_preserves_evidence(self):
+        self._corrupt()
+        with self.assertRaises(F.IndexCorruptError):
+            F.load_download_index(self.tmp)
+        leftovers = [f for f in os.listdir(self.tmp)
+                     if f.startswith(F.INDEX_NAME + ".corrupt-")]
+        self.assertEqual(len(leftovers), 1, "坏文件必须改名保留现场")
+        self.assertFalse(os.path.exists(
+            os.path.join(self.tmp, F.INDEX_NAME)), "坏文件不能留在原位")
+
+    def test_main_aborts_on_corrupt_index(self):
+        """main() 层面：索引损坏 → 语义化退出码，绝不继续下载。"""
+        out = os.path.join(self.tmp, "OUT")
+        os.makedirs(out)
+        with open(os.path.join(out, F.INDEX_NAME), "w", encoding="utf-8") as f:
+            f.write("garbage")
+        acts = [{"id": 1, "type": "lesson", "title": "第1章",
+                 "uploads": [{"id": 100}]}]
+        rc, buf = run_main(self.tmp, MainOpener(acts), ["--dry-run"])
+        self.assertEqual(rc, F.RC_BAD_INDEX)
+        self.assertIn("拒绝继续", buf)
+        leftovers = [f for f in os.listdir(out)
+                     if f.startswith(F.INDEX_NAME + ".corrupt-")]
+        self.assertEqual(len(leftovers), 1)
+
+    # ---- 索引路径越界防护 ----
+
+    def _load_with(self, path_value):
+        p = os.path.join(self.tmp, F.INDEX_NAME)
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump({"version": 1, "identity_schema": 1,
+                       "items": {"course:1:upload:1":
+                                 {"path": path_value, "name": "x.pdf"}}}, f)
+        return F.load_download_index(self.tmp)
+
+    def test_escape_path_fails_closed(self):
+        """★ 非法 canonical path 不能「丢单条继续」—— 那等于静默遗忘
+        该身份的映射，重新分配又会去抢名字槽。必须整份 fail-closed。"""
+        self.assertRaises(F.IndexCorruptError, self._load_with,
+                          "../../important.txt")
+        leftovers = [f for f in os.listdir(self.tmp)
+                     if f.startswith(F.INDEX_NAME + ".corrupt-")]
+        self.assertEqual(len(leftovers), 1, "原文件改名保留现场")
+
+    def test_absolute_and_drive_paths_fail_closed(self):
+        for bad in ("/etc/passwd", "C:/Windows/x.pdf", "\\\\srv/x.pdf"):
+            self.assertRaises(F.IndexCorruptError, self._load_with, bad)
+
+    def test_valid_relative_path_kept(self):
+        idx = self._load_with("课件/第1章/讲义.pdf")
+        self.assertEqual(idx["course:1:upload:1"]["path"],
+                         "课件/第1章/讲义.pdf")
+
+    def test_save_uses_items_envelope(self):
+        """顶层必须是 {version, identity_schema, items} —— 结构版本与
+        身份键语义版本分两个字段，以后迁移 identity 格式有余地。"""
+        F.save_download_index(self.tmp, {"course:1:upload:1":
+                                         {"path": "a.pdf", "name": "a.pdf"}})
+        with open(os.path.join(self.tmp, F.INDEX_NAME), encoding="utf-8") as f:
+            data = json.load(f)
+        self.assertEqual(data["version"], F.INDEX_VERSION)
+        self.assertEqual(data["identity_schema"], F.IDENTITY_SCHEMA)
+        self.assertIsInstance(data["items"], dict)
+        self.assertEqual(data["items"]["course:1:upload:1"]["path"], "a.pdf")
+
+    def test_unknown_version_rejected(self):
+        p = os.path.join(self.tmp, F.INDEX_NAME)
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump({"version": 2, "identity_schema": 1, "items": {}}, f)
+        self.assertRaises(F.IndexCorruptError, F.load_download_index, self.tmp)
+
+    def test_unknown_identity_schema_rejected(self):
+        p = os.path.join(self.tmp, F.INDEX_NAME)
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump({"version": 1, "identity_schema": 2, "items": {}}, f)
+        self.assertRaises(F.IndexCorruptError, F.load_download_index, self.tmp)
+
+    def test_missing_identity_schema_rejected(self):
+        """identity_schema 是身份键语义的声明，缺失 = 未知语义，拒绝。"""
+        p = os.path.join(self.tmp, F.INDEX_NAME)
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump({"version": 1, "items": {}}, f)
+        self.assertRaises(F.IndexCorruptError, F.load_download_index, self.tmp)
+
+    def test_refuse_leaves_file_byte_identical(self):
+        """「格式不认识」类拒绝：原文件字节级原样保留——不改名、不修复。"""
+        body = '{"version": 99, "identity_schema": 1, "items": {}}'
+        p = os.path.join(self.tmp, F.INDEX_NAME)
+        with open(p, "w", encoding="utf-8") as f:
+            f.write(body)
+        self.assertRaises(F.IndexCorruptError, F.load_download_index, self.tmp)
+        with open(p, "rb") as f:
+            self.assertEqual(f.read().decode("utf-8"), body,
+                             "拒绝路径不得碰原文件")
+        self.assertEqual([f for f in os.listdir(self.tmp)
+                          if ".corrupt-" in f], [],
+                         "格式不认识 ≠ 内容损坏，不做隔离改名")
+
+    def test_structural_envelope_migration_ok(self):
+        """结构型迁移（旧信封 entries → items）允许，前提是身份键语义
+        已经是当前代（键带 course namespace）。"""
+        p = os.path.join(self.tmp, F.INDEX_NAME)
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump({"entries": {"course:1:upload:1":
+                                   {"path": "a.pdf", "name": "a.pdf"}}}, f)
+        idx = F.load_download_index(self.tmp)
+        self.assertEqual(idx["course:1:upload:1"]["path"], "a.pdf")
+
+    def test_identity_semantic_migration_never_happens(self):
+        """★ 旧语义键（无 course namespace）→ 直接拒绝。loader 绝不猜
+        course 归属去补前缀——那是身份语义推断，不是结构迁移。"""
+        p = os.path.join(self.tmp, F.INDEX_NAME)
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump({"items": {"upload:5": {"path": "a.pdf",
+                                              "name": "a.pdf"}}}, f)
+        self.assertRaises(F.IndexCorruptError, F.load_download_index, self.tmp)
+        self.assertFalse(os.path.exists(
+            os.path.join(self.tmp, F.INDEX_NAME + ".part")))
+
+    def test_main_aborts_on_invalid_path(self):
+        """main() 层面：单条 path 越界 → RC_BAD_INDEX，下载零进行。"""
+        out = os.path.join(self.tmp, "OUT")
+        os.makedirs(out)
+        with open(os.path.join(out, F.INDEX_NAME), "w", encoding="utf-8") as f:
+            json.dump({"version": 1, "identity_schema": 1,
+                       "items": {"course:1:upload:100":
+                                 {"path": "../../x", "name": "x.pdf"}}}, f)
+        acts = [{"id": 1, "type": "lesson", "title": "第1章",
+                 "uploads": [{"id": 100}]}]
+        rc, buf = run_main(self.tmp, MainOpener(acts), ["--dry-run"])
+        self.assertEqual(rc, F.RC_BAD_INDEX)
+        self.assertIn("拒绝继续", buf)
+        leftovers = [f for f in os.listdir(out)
+                     if f.startswith(F.INDEX_NAME + ".corrupt-")]
+        self.assertEqual(len(leftovers), 1, "原文件保留现场")
+
+
+class TestGuardInViews(Base):
+    """守卫判定必须反映到清单视图（--list-only / --dry-run 共用逻辑），
+    否则清单说 PLAN 某路径、实际下载却落到另一个路径。"""
+
+    def _item(self, **kw):
+        base = {"kind": "课件", "activity": "A", "name": "讲义.pdf",
+                "uid": 200, "size": 10}
+        base.update(kw)
+        return base
+
+    def test_row_shows_alt_path_when_foreign_file_present(self):
+        d = os.path.join(self.tmp, "课件")
+        os.makedirs(d)
+        with open(os.path.join(d, "讲义.pdf"), "wb") as f:
+            f.write(b"x" * 999)
+        args = FakeArgs(out=self.tmp, layout="flat")
+        rows = F.build_rows(None, [self._item()], None, args, quiet=True)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["status"], F.STATUS_PLAN)
+        self.assertEqual(rows[0]["name"], "讲义~200.pdf")
+
+    def test_row_shows_exists_on_guard_path(self):
+        d = os.path.join(self.tmp, "课件")
+        os.makedirs(d)
+        with open(os.path.join(d, "讲义.pdf"), "wb") as f:
+            f.write(b"x" * 999)
+        with open(os.path.join(d, "讲义~200.pdf"), "wb") as f:
+            f.write(b"y" * 10)
+        args = FakeArgs(out=self.tmp, layout="flat")
+        rows = F.build_rows(None, [self._item()], None, args, quiet=True)
+        self.assertEqual(rows[0]["status"], F.STATUS_EXISTS)
+        self.assertEqual(rows[0]["name"], "讲义~200.pdf")
+
 
 class TestMetaErrorPropagation(Base):
     """取元信息失败必须按类型分流 —— 不能把网络错误伪装成「无权限」。
@@ -1799,6 +2703,10 @@ class TestListOnly(Base):
 
         以前 build_rows 只判 os.path.exists，于是本地截断文件在清单里是
         exists、在主流程里却要 REDO —— 两种视图对不上。
+
+        v1.4.2 身份索引落地后的语义：uid900 的 canonical_path 在索引里
+        （第一次 --list-only 就已分配），本地截断文件视为「同 uid 的旧内容」
+        —— 清单仍是 plan（不是 exists），但路径不漂移，正式下载原地覆盖。
         """
         _, rows, _out = self._run({"name": "第2章讲义.pdf", "size": 100000})
         target = rows[0]
@@ -1816,6 +2724,10 @@ class TestListOnly(Base):
         self.assertNotEqual(row["status"], "exists",
                             "截断文件不能被清单当成已存在")
         self.assertEqual(row["status"], "plan")
+        self.assertEqual(row["name"], "第2章讲义.pdf",
+                         "索引权威：同 uid 更新原地覆盖，路径不漂移")
+        with open(path, "rb") as f:
+            self.assertEqual(len(f.read()), 1000, "--list-only 不改任何文件")
 
 
 class TestMainScanFailure(Base):
@@ -1886,12 +2798,17 @@ class TestMainScanFailure(Base):
         self.assertNotIn("扫描阶段", out)
 
 
-class TestCompleteTolerance(Base):
-    """下载判据与增量判据必须一致 —— 回放允许 8% 自然短读。
+class TestNoTolerancePolicy(Base):
+    """★ v1.4.2 起全局无容差 —— 完成判据收敛到「可信 size 精确相等」。
 
-    回归背景：`lms_live.download()` 认定 944000/1000000 是成功，
-    但下一轮 `already_complete()` 要求严格相等，又把它判成要重下 ——
-    同一个文件在两套判据下反复横跳。
+    回归背景（两个阶段）：
+      - v1.4.1 为了修「上一轮判成功、下一轮判要重下」，给回放加了 8% 短读
+        容差 —— 这等于留下一条「尺寸差不多就相信」的旁路。
+      - Round 12 删掉它：下载侧的完成真值改为「实得字节 == 经稳定窗口确认的
+        远端 size」（lms_live.verify_tail），确认值记进 `.download-index.json`，
+        增量判据与它精确比对；没有可信 size 的存量文件用本轮远端探测值精确比对。
+    所以 `already_complete` 不再接受 tolerance，`complete_tolerance()` 与
+    `lms_live.SHORT_TOLERANCE` 一并删除。
     """
 
     def _file(self, n):
@@ -1900,74 +2817,92 @@ class TestCompleteTolerance(Base):
             f.write(b"x" * n)
         return p
 
+    def test_exact_size_is_complete(self):
+        ok, local, exp = F.already_complete(self._file(1000), 1000)
+        self.assertTrue(ok)
+        self.assertEqual((local, exp), (1000, 1000))
+
     def test_attachment_needs_exact_size(self):
-        """普通附件仍然是严格判等 —— 不能给 PDF 放 8% 容差。"""
-        p = self._file(944)
-        ok, local, exp = F.already_complete(p, 1000)
-        self.assertFalse(ok, "普通附件 944/1000 必须判为不完整")
+        ok, local, exp = F.already_complete(self._file(944), 1000)
+        self.assertFalse(ok, "944/1000 必须判为不完整")
         self.assertEqual(local, 944)
         self.assertEqual(exp, 1000)
 
-    def test_replay_tolerates_short_read(self):
-        """回放 944/1000 少 5.6%，落在 SHORT_TOLERANCE 内 → 算完整。"""
-        import lms_live
-        p = self._file(944)
-        ok, _local, _exp = F.already_complete(
-            p, 1000, tolerance=lms_live.SHORT_TOLERANCE)
-        self.assertTrue(ok)
-
-    def test_replay_beyond_tolerance_is_incomplete(self):
-        import lms_live
-        p = self._file(800)
-        ok, _local, _exp = F.already_complete(
-            p, 1000, tolerance=lms_live.SHORT_TOLERANCE)
-        self.assertFalse(ok, "少 20% 超出容差，必须重下")
+    def test_replay_short_read_is_incomplete_too(self):
+        """回放（944000/1000000 少 5.6%）同样不完整 —— 旧容差已删除。"""
+        ok, _l, _e = F.already_complete(self._file(944000), 1000000)
+        self.assertFalse(ok, "回放不该再有任何短读容差")
 
     def test_local_larger_than_expected_is_incomplete(self):
-        """比声明还大 → 不完整，无论容差多少。"""
-        import lms_live
-        p = self._file(1200)
-        for tol in (0.0, lms_live.SHORT_TOLERANCE, 5.0):
-            ok, _l, _e = F.already_complete(p, 1000, tolerance=tol)
-            self.assertFalse(ok, "tolerance=%s 时不该判为完整" % tol)
+        ok, _l, exp = F.already_complete(self._file(1200), 1000)
+        self.assertFalse(ok, "比声明还大 → 来源可疑，必须重下")
+        self.assertEqual(exp, 1000)
 
-    def test_tolerance_boundary_value(self):
-        """正好等于容差 → 完整（与 lms_live 的 `<` 判定保持方向一致）。"""
-        import lms_live
-        boundary = int(1000 * (1 - lms_live.SHORT_TOLERANCE))
-        p = self._file(boundary)
-        ok, _l, _e = F.already_complete(
-            p, 1000, tolerance=lms_live.SHORT_TOLERANCE)
-        self.assertTrue(ok)
-        ok2, _l2, _e2 = F.already_complete(
-            self._file(boundary - 1), 1000,
-            tolerance=lms_live.SHORT_TOLERANCE)
-        self.assertFalse(ok2)
-
-    def test_complete_tolerance_per_kind(self):
-        """每个 kind 的容差取值：回放跟 lms_live 一致，其余为 0。"""
-        import lms_live
-        self.assertEqual(F.complete_tolerance("回放"),
-                         lms_live.SHORT_TOLERANCE)
-        for kind in ("课件", "作业", "录像"):
-            self.assertEqual(F.complete_tolerance(kind), 0.0)
-
-    def test_bad_tolerance_falls_back_to_zero(self):
-        p = self._file(999)
-        ok, _l, _e = F.already_complete(p, 1000, tolerance="junk")
-        self.assertFalse(ok)
-
-    def test_getsize_oserror_under_replay_tolerance(self):
-        """回放分支（带容差）同样不能被 OSError 带着走向「已完成」。"""
+    def test_getsize_oserror_stays_conservative(self):
         import unittest.mock as mock
-        import lms_live
         p = self._file(999)
         with mock.patch("os.path.getsize", side_effect=OSError(121, "semaphore")):
-            ok, local, exp = F.already_complete(
-                p, 1000, tolerance=lms_live.SHORT_TOLERANCE)
-        self.assertFalse(ok)
+            ok, local, exp = F.already_complete(p, 1000)
+        self.assertFalse(ok, "stat 失败不能走向「已完成」")
         self.assertEqual(local, 0)
         self.assertEqual(exp, 1000)
+
+    def test_tolerance_knobs_are_gone(self):
+        """★ 结构保证：容差入口整个消失，不给后人留后门。"""
+        import lms_live
+        self.assertFalse(hasattr(lms_live, "SHORT_TOLERANCE"))
+        self.assertFalse(hasattr(F, "complete_tolerance"))
+        self.assertNotIn("tolerance", F.already_complete.__code__.co_varnames)
+
+    # ---- 可信 size（索引确认值）才是增量判据的真值 ----
+
+    def test_indexed_size_read_from_confirmed_entry(self):
+        idx = {"course:1:live:-9:camera:1": {"path": "回放/a.mp4",
+                                            "name": "a.mp4", "size": 500}}
+        it = {"kind": "回放", "activity": "第1章", "name": "a.mp4", "uid": -9,
+              "camera_id": 1, "size": 999999}
+        self.assertEqual(F.indexed_size(it, idx, 1), 500)
+
+    def test_indexed_size_absent_when_entry_has_no_size(self):
+        """老索引 / 守卫分流留下的条目只有 path+name → 无可信 size。"""
+        idx = {"course:1:live:-9:camera:1": {"path": "回放/a.mp4",
+                                            "name": "a.mp4"}}
+        it = {"kind": "回放", "activity": "第1章", "name": "a.mp4", "uid": -9,
+              "camera_id": 1, "size": 999}
+        self.assertIsNone(F.indexed_size(it, idx, 1))
+
+    def test_indexed_size_absent_without_entry_or_index(self):
+        it = {"kind": "回放", "activity": "A", "name": "a.mp4", "uid": -9,
+              "camera_id": 1}
+        self.assertIsNone(F.indexed_size(it, None, 1))
+        self.assertIsNone(F.indexed_size(it, {}, 1))
+        self.assertIsNone(F.indexed_size(
+            it, {"course:1:live:-9:camera:1": {"size": 0}}, 1),
+            "0 不是可信 size")
+
+    def test_manifest_view_prefers_trusted_size(self):
+        """清单视图与下载主流程同判据：回放优先用索引确认的 size。
+
+        场景：响应头声明 999999（转码后期才长到那么大），索引里确认值是
+        5000，本地正好 5000 字节 —— 必须显示 exists，而不是又判要重下。
+        没有可信 size 时（老索引 / 首次）才退回本轮探测值精确比对。
+        """
+        out = os.path.join(self.tmp, "OUT")
+        d = os.path.join(out, "回放")
+        os.makedirs(d)
+        with open(os.path.join(d, "a.mp4"), "wb") as f:
+            f.write(b"x" * 5000)
+        args = FakeArgs(out=out, layout="flat", course="1")
+        it = {"kind": "回放", "activity": "第1章", "name": "a.mp4", "uid": -9,
+              "camera_id": 1, "camera": "encoder", "size": 999999}
+        index = {"course:1:live:-9:camera:1": {"path": "回放/a.mp4",
+                                              "name": "a.mp4", "size": 5000}}
+        rows = F.build_rows(None, [it], None, args, quiet=True, index=index)
+        self.assertEqual(rows[0]["status"], F.STATUS_EXISTS)
+        self.assertEqual(rows[0]["size"], 5000)
+        # 老索引（无可信 size）→ 用声明值精确比对 → 大小对不上，要重下
+        rows2 = F.build_rows(None, [it], None, args, quiet=True, index={})
+        self.assertEqual(rows2[0]["status"], F.STATUS_PLAN)
 
 
 class TestSevenZipCollision(Base):

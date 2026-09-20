@@ -33,8 +33,14 @@ BODY / ZIP 路径），v1.0.0 → v1.0.1 → v1.0.2 三次全靠手改，第 4 �
 3. **打包排除规则显式声明**：不靠 .gitignore 猜，用 EXCLUDE 列表 + 体积上限双重兜底，
    绝不把 __pycache__ / .git / 登录态打进 Release 包。
 4. **幂等**：--resume 让中断后可以重跑，不会重复建 tag / Release。
+5. **tag 必须绑定到明确的源码 commit**：优先级为
+   「已存在 tag 指向的 commit」>「本次原子推送产生的 commit」>「远端 main HEAD」。
+   并且校验的是**实际要上传的 zip**（不是工作区）与那个 commit 的 tree
+   逐文件一致，不一致就停下 —— 不允许出现「tag 指向 A、asset 来自 B」。
+   校验通过后用 sha256 锁定这份 zip，上传前再核对一次。
 """
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -42,6 +48,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import zipfile
 
 OWNER = "XLJFZ"
@@ -50,6 +57,12 @@ API = "https://api.github.com"
 PROXY = os.environ.get("HTTPS_PROXY") or "http://127.0.0.1:4774"
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
+
+# 打包白名单与推送白名单必须是同一份定义，否则「包里有什么」和
+# 「仓库里有什么」会各自漂移 —— 详见 tools/release_common.py。
+from tools import release_common as RC  # noqa: E402
 
 
 def find_src():
@@ -70,30 +83,13 @@ def find_src():
 SRC = find_src()
 ZIP_STEM = "xjtu-siyuanxuetang-grab"                # 压缩包与顶层文件夹名
 
-# 打进 Release 包的内容（白名单，不是黑名单 —— 新文件要显式加进来）
-INCLUDE = [
-    ".gitignore",
-    ".github",
-    "LICENSE",
-    "README.md",
-    "SKILL.md",
-    "prompt.md",
-    "release.py",
-    "scripts",
-    "tests",
-]
-
-# 就算在 INCLUDE 目录里也绝不打包
-EXCLUDE_NAMES = {
-    "__pycache__", ".git", ".pytest_cache", ".mypy_cache",
-    ".ruff_cache", ".venv", "venv", ".idea", ".vscode",
-}
-EXCLUDE_SUFFIX = (".pyc", ".pyo", ".pyd", ".log", ".swp")
-# 登录态 / 活动清单 / 浏览器 profile 绝不能进包（与 .gitignore 保持同步）
-EXCLUDE_STATE = re.compile(
-    r"(^|/)(state_.*\.json|.*\.state\.json|storage_state\.json|cookies.*\.json"
-    r"|activities_.*\.json|.*\.har)$", re.I)
-EXCLUDE_PROFILE = re.compile(r"(^|/)profile_[^/]+(/|$)")
+# 打进 Release 包 / 推上仓库的内容 —— 唯一定义在 tools/release_common.py
+INCLUDE = RC.INCLUDE
+# 排除规则同样只有一份定义（下面几处沿用旧名字，避免改动扩散）
+EXCLUDE_NAMES = RC.EXCLUDE_NAMES
+EXCLUDE_SUFFIX = RC.EXCLUDE_SUFFIX
+EXCLUDE_STATE = RC.EXCLUDE_STATE
+EXCLUDE_PROFILE = RC.EXCLUDE_PROFILE
 
 # 单个文件体积上限，超过就报警（防止误把课程资料打进去）
 MAX_FILE_MB = 5
@@ -134,37 +130,67 @@ def step(n, total, title):
 # ---------------------------------------------------------------- HTTP（走 curl）
 
 class ApiError(Exception):
-    pass
+    """GitHub 接口错误。code 为 HTTP 状态码，网络层失败时为 None。"""
+
+    def __init__(self, msg, code=None):
+        Exception.__init__(self, msg)
+        self.code = code
+
+
+def _curl_config():
+    """把凭据写进临时 curl 配置文件，避免 token 出现在 argv。
+
+    argv 在同一台机器上的其他进程可见（ps / 任务管理器 / WMI 查命令行），
+    token 放 `-H` 等于把凭据公开给本机所有进程。curl 配置文件的
+    `header = "..."` 与 -H 等价，但内容只存在于文件里。
+    文件用 mkstemp 创建（POSIX 下即 0600），用完立刻删除。
+    """
+    tok = token()
+    fd, path = tempfile.mkstemp(prefix="ghcurl_", suffix=".cfg")
+    try:
+        os.write(fd, ('header = "Authorization: Bearer %s"\n'
+                      'header = "Accept: application/vnd.github+json"\n'
+                      'header = "X-GitHub-Api-Version: 2022-11-28"\n'
+                      % tok).encode("utf-8"))
+    finally:
+        os.close(fd)
+    return path
 
 
 def curl_json(args, expect=None):
     """调 curl 并解析 JSON。expect 是允许的 HTTP 状态码集合。"""
+    cfg = _curl_config()
     cmd = ["curl", "-s", "--max-time", "180",
-           "-w", "\n%{http_code}",
-           "-H", "Authorization: Bearer " + token(),
-           "-H", "Accept: application/vnd.github+json"] + args
-    r = subprocess.run(cmd, capture_output=True, text=True,
-                       encoding="utf-8", errors="replace")
-    if r.returncode != 0:
-        raise ApiError("curl 退出码 %d: %s" % (r.returncode, r.stderr[:200]))
-    out = r.stdout
-    if "\n" not in out:
-        raise ApiError("curl 无输出: %s" % r.stderr[:200])
-    body, _, code_s = out.rpartition("\n")
+           "-w", "\n%{http_code}", "-K", cfg] + args
     try:
-        code = int(code_s.strip())
-    except ValueError:
-        raise ApiError("无法解析 HTTP 状态: %r" % code_s[:40])
-    try:
-        data = json.loads(body) if body.strip() else None
-    except json.JSONDecodeError:
-        data = {"__raw__": body[:400]}
-    if expect is not None and code not in expect:
-        msg = ""
-        if isinstance(data, dict):
-            msg = data.get("message", "")
-        raise ApiError("HTTP %d %s" % (code, msg[:200] or str(data)[:200]))
-    return code, data
+        r = subprocess.run(cmd, capture_output=True, text=True,
+                           encoding="utf-8", errors="replace")
+        if r.returncode != 0:
+            raise ApiError("curl 退出码 %d: %s" % (r.returncode, r.stderr[:200]))
+        out = r.stdout
+        if "\n" not in out:
+            raise ApiError("curl 无输出: %s" % r.stderr[:200])
+        body, _, code_s = out.rpartition("\n")
+        try:
+            code = int(code_s.strip())
+        except ValueError:
+            raise ApiError("无法解析 HTTP 状态: %r" % code_s[:40])
+        try:
+            data = json.loads(body) if body.strip() else None
+        except json.JSONDecodeError:
+            data = {"__raw__": body[:400]}
+        if expect is not None and code not in expect:
+            msg = ""
+            if isinstance(data, dict):
+                msg = data.get("message", "")
+            raise ApiError("HTTP %d %s" % (code, msg[:200] or str(data)[:200]),
+                           code)
+        return code, data
+    finally:
+        try:
+            os.remove(cfg)
+        except OSError:
+            pass
 
 
 def token():
@@ -178,28 +204,18 @@ def token():
 # ---------------------------------------------------------------- 打包
 
 def collect_files(src):
-    """按 INCLUDE 白名单收集文件，返回 [(绝对路径, 包内相对路径)]。"""
-    out = []
+    """按 INCLUDE 白名单收集文件，返回 [(绝对路径, 包内相对路径)]。
+
+    收集规则只有一份实现（tools/release_common.collect）——
+    本地打包、原子推送、CI 打包三处共用，否则「包里有什么」和
+    「仓库里有什么」会各自漂移，而 tag 只能绑定到其中一个。
+    """
+    files = RC.collect(src)
+    present = {rel.split("/")[0] for _p, rel in files}
     for entry in INCLUDE:
-        full = os.path.join(src, entry)
-        if not os.path.exists(full):
-            warn("INCLUDE 里的 %s 不存在，跳过" % entry)
-            continue
-        if os.path.isfile(full):
-            out.append((full, entry))
-            continue
-        for root, dirs, files in os.walk(full):
-            dirs[:] = [d for d in dirs if d not in EXCLUDE_NAMES]
-            for fn in sorted(files):
-                p = os.path.join(root, fn)
-                rel = os.path.relpath(p, src).replace(os.sep, "/")
-                if fn in EXCLUDE_NAMES or fn.endswith(EXCLUDE_SUFFIX):
-                    continue
-                if EXCLUDE_STATE.search(rel) or EXCLUDE_PROFILE.search(rel):
-                    warn("跳过疑似凭据/个人数据：%s" % rel)
-                    continue
-                out.append((p, rel))
-    return sorted(out, key=lambda x: x[1])
+        if entry not in present:
+            warn("INCLUDE 里的 %s 不存在或没有可打包内容，跳过" % entry)
+    return files
 
 
 def build_zip(src, version, dry_run=False):
@@ -271,10 +287,12 @@ def verify_zip(zip_path):
         root = os.path.join(tmp, ZIP_STEM)
 
         # 关键文件必须在
-        for must in ("README.md", "SKILL.md", "scripts/lms_fetch.py",
+        for must in ("README.md", "SKILL.md", "docs/MAINTAINING.md",
+                     "scripts/lms_fetch.py",
                      "scripts/lms_organize.py", "scripts/lms_selfcheck.py",
                      "tests/test_organize.py", "tests/test_fetch.py",
-                     "tests/test_selfcheck.py",
+                     "tests/test_selfcheck.py", "tests/test_push.py",
+                     "tools/gh_push_dir.py", "tools/release_common.py",
                      ".github/workflows/ci.yml", ".github/workflows/release.yml",
                      ".github/scripts/pack.py"):
             if not os.path.isfile(os.path.join(root, must)):
@@ -289,7 +307,8 @@ def verify_zip(zip_path):
         # 跑离线测试（每个文件都要跑，别只跑一个）
         n_files = 0
         total_ran = 0
-        for t in ("test_organize.py", "test_fetch.py", "test_selfcheck.py"):
+        for t in ("test_organize.py", "test_fetch.py", "test_selfcheck.py",
+                  "test_push.py"):
             r = subprocess.run([sys.executable,
                                 os.path.join(root, "tests", t)],
                                capture_output=True, text=True)
@@ -337,30 +356,192 @@ def release_by_tag(tag):
     return d if code == 200 else None
 
 
-def push_code(src, branch="main"):
-    """调 gh_push_dir.py 把源目录推上去（复用已有脚本，不重写）。
+def remote_tree(sha):
+    """取某个 commit 的完整文件清单 -> {path: (blob_sha, mode)}。
 
-    注意：找不到推送脚本时**必须报错退出**，不能静默跳过 ——
-    否则会出现「包是新的、仓库代码是旧的」这种最危险的不一致。
-
-    推送范围**必须与打包白名单一致**（INCLUDE）。gh_push_dir 默认是全目录遍历，
-    源目录里任何散落文件都会被推上仓库 —— 踩过：旧的 v1.2.0.zip 就是这样混进去的。
+    这是「tag SHA 与本地内容是否一致」的判据来源：Git 的 blob sha 由内容决定，
+    所以本地文件与远端同一路径的 blob sha 相同，即证明是同一份内容。
     """
-    pusher = os.path.join(HERE, "gh_push_dir.py")
-    pusher = os.path.abspath(pusher)
+    _code, c = curl_json(["https://api.github.com/repos/%s/%s/git/commits/%s"
+                          % (OWNER, REPO, sha)], expect=(200,))
+    _code, t = curl_json(["https://api.github.com/repos/%s/%s/git/trees/%s"
+                          "?recursive=1" % (OWNER, REPO, c["tree"]["sha"])],
+                         expect=(200,))
+    if t.get("truncated"):
+        raise SystemExit("远端 tree 被截断，无法完成一致性校验（仓库过大）")
+    out = {}
+    for it in t.get("tree", []):
+        if it.get("type") == "blob":
+            out[it["path"]] = (it.get("sha"), it.get("mode") or "100644")
+    return out
+
+
+def tag_commit_sha(tag):
+    """tag 指向的 commit SHA。annotated tag 需要再解一层。"""
+    _code, d = curl_json(["https://api.github.com/repos/%s/%s/git/ref/tags/%s"
+                          % (OWNER, REPO, tag)], expect=(200,))
+    obj = d["object"]
+    if obj.get("type") == "tag":
+        _code, t = curl_json(["https://api.github.com/repos/%s/%s/git/tags/%s"
+                              % (OWNER, REPO, obj["sha"])], expect=(200,))
+        obj = t["object"]
+    return obj["sha"]
+
+
+def sha256_file(path):
+    """分块算文件 sha256 —— zip 可能有上百 MB，不能整个读进内存。"""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for blk in iter(lambda: f.read(1 << 20), b""):
+            h.update(blk)
+    return h.hexdigest()
+
+
+def archive_blobs(zip_path):
+    """解压 Release zip，返回 {包内相对路径: git blob sha}。
+
+    ★ 比对对象是「实际要上传的那个 zip」，不是当前工作区：
+      打包和推送之间存在 TOCTOU —— 若工作区在打包之后又被改过，
+      「工作区 == 远端」的校验会通过，但发出去的仍是旧内容。
+      只有 zip 本身才算数。
+
+    zip 里有一层顶层目录 ZIP_STEM/，比对前剥掉，否则每个路径都多一段前缀。
+    范围仍由 tools/release_common.py 的 INCLUDE / 排除规则决定，
+    不另立一份清单。
+    """
+    tmp = tempfile.mkdtemp(prefix="archblob_")
+    try:
+        with zipfile.ZipFile(zip_path) as z:
+            z.extractall(tmp)
+        root = os.path.join(tmp, ZIP_STEM)
+        if not os.path.isdir(root):
+            raise SystemExit("压缩包顶层不是 %s/，结构不对" % ZIP_STEM)
+        return RC.local_blobs(root)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def verify_archive_matches_remote(zip_path, sha):
+    """★ 最终不变量：实际 zip 的内容 == source_sha 对应 commit 的源码。
+
+    三个方向都要查，缺一不可：
+      missing —— zip 里有、远端 commit 没有（打包进了未提交的东西）
+      changed —— 两边都有但内容不同（最典型的 TOCTOU 症状）
+      absent  —— 远端有、zip 里没有（推送了却没打进包，发布不完整）
+
+    返回 {ok, missing, changed, absent, n_archive}。
+    """
+    archive = archive_blobs(zip_path)
+    remote = remote_tree(sha)
+    missing = sorted(p for p in archive if p not in remote)
+    changed = sorted(p for p in archive
+                     if p in remote and remote[p][0] != archive[p])
+    absent = sorted(p for p in remote
+                    if RC.in_scope(p) and p not in archive)
+    return {"ok": not (missing or changed or absent),
+            "missing": missing, "changed": changed, "absent": absent,
+            "n_archive": len(archive)}
+
+
+def report_archive_mismatch(sha, rep):
+    for p in rep["missing"]:
+        err("包里有、远端 %s 没有：%s" % (sha[:12], p))
+    for p in rep["changed"]:
+        err("内容不一致（包 vs commit）：%s" % p)
+    for p in rep["absent"]:
+        err("远端有、包里没有：%s" % p)
+
+
+def assert_archive_unchanged(zip_path, expected_sha256):
+    """上传前再算一次 zip 的 sha256，防止「校验通过后被替换」。"""
+    actual = sha256_file(zip_path)
+    if actual != expected_sha256:
+        err("压缩包在校验之后被改动过（sha256 %s != %s），停止上传"
+            % (actual[:12], expected_sha256[:12]))
+        raise SystemExit(1)
+
+
+def push_code(src, version, branch="main"):
+    """用仓库内的原子推送器同步源码，返回本次产生的 commit SHA。
+
+    ★ 为什么必须由它返回 SHA 而不是回头去读 main：
+      `push` 完成后再 `get_main_sha()`，读到的是「此刻的 main」——
+      如果这中间又有人推了一次，拿到的就是别人的 commit，
+      tag 会打在错误的位置上。推送器自己知道它创建了哪个 commit，
+      由它返回才是可靠的。
+
+    ★ 为什么不再容忍「部分成功」：旧脚本遇到无权限文件会跳过但退出码仍为 0，
+      于是「包是完整的、仓库是残缺的」也能一路走到发版。
+      现在的推送器要么整体成功、要么整体失败。
+    """
+    pusher = os.path.abspath(os.path.join(HERE, "tools", "gh_push_dir.py"))
     if not os.path.isfile(pusher):
-        err("找不到推送脚本 %s" % pusher)
-        err("要么把它放回该位置，要么去掉 --push-code 参数")
+        err("找不到仓库内的推送脚本 %s" % pusher)
+        err("它随仓库一起分发；如果是旧版本解压出来的包，请重新下载完整包")
         raise SystemExit(1)
-    r = subprocess.run([sys.executable, pusher, src, "%s/%s" % (OWNER, REPO),
-                        branch, ",".join(INCLUDE)],
-                       capture_output=True, text=True, encoding="utf-8", errors="replace")
-    for line in (r.stdout or "").splitlines()[-14:]:
-        info(line)
-    if r.returncode != 0:
-        err("代码推送失败")
-        print((r.stdout or "") + (r.stderr or ""))
+
+    fd, result_path = tempfile.mkstemp(prefix="pushres_", suffix=".json")
+    os.close(fd)
+    cmd = [sys.executable, pusher,
+           "--src", src, "--repo", "%s/%s" % (OWNER, REPO),
+           "--branch", branch,
+           "--message", "release: prepare v%s" % version,
+           "--result-json", result_path]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True,
+                           encoding="utf-8", errors="replace")
+        for line in (r.stdout or "").splitlines()[-16:]:
+            info(line)
+        if r.returncode != 0:
+            err("代码推送失败（退出码 %d）" % r.returncode)
+            err("推送器在有文件没推成功时不会返回 0，不要绕过这一步")
+            print((r.stdout or "") + (r.stderr or ""))
+            raise SystemExit(1)
+        try:
+            with open(result_path, encoding="utf-8") as f:
+                rep = json.load(f)
+        except (OSError, ValueError) as e:
+            err("读不到推送结果：%s" % e)
+            raise SystemExit(1)
+    finally:
+        try:
+            os.remove(result_path)
+        except OSError:
+            pass
+
+    sha = rep.get("sha")
+    if not sha:
+        err("推送结果里没有 commit SHA，无法把 tag 绑定到明确的源码")
         raise SystemExit(1)
+    info("变更 +%d / ~%d / -%d，未变 %d"
+         % (len(rep.get("added") or []), len(rep.get("modified") or []),
+            len(rep.get("deleted") or []), rep.get("unchanged", 0)))
+    return sha
+
+
+def resolve_source_sha(args, src, tag):
+    """确定本次发布要打 tag 的 commit SHA。
+
+    优先级：
+      ① tag 已存在      -> 用它已经指向的 commit（已发布内容不可变，
+                            --resume 只能补缺，不能换内容）
+      ② --push-code     -> 原子推送返回的那个 commit
+      ③ 其余            -> 远端 main HEAD
+
+    注意：这里**不做内容校验**。源码内容是否与发布包一致，
+    由之后的 verify_archive_matches_remote() 用「实际 zip」去证明 ——
+    工作区比较挡不住打包与推送之间的改动（TOCTOU）。
+    """
+    if tag_exists(tag):
+        sha = tag_commit_sha(tag)
+        info("tag %s 已存在，内容以它指向的 %s 为准" % (tag, sha[:12]))
+    elif args.push_code:
+        sha = push_code(src, args.version)
+        ok("原子推送完成，一个 commit：%s" % sha[:12])
+    else:
+        sha = get_main_sha()
+        info("未推送代码，以远端 main HEAD %s 为源码 commit" % sha[:12])
+    return sha
 
 
 def create_tag(tag, sha):
@@ -416,22 +597,42 @@ def update_notes(tag, name, body):
     return d
 
 
-def upload_asset(release_id, zip_path):
-    """上传附件。必须走 curl —— urllib 经代理对 uploads.github.com 会 502。"""
+# 值得重试的上传失败：限流与服务端临时故障。
+# 其余 4xx（400 参数错、401 凭据错、404 release 不存在、422 校验失败）
+# 重试多少次都是同一个结果，盲目重试只会拖长失败时间。
+RETRY_ASSET_STATUS = (408, 425, 429, 500, 502, 503, 504)
+
+
+def upload_asset(release_id, zip_path, attempts=3):
+    """上传附件。必须走 curl —— urllib 经代理对 uploads.github.com 会 502。
+
+    ★ 旧写法是 `code, d = curl_json(..., expect=(201,))` 之后判断 code：
+      curl_json 在返回非 201 时**已经抛了 ApiError**，那句 `warn(重试)`
+      永远执行不到，第二次 attempt 也就永远不存在。现在改成在
+      except 里决定要不要重试，并按状态码区分「临时故障」与「永久错误」。
+    """
     zsize = os.path.getsize(zip_path)
-    for attempt in (1, 2):
-        code, d = curl_json([
-            "-X", "POST",
-            "-H", "Content-Type: application/zip",
-            "-H", "Content-Length: %d" % zsize,
-            "--data-binary", "@" + zip_path,
-            "https://uploads.github.com/repos/%s/%s/releases/%d/assets?name=%s"
-            % (OWNER, REPO, release_id, os.path.basename(zip_path)),
-        ], expect=(201,))
-        if code == 201:
+    last = None
+    for attempt in range(1, attempts + 1):
+        try:
+            _code, d = curl_json([
+                "-X", "POST",
+                "-H", "Content-Type: application/zip",
+                "-H", "Content-Length: %d" % zsize,
+                "--data-binary", "@" + zip_path,
+                "https://uploads.github.com/repos/%s/%s/releases/%d/assets?name=%s"
+                % (OWNER, REPO, release_id, os.path.basename(zip_path)),
+            ], expect=(201,))
             return d
-        warn("第 %d 次上传返回 %d，重试" % (attempt, code))
-    raise ApiError("附件上传失败")
+        except ApiError as e:
+            last = e
+            if e.code is not None and e.code not in RETRY_ASSET_STATUS:
+                raise                       # 4xx 是永久错误，重试没有意义
+            if attempt == attempts:
+                raise
+            warn("第 %d 次上传失败（%s），%d 秒后重试" % (attempt, e, 3 * attempt))
+            time.sleep(3 * attempt)
+    raise last
 
 
 # ---------------------------------------------------------------- 主流程
@@ -490,7 +691,7 @@ def main():
     print("  发布 %s/%s  →  %s" % (OWNER, REPO, tag))
     print("=" * 62)
 
-    total_steps = 4 if args.dry_run else (6 if args.push_code else 5)
+    total_steps = 4 if args.dry_run else 7
     n = 0
 
     # ---- 1. 版本号自检 ----
@@ -536,36 +737,55 @@ def main():
     verify_zip(zip_path)
     ok("压缩包结构正确、无登录态、离线测试通过")
 
-    # ---- 4. 推代码（可选）----
-    if args.push_code:
-        n += 1
-        step(n, total_steps, "推送代码到 main")
-        push_code(SRC)
-        ok("代码已推送")
+    # ---- 4. 确定源码 commit（可选推代码）----
+    n += 1
+    step(n, total_steps, "确定源码 commit")
+    source_sha = resolve_source_sha(args, SRC, tag)
 
-    # ---- 5. 确认 ----
+    # ---- 5. 实际发布包 vs 源码 commit 逐文件校验 ----
+    # ★ 校验对象是 zip 本身，不是工作区。打包之后工作区又被动过的场景
+    #   （TOCTOU）在这里暴露：zip 还是旧内容，而 push 的已是新内容，
+    #   若拿工作区比会「验证通过」，发出去的却是旧包。
+    n += 1
+    step(n, total_steps, "校验实际发布包与源码 commit 一致")
+    arep = verify_archive_matches_remote(zip_path, source_sha)
+    if not arep["ok"]:
+        err("压缩包内容与远端 %s 的源码不一致，停止发布" % source_sha[:12])
+        report_archive_mismatch(source_sha, arep)
+        err("多半是打包之后工作区又变了 —— 重新跑一次发布即可")
+        raise SystemExit(1)
+    ok("zip 内 %d 个文件与源码 commit %s 的 tree 逐文件一致"
+       % (arep["n_archive"], source_sha[:12]))
+
+    # 锁定这一个 zip：之后无论谁改它，上传前都会被 sha256 拦下
+    archive_sha256 = sha256_file(zip_path)
+    info("asset sha256: %s" % archive_sha256)
+
+    # ---- 6. 确认 ----
     if not args.yes:
         print("\n即将发布 %s，附件 %s (%.1f KB)"
               % (tag, os.path.basename(zip_path), os.path.getsize(zip_path) / 1024))
+        print("源码 commit: %s" % source_sha)
+        print("asset sha256: %s" % archive_sha256)
         ans = input("确认？[y/N] ").strip().lower()
         if ans not in ("y", "yes"):
             info("已取消。压缩包留在 %s" % zip_path)
             return 0
 
-    # ---- 6. 打 tag + 建 Release + 传附件 ----
+    # ---- 7. 打 tag + 建 Release + 传附件 ----
     n += 1
     step(n, total_steps, "打 tag / 建 Release / 传附件")
+    assert_archive_unchanged(zip_path, archive_sha256)
 
     existing = release_by_tag(tag) if args.resume else None
     if existing:
         ok("Release 已存在，跳过创建：%s" % existing["html_url"])
+        info("内容仍绑定原 commit %s（--resume 只补缺，不改内容）" % source_sha[:12])
         rel = existing
     else:
-        sha = get_main_sha()
-        info("目标 commit: %s" % sha[:12])
         if not tag_exists(tag):
-            create_tag(tag, sha)
-            ok("tag %s 已创建" % tag)
+            create_tag(tag, source_sha)
+            ok("tag %s 已创建 -> %s" % (tag, source_sha[:12]))
         body = ""
         if args.notes:
             with open(args.notes, encoding="utf-8") as f:
@@ -583,8 +803,11 @@ def main():
                        % (OWNER, REPO, a["id"])], expect=(204, 200))
             warn("删掉同名旧附件 %s" % a["name"])
 
+    # 上传前最后一次确认：就是校验过的那个文件，一个字节都不能变
+    assert_archive_unchanged(zip_path, archive_sha256)
     up = upload_asset(rel["id"], zip_path)
-    ok("附件 %s (%.1f KB)" % (up.get("name"), up.get("size", 0) / 1024))
+    ok("附件 %s (%.1f KB，sha256 %s…)"
+       % (up.get("name"), up.get("size", 0) / 1024, archive_sha256[:12]))
 
     print("\n" + "=" * 62)
     print("  发布完成")

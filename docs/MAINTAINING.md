@@ -13,8 +13,8 @@ README 面向「拿到仓库想用它下课件的人」，只保留：Skill 定�
 
 | 内容 | 在哪 |
 |---|---|
-| 发版流程（方式 A / 方式 B）、三层保护、`release.py` 参数 | 本文「发版流程」 |
-| CI / 自动发版的配置细节、workflows 权限 | 本文「CI 配置」+「GitHub Actions 的实测坑」 |
+| 发版流程（方式 A / 方式 B）、四层保护、`release.py` 参数 | 本文「发版流程」 |
+| CI / 手动备用发版的配置细节、workflows 权限 | 本文「CI 配置」+「GitHub Actions 的实测坑」 |
 | 文档站的发布与排错 | 本文「文档站」 |
 | 测试覆盖矩阵、时区用例、`FakeOpener` 范式 | 本文「测试矩阵与覆盖明细」 |
 | v1.0.0 ~ v1.2.1 的历史更新日志 | 本文「完整更新日志」 |
@@ -49,11 +49,15 @@ python push_docs.py
 python push_docs.py --dry-run
 ```
 
-### 为什么不用 `gh_push_dir.py`
+### 为什么另外写 `push_docs.py`，而不用 `tools/gh_push_dir.py`
 
-那个脚本推**整个目录**。如果拿它推这个仓库，会把已有的 12 个文件（`README.md`、
-`release.py`、`tests/` 等）全部重推一遍，**每个都产生一条无意义的 commit**。
-`push_docs.py` 把顶层目录写死成 `docs`，避免这个问题。
+`tools/gh_push_dir.py` 推的是**发布白名单**（`tools/release_common.py` 的
+`INCLUDE`），范围是整个项目源码。文档站只想更新 `docs/` 一个目录，
+没必要让一次文档改动带着源码一起进 diff。
+
+`push_docs.py` 把顶层目录写死成 `docs`，职责单一。
+（顺带说明：新版 `gh_push_dir.py` 已经只对变化文件建 blob、且无变化时不建
+commit，所以用它推也不会再产生一堆空 commit —— 分开的原因是范围，不是效率。）
 
 ### 为什么发布源是 `main/docs` 而不是 `gh-pages` 分支
 
@@ -356,10 +360,14 @@ token 就必须先经过 AI 的上下文；而且明文文件对同机器任何�
 | 存储库权限 → 内容 | 读取和写入 |
 
 **`.github/workflows/` 下的文件例外**（2026-09-19 起 workflow 已直接放进仓库）：
-推它们需要 **`Workflows: write`** 权限，只有 `Contents: write` 时 Contents API
-会 403。`gh_push_dir.py` 遇到这种情况会**跳过这些文件并明确列出剩余清单**（退出码 0），
-此时在网页端 *Add file → Upload files* 手动上传，或换带 workflows 权限的 token。
-日常改代码不需要每次都推 workflows 文件。
+推它们需要 **`Workflows: write`** 权限，只有 `Contents: write` 时会被 403。
+
+⚠️ **行为在 v1.4.2 变了**：旧推送器遇到无权限文件会**跳过并仍以 0 退出**，
+于是「仓库少几个文件」这件事被静默吞掉，一路走到发版。
+现在的原子推送器要么整体成功、要么整体失败（非零退出），
+`release.py` 读到非零就停下。所以缺 workflows 权限时，
+**要么换带该权限的 token，要么在网页端手动上传这几个文件**，
+没有「先跳过、以后再说」这个选项。日常改代码不需要每次都推 workflows 文件。
 
 > **细粒度 token 编辑权限后，token 字符串不变。** 实测（2026-09-20）：
 > 给已有 token 在网页上补勾「Workflows → 读取和写入」并保存后，
@@ -404,26 +412,48 @@ GitHub 的 `windows-latest` runner 终端编码是 **cp1252**，脚本 `--help` 
 新脚本只要 import 了 `lms_common` 就自动受保护；**不经过 lms_common 的脚本**
 （如 CI 用的 `.github/scripts/pack.py`）要么避免中文输出，要么自己加同样的防护。
 
-### 坑二：`gh_push_dir.py` 只增改、不删除
+### 坑二：删除只在白名单范围内发生（v1.4.2 起已支持删除）
 
-它对每个文件做 GET → PUT，**不会删除远端已有文件**。本地删掉的文件
-（如 v1.4.0 删掉的 `ci.yml.txt` 等四个模板）会一直残留在远端 main 上。
-清理方式：`DELETE /repos/<o>/<r>/contents/<path>`，body 带
-`{"sha": <该文件当前sha>, "branch": "main"}`。删除后记得复核远端根目录。
+v1.4.2 之前的推送器对每个文件做 GET → PUT，**根本不会删除远端文件**，
+本地删掉的（如 v1.4.0 删掉的几个模板）会一直残留在远端 main 上。
 
-### 坑三：CI 触发是按 commit 的
+现在走 tree API，本地没有、远端有的文件会带 `sha: null` 进 tree 条目，
+即真实删除。但有两个边界必须知道：
 
-`on: push: branches: [main]` 对**每个 commit** 都触发。`gh_push_dir.py`
-逐文件提交，推一批文件会产生多个 commit、多个 CI run——看到一排 run 别慌，
-**只看 head sha 对应（最新）那条的结论**，前面的中途 run 可以无视。
-另外 `release.yml` 靠「推 `v*` tag」触发，本机 git 推不了 tag，
-发版仍走 `release.py` 本地方案（方式 A）。
+- **只删白名单（`INCLUDE`）范围内的路径。** 仓库里白名单之外的东西
+  （遗留脚本、历史产物）不会被这次推送删掉 —— 避免一次同步把
+  不属于本项目的文件悄悄清掉。
+- 想手动删某个文件仍可用 `DELETE /repos/<o>/<r>/contents/<path>`，
+  body 带 `{"sha": <该文件当前sha>, "branch": "main"}`。
+
+### 坑三：CI 触发是按 commit 的（v1.4.2 起已大幅缓解）
+
+`on: push: branches: [main]` 对**每个 commit** 都触发。旧推送器逐文件提交，
+推一批文件会产生 N 个 commit、N 个 CI run，免费 runner 互相挤队列，
+一次发布要等十几分钟。
+
+v1.4.2 起一次源码同步 = **一个 commit**，CI 只触发一次。
+另外 `release.yml` 不监听任何 push 事件（只保留手动触发、且只发布已存在的 tag），
+发版走 `release.py` 本地方案（方式 A）。
 
 ---
 
 ## 发版流程
 
-### 方式 A：本地一键（推荐，本机 git 协议不通时唯一可行）
+### 唯一 publisher：`release.py`
+
+**本仓库只有一个默认 publisher —— 本地的 `release.py`。**
+`.github/workflows/release.yml` **不再监听 `push: tags:`**（v1.4.2 收口），
+`release.py` 打 tag 后不会再在 Actions 里触发第二次发布。
+以前两边同时发：同名附件竞争、标题/正文互相覆盖、
+「本地成功但 workflow 失败」还是「反过来」说不清 —— 现在只有一条路。
+
+`release.yml` 保留为**手动备用**：网页 Actions 页输入版本号触发，
+**只发布「已经存在的 tag」对应的冻结提交**（语义见下文「方式 B」）。
+
+---
+
+### 方式 A：本地一键（默认，本机 git 协议不通时唯一可行）
 
 ```bash
 set GH_TOKEN=github_pat_xxx
@@ -432,14 +462,27 @@ python release.py --version 1.1.0 --title "下载可靠性" --dry-run   # 先看
 python release.py --version 1.1.0 --title "下载可靠性" --yes       # 正式发
 ```
 
-它会依次做：**版本号自检 → 打包 → 包体校验 → 打 tag → 建 Release → 传附件**。
+完整流程与顺序：
+
+```text
+1  版本号自检（tag 未被占用 / resume 只在缺东西时继续）
+2  打包（从当前工作区生成 zip）
+3  包体校验（解压跑离线测试 + 隐私检查）
+4  确定源码 commit（--push-code 则先原子推送，tag 优先级见下）
+5  校验「实际 zip」== 源码 commit 的 tree   ← 对象是 zip，不是工作区
+6  sha256 锁定这份 zip + 人工确认
+7  tag(source_sha) → Release → 再核 sha256 → 上传同一个文件
+```
+
+关键是 **第 5 步验证通过的那份 zip，就是第 7 步上传的那份**：
+校验后任何改动（哪怕一个字节）都会被上传前的 sha256 复核拦下。
 
 | 参数 | 作用 |
 |---|---|
 | `--dry-run` | 只打包 + 列清单，不碰 GitHub |
-| `--push-code` | 发布前先把源码推到 main（注意：依赖旁边的 `gh_push_dir.py`） |
+| `--push-code` | 发布前用仓库内的 `tools/gh_push_dir.py` 原子推送源码，并把 tag 绑定到它返回的 commit |
 | `--notes notes.md` | 用文件里的内容当 Release 说明 |
-| `--resume` | 上次发到一半中断了，只补缺的部分 |
+| `--resume` | 见下方「`--resume` 的真实语义」—— 不是「恢复任意旧版本」 |
 | `--update-notes` | 只更新已发布 Release 的说明，不重新打包 |
 | `--yes` | 跳过发布前确认。**脚本化/自动化调用必须加**，否则 `input()` 会 `EOFError` |
 
@@ -448,33 +491,234 @@ python release.py --version 1.1.0 --title "下载可靠性" --yes       # 正式
 > （新版已自动剥掉重复前缀，但仍建议只写后半段。）
 
 > **改代码要在打包之前。** `release.py` 自己也在发布内容里（`INCLUDE` 含它），
-> 如果打包后才改它，就会出现「zip 里是旧版、仓库里是新版」的不一致。
+> 如果打包后才改它，第 5 步的 archive 校验会直接拦下 —— 这是设计行为，不是误报。
 
 `release.py` 放在仓库内外都能跑：它会自动判断自己在维护者工作区
 （源目录是旁边的 `xjtu-lms-grab/`）还是在仓库内（源目录就是自己所在目录）。
 
-**三层保护：**
+**四层保护：**
 
 1. **版本号自检** —— tag 已存在就报错退出。已发布的版本内容不可变，要改就发新版本号。
    （这条是踩过坑换来的：v1.0.0 曾被原地覆盖过。）
 2. **包体校验** —— 上传前解压到临时目录，确认关键文件齐全、没混进登录态、
-   离线测试能过（三个测试文件，共 212 个用例；用例数由测试自己报出，并与
+   离线测试能过（四个测试文件，共 330 个用例；用例数由测试自己报出，并与
    静态扫描的 `def test_` 数量交叉核对，对不上就告警）。校验不过就不发。
-3. **打包白名单** —— 用 `INCLUDE` 显式列出该打进去的东西，新文件必须手动加；
+3. **artifact identity 校验**（v1.4.2 起）—— `verify_archive_matches_remote()`
+   把**实际 zip** 的每个文件算成 Git blob sha，与源码 commit 的 tree 逐条比对，
+   外加 sha256 锁。见下一节。
+4. **打包白名单** —— 用 `INCLUDE` 显式列出该打进去的东西，新文件必须手动加；
    另有体积上限兜底，防止课程资料误入。
-   **这份清单和 CI 用的 `.github/scripts/pack.py` 必须保持一致** —— 否则本地发的包和 CI 发的包内容不同。
+   白名单的唯一定义在 **`tools/release_common.py`**，`release.py`、
+   `tools/gh_push_dir.py`、`.github/scripts/pack.py` 三处都引用它，
+   不存在「各存一份然后漂移」的可能。
 
-### 方式 B：GitHub Actions 自动发
+### tag 绑定到哪个 commit（v1.4.2 起）
 
-启用 workflow 后，打一个 tag 就自动发布：
+以前是「推完代码 → 再读一次远端 main HEAD → 拿它打 tag」。
+这两个动作之间如果又有人推了一次（或推送只成功了一部分），
+tag 就会打在别人的 commit 上，而 zip 却来自本地工作区 ——
+**asset 与 tag 指向的源码不一致**，这是最难事后发现的一类发布事故。
 
-```bash
-git tag v1.1.0 && git push origin v1.1.0
+现在的取值顺序是：
+
+| 情形 | 源码 commit | 说明 |
+|---|---|---|
+| tag 已存在 | tag 当前指向的 commit | `--resume` 只补缺，不能换内容 |
+| `--push-code` | 原子推送**返回**的那个 commit | 推送器自己知道建了谁，不靠回读 main |
+| 其余 | 远端 main HEAD | 由第 5 步证明 zip 与它一致 |
+
+### artifact identity：比对对象是 zip，不是工作区
+
+早期版本校验的是「工作区 vs 远端 tree」，这挡不住 TOCTOU：
+
+```text
+t1  build_zip() 从工作区 A 打出包
+t2  工作区某文件被改成 B
+t3  push B → 远端 main = B
+t4  「工作区 vs 远端」= B vs B → 验证通过
+    但发出去的 asset 仍是 A，tag 却指向 B
 ```
 
-或在仓库 Actions 页面手动触发 `Release`，输入版本号。
+所以最终不变量必须是：
 
-> 前提是 **git push 通**。本机不通（见「本机环境约束」），所以实际仍走方式 A。
+```text
+zip payload 的 blob 集合  ==  source_sha tree 的 blob 集合（按发布范围）
+校验时的 zip sha256       ==  上传前的 zip sha256
+```
+
+`verify_archive_matches_remote()` 做三件事，任一不满足即停止发布：
+
+| 检查 | 含义 |
+|---|---|
+| `missing` | 包里有、commit 没有 → 打进了未提交的东西 |
+| `changed` | 两边都有但内容不同 → 典型 TOCTOU 症状 |
+| `absent`  | commit 有（发布范围内）、包里没有 → 推送了却没打进包 |
+
+范围仍由 `tools/release_common.py` 的 `INCLUDE` / 排除规则决定，
+不另立一份清单；zip 顶层的 `xjtu-siyuanxuetang-grab/` 目录在比对前剥掉。
+
+配套的两条硬约束：
+
+- **绝不强制（force）更新 main。** ref 更新带 `force: false`，
+  这不是严格意义的 compare-and-swap，而是**基于 parent SHA 的乐观并发保护 /
+  非强制 fast-forward 更新**：新 commit 的 parent 是 base=A，
+  若 main 仍是 A 则 A→B 是 fast-forward、允许；若 main 已被推到 C，
+  C→B 不是 fast-forward，GitHub 直接拒绝（409/422），本次推送整体放弃并报错。
+  安全性足够，但不要把它描述成 CAS。
+- **`--resume` 不能改内容。** 见下。
+
+### `--resume` 的真实语义
+
+它**只补缺失的 Release / 附件**，不会也不能「把旧版本重新构建出来」：
+
+```text
+tag=A，当前工作区=B
+--resume
+  → source_sha = A（tag 已指向的 commit，不重新推送、不取新代码）
+  → 校验「实际 zip」是否与 A 的 tree 一致
+  → 不一致（工作区已经是 B，本地无法证明能重建 A 的内容）→ 停止发布
+```
+
+也就是说：**如果工作区已经变化且无法重建原 tag 内容，`--resume` 会停下，
+不会拿新代码补旧版本。** 想发新代码，请换一个新版本号。
+
+### 方式 B：GitHub Actions 手动备用发布
+
+`release.yml` **只保留 `workflow_dispatch`**，不监听任何 push 事件（含 tag push）。
+语义是「**发布一个已经冻结的 tag**」，不是「把当前 main 发布为新版本」：
+
+```text
+workflow_dispatch(version=1.4.2)
+↓
+source job：tag v1.4.2 必须已存在（不存在 → 失败，绝不自动拿 main 创建）
+↓
+git rev-list -n 1 v1.4.2 → 最终 commit SHA（annotated tag 剥掉 tag object）
+→ checkout 该 SHA 并核对
+↓
+verify job：checkout 精确 SHA → compileall + 离线测试 + 隐私自检
+↓
+release job：再核 SHA → 版本占用检查（Release/附件已存在 → 失败，不覆盖）
+→ pack（从该 SHA 打包）→ 发布 Release + 附件
+```
+
+> 这条路径是给 `release.py` 所在网络环境不可用时的人工兜底。
+> 为什么不再发布「点击时的 main」：main 是可移动引用，网页点击与 runner
+> 真正 checkout 之间可能被别人推进新 commit，拿到的是 B 而不是你以为的 A；
+> tag 是不可变发布身份，天然抗这个 race。
+> 「补发已有 tag 缺的附件」仍用 `release.py --resume`
+> （绑定 tag 已指向的 commit，不会拿新代码顶替旧版本）。二者不要混。
+
+---
+
+## Workflow 按 SHA 分工（source identity，v1.4.2 起）
+
+核心原则：**CI 验证「正在开发的提交」，Release workflow 只验证并发布「已经冻结的发布提交」。**
+两者按 source identity 分工，不互相替代：
+
+```text
+       开发阶段（ci.yml 验证）              发布阶段（release.yml 验证并发布）
+
+  PR 提交 / main·master push              release.py --push-code
+        │                                            │
+        ▼                                            ▼
+  PR HEAD SHA / 集成分支 HEAD SHA        原子推送 → tag vX.Y.Z 冻结 commit
+        │                                            │
+        ▼                                            ▼
+ ┌───────────────────────────┐      tag → git rev-list -n 1 剥出最终
+ │ ci.yml（3 OS × 3 Python） │         commit SHA（source job 锁定）
+ │ checkout 精确 source SHA  │                  │
+ │ （≠ GitHub 合成的 merge）  │                  ▼
+ │ compileall + 330 用例     │      ┌────────────────────────────┐
+ │ 隐私自检（contents: read）│      │ release.yml（仅手动触发）   │
+ └───────────────────────────┘      │ checkout 精确 commit SHA    │
+                                    │ verify（330 用例）→ pack    │
+   同一 PR/分支出新 HEAD             │ → Release + 附件            │
+   → 取消旧 run（concurrency）      └────────────────────────────┘
+```
+
+| 问题 | ci.yml | release.yml |
+|---|---|---|
+| pull_request 事件的 source | **PR HEAD SHA**（显式 checkout `github.event.pull_request.head.sha`，不用 `refs/pull/N/merge` 合成提交） | — |
+| branch push 事件的 source | **`github.sha`**（仅 main/master。**push 不监听 `**`**：PR 分支的每次 push 若同时触发 branch push CI + pull_request CI，3 OS × 3 Python 矩阵直接翻倍——feature 分支的验证统一走 PR 事件） | — |
+| tag push 是否触发 | **否**（只监听 branch push / PR / 手动） | 否（不监听任何 push 事件，只保留 `workflow_dispatch`） |
+| Release workflow 的 source | — | **tag 剥壳后的最终 commit SHA**（`git rev-list -n 1 vX.Y.Z`，annotated tag 的 tag object 会被剥掉） |
+| Release workflow 是否读取 main | — | **否**。main 是可移动引用，点击触发与 runner 实际 checkout 之间可能被推进新 commit；tag 是不可变发布身份 |
+| Release workflow 是否要求 tag 已存在 | — | **是**。tag 不存在直接失败，绝不自动拿 main 创建 |
+| 同源再验证 | test / lint 两个 job 各自 `git rev-parse HEAD` 与预期 SHA 核对 | source → verify → release 三个 job 逐级传递同一 SHA，verify 与 pack 前各核一次：**verified == packed == tag 指向的 commit** |
+| 并发控制 | `concurrency` 组按 PR / 分支分组，新 HEAD 取消旧 run | 不取消（发布是低频终态操作，不与 CI 抢队列） |
+
+为什么 PR 事件必须显式 checkout PR HEAD：`actions/checkout` 默认在 PR 事件下
+拿到的是 GitHub 临时合成的 `refs/pull/<N>/merge`（merge commit），
+它不是任何人在本地见过的提交——验证它等于验证一个从未存在的状态。
+显式指定 `head.sha` 才是「验证 PR 作者写出的代码」。
+
+方式 A（`release.py` 本地发布）不经过这两个 workflow：它在本机完成
+原子推送 + archive 校验 + tag + Release + 附件全链路，`release.yml`
+对它创建的 tag **不会**自动触发二次发布（没有 `push: tags` 监听）。
+
+---
+
+## 回放完成判据：稳定窗口（v1.4.2 起）
+
+回放（`lms_live.py`）**没有官方哈希**，而唯一能拿到的服务端长度信号 ——
+响应头里的 `Content-Length` / `Content-Range` 总长 —— **不是完成真值**：
+回放还在转码时这个数会随时间增长，一次 GET 读到 EOF 与紧随其后的一次探测
+完全可能看到同一个旧长度，10 秒后对象才变成 N+Δ。
+
+v1.4.1 曾用「实得字节 vs 声明总长，差 8% 以内算自然短读」的比例容差绕过这个
+问题，结果是留了一条「尺寸差不多就相信」的旁路：转码中途的快照可能被当成
+最终文件永久留在磁盘上（下次运行还会因「文件已存在」跳过）。
+
+**v1.4.2 起唯一的完成判据：**
+
+> 本次实得字节数 == 经稳定窗口确认的远端最终 size
+
+```text
+download EOF（got 字节）
+      ↓
+probe remote（Range: bytes=0-0 → Content-Range 的 total）
+      ↓
+┌ remote == got 且 (size, ETag/Last-Modified) 持续稳定 60s → ACCEPT
+│      （accept = rename 成最终 mp4 + 把确认 size 写进索引）
+├ remote > got        → resume 到 remote → EOF 后重新 probe/稳定窗口
+│      （轮数上限 TAIL_MAX_ROUNDS，防「转码永远追不上」）
+├ size 相同但校验器变了 → 稳定计时重置（对象被替换）
+├ remote < got        → FAIL（远端换对象 / 收缩，不截断本地后接受）
+└ probe 404 / 异常 / 300s 仍不稳定 → FAIL，保留 .part
+```
+
+**注意 `got < declared` 不再先去耗光基于旧 `declared` 的重试**：第一次 EOF
+就探远端更合理 —— 旧声明没有信息增益，而稳定探针能直接证明「当前最终对象
+到底多大」。`declared` 只作为传输提示写进 `note` 与清单。
+
+### 不变量（改这段代码前先读）
+
+1. **只有通过稳定窗口校验的字节才能 rename 成最终文件**；任何失败出口都保留
+   `.part`，且不更新 `.download-index.json`。
+2. 稳定计时是**时间戳差**（`time.monotonic`），不是「连续 N 次探测相同」——
+   后者会让判据随探测间隔漂移。测试注入虚拟时钟（`download(clock=, sleep=)`）。
+3. 探测走 `Range: bytes=0-0`（与实际下载同一条路径），只取响应头就断开；
+   不用 HEAD，也不读 body（读 body 会触发限流）。
+4. 判据两侧都不再有容差：`SHORT_TOLERANCE` 与 `already_complete(tolerance=...)`
+   已删除，增量判据统一为「可信 size 精确相等」。
+5. 回放的**可信 size** 只来自稳定窗口确认（索引里的 `size` 字段由下载侧写入）；
+   老的 / 守卫分流产生的条目只有 `path` + `name` → 视为无可信 size，
+   退回「本轮远端探测值精确比对」，绝不拿猜测值当真。
+6. `.part` 不再因为「不小于声明总长」被删掉（声明值会变）；本地比远端长
+   由 HTTP 416 与 `remote_smaller` 分支显式判失败。
+
+### 参数
+
+| 常量 | 值 | 含义 |
+|---|---|---|
+| `TAIL_STABLE_SECONDS` | 60 | 远端对象必须连续这么久不变才算「最终」 |
+| `TAIL_PROBE_INTERVAL` | 20 | 两次探测间隔（秒） |
+| `TAIL_MAX_WAIT` | 300 | 单次窗口校验最长等待；超时判失败、保留 `.part` |
+| `TAIL_MAX_ROUNDS` | 5 | 「远端更大 → 续传追平」的最大轮数 |
+| `PROBE_TIMEOUT` | 45 | 单次探测超时 |
+
+测试里 `LiveWindowBase` 注入虚拟时钟（窗口语义可断言、不真等 60 秒），
+`LiveFastBase` 把窗口压成 0 秒（只验续传与落盘正确性）。
 
 ---
 
@@ -489,10 +733,25 @@ workflow 配置已直接放在仓库里（`.github/workflows/ci.yml`、`.github/
    已经强制跑过全部离线测试，测试不过就 `SystemExit`，不会发出坏包。
    CI 的额外价值只有**跨平台兼容性验证**（ubuntu / windows / macos × py3.8/3.10/3.12）。
 2. **推送 workflows 文件需要 `Workflows: write` 权限。** 用只有 `Contents: write`
-   的细粒度 token 走 Contents API 时，`.github/workflows/` 下的文件会 403
-   （推送脚本会跳过它们并明确列出剩余清单），此时在网页端
-   *Add file → Upload files* 手动上传这几个文件即可；或换用带 workflows 权限的
-   token / 真 git 推送。
+   的细粒度 token 推 `.github/workflows/` 下的文件会 403，
+   此时在网页端 *Add file → Upload files* 手动上传这几个文件即可；
+   或换用带 workflows 权限的 token / 真 git 推送。
+   （v1.4.2 起推送器不再「跳过并继续」，缺权限就是整体失败。）
+
+### 「Release verify」和「完整 CI 矩阵」是两件事
+
+v1.4.2 起一次同步只产生一个 commit，CI 也只触发一次，所以不用再等九宫格。
+但要把两者的结论区分开：
+
+| | 范围 | 谁触发 | 用途 |
+|---|---|---|---|
+| **`release.yml` 的 verify job** | 单平台（ubuntu / py3.12）：compileall + 4 个测试文件 + 隐私自检 | 手动（existing tag only，对象是 tag 指向的 commit） | **发布门禁** —— 它挂了 Release 就不会建 |
+| **完整 CI 矩阵**（`ci.yml`） | 3 平台 × 3 Python 版本 | main/master push 与 PR（对象是开发中的 HEAD） | **兼容性验证** —— 跨平台 / 老版本 Python 的行为 |
+
+发布时**只需要看 verify 的结论**（约 1 分钟出结果）；
+九宫格让它在后台自己跑完即可，不必阻塞发布流程。
+如果某个平台单独挂了（例如 Windows 上的编码问题），
+再用 `ci.yml` 的结论去定位，而不是回滚已经发出的 Release。
 
 权限设计：workflow 顶层是 `contents: read`；`release.yml` 里只有发布 job 才是
 `contents: write`，校验 job 只读。第三方 action 固定到具体 commit SHA
@@ -502,19 +761,26 @@ workflow 配置已直接放在仓库里（`.github/workflows/ci.yml`、`.github/
 
 ## 测试矩阵与覆盖明细
 
-全部离线，不需要网络与登录态，共 **212 个用例**：
+全部离线，不需要网络与登录态，共 **330 个用例**：
 
 ```bash
 python tests/test_organize.py     # 22 个用例
-python tests/test_fetch.py        # 170 个用例
+python tests/test_fetch.py        # 227 个用例
 python tests/test_selfcheck.py    # 20 个用例
+python tests/test_push.py         # 61 个用例
 ```
 
 | 文件 | 覆盖 |
 |---|---|
 | `test_organize.py` | 中文数字转换、括号剥离、六种章节写法、假章号排除、目录名去重、目录名不带扩展名 |
-| `test_fetch.py` | 下载成功/重试/403 不重试/5xx 重试/空响应/HTML 响应/sha256 不符/etag 不符、断点续传与 Range 对齐四情形（正常/忽略/向前扩大/缺口，含最后一次缺口保留 `.part`）、回放短读判定（轻度过、严重失败、保留 `.part`）、元信息错误分类（403/404→N/A，401→登录态，5xx/超时/坏 JSON→FAIL）、**扫描阶段失败记账**（page / lecture_live 详情的 500/超时/坏 JSON/403/404/401）、`item_status()` 统一状态语义、`--list-only` 退出码（真跑 `main()`）、已有文件大小比对与短读容差（回放 8% vs 普通附件 0%）、`.7z` 冲突改名保扩展名与项目包判定、新旧登录态格式兼容、Cookie 安全属性还原、文件名安全（含 Windows 保留名）、路径冲突消解、项目包判定、CSV 公式注入防护、时间戳固定 UTC+8（跨时区一致）、清单导出（`stage` / `err_kind` 入 CSV）、多来源计数 |
+| `test_fetch.py` | 下载成功/重试/403 不重试/5xx 重试/空响应/HTML 响应/sha256 不符/etag 不符、断点续传与 Range 对齐四情形（正常/忽略/向前扩大/缺口，含最后一次缺口保留 `.part`）、**回放稳定窗口**（等长也要过窗口、稳定语义按时间差而不是探测次数、短读不再被容差放行、声明值小于/大于远端的两向情形、ETag 变化重置计时、远端更小 / 404 / 探测异常 / 无 size 头 → 失败且保留 `.part`、远端增长驱动续传后接受、增长轮数受上限约束、416 → 不截断本地；探测走 `Range: bytes=0-0`，416 带 `Content-Range: bytes */N` 时按 RFC 7233 回填长度；`.part` 等于声明总长时不再被删掉重下）、元信息错误分类（403/404→N/A，401→登录态，5xx/超时/坏 JSON→FAIL）、**扫描阶段失败记账**（page / lecture_live 详情的 500/超时/坏 JSON/403/404/401）、`item_status()` 统一状态语义、`--list-only` 退出码（真跑 `main()`）、已有文件精确比对（**无任何容差**：`tolerance` 参数与 `SHORT_TOLERANCE` 已删除并有结构断言钉住、回放 944/1000 同样算不完整、索引可信 size 精确命中、清单视图与主流程同判据）、`.7z` 冲突改名保扩展名与项目包判定、新旧登录态格式兼容、Cookie 安全属性还原、文件名安全（含 Windows 保留名）、路径冲突消解、项目包判定、CSV 公式注入防护、时间戳固定 UTC+8（跨时区一致）、清单导出（`stage` / `err_kind` 入 CSV）、多来源计数、**resource identity**（**持久身份索引** `.download-index.json`：等大小瞬时错误不冒领 plain 名、报错条目经索引占位、新增同身份资源拿独立后缀、同 uid 内容更新原地覆盖路径不漂移、布局切换不移动已分配身份、索引无凭据且损坏可重建、回放机位并入身份键、dry-run 两次运行分配逐字节一致、**等大小三轮收敛封板回归**、course namespace（多课程共用 --out 不串身份）、camera_id 优先的同活动多机位键、同活动多路无 camera_id 同类型显式 identity ambiguous、索引损坏 fail-closed（坏文件改名保留现场 + RC_BAD_INDEX 拒绝下载）、索引路径越界 / 绝对路径条目丢弃；min-uid 冲突规则与 `identity_conflict_target()` 覆盖守卫作为新身份分配与存量迁移保护层；**内容损坏 vs 格式不认识分立**（拒绝路径字节原样保留、不建 `.corrupt-`；结构信封 `entries` → `items` 迁移放行且仅限键已带 course namespace；无 course 旧键的身份语义迁移一律拒绝）） |
 | `test_selfcheck.py` | 登录态五种状态判定、检查级别（警告 vs 失败）、退出码、默认不联网、自检清单与 `scripts/` 实际文件一致 |
+| `test_push.py` | 发布链路（全部 mock / subprocess，不联网）：N 个文件变化只产生 1 个 commit / 1 次 ref 更新、一次 tree POST 装下全部变化、未变文件不重传 blob、删除用 `sha: null`、**绝不 force**（`force: false` + 冲突时放弃且不动 main）、ref 更新后复核、无变化不建空 commit、删除只在白名单范围内、blob sha 算法（空文件常量）、登录态/profile/缓存被过滤、`release.py` 用的是仓库内推送器且带版本化 commit message、`push_code()` 返回 commit SHA、**tag 绑定推送返回的 SHA 而不是回读 main**、`--resume` 绑定已存在 tag 的 SHA 且不再推代码、附件上传 502 重试而 400 不重试、**artifact identity**（zip==commit 通过 / 工作区漂移不影响 / 旧 zip 拦下 / 缺文件与多文件均失败 / 顶层目录不对拒绝）、**sha256 锁**（校验后被替换必须停上传）、**双 publisher 已消除**（release.yml 无 `push: tags`、手动入口与占用检查保留）、**CLI smoke**（清空 PYTHONPATH 后真实跑 `tools/gh_push_dir.py --help` 与 `pack.py`）、**workflow source identity**（ci.yml 只验证 PR HEAD / 分支 HEAD 且不触发 tag、checkout 精确 source SHA、concurrency 取消旧 run；release.yml 是 existing-tag-only：tag 缺失即失败、绝不建/挪 tag、绝不 checkout main、verify 与 pack 复核同一 SHA、`rev-list -n 1` 剥 annotated tag）、**tag 剥壳实测**（真实 git 验证 lightweight / annotated 都解析到 commit） |
+
+`test_push.py` 用 **`FakeApi`**（模拟 Git Data API 的 ref / commit / tree / blob
+四个端点）与假 `subprocess.run`（模拟推送器写出结果 JSON），
+所以「并发下 main 被别人更新」「推送返回 B 但 main 已是 C」这类
+真实环境里很难构造的场景都能离线验证。
 
 `test_fetch.py` 用 **假 opener**（`FakeOpener` / `RangeFakeOpener` / `FakeResponse` /
 `http_err`）脚本化服务端行为，所以能测「第一次超时第二次成功」「服务端把 Range 起点
@@ -526,8 +792,9 @@ UTC / Asia-Tokyo / America-New_York / Asia-Shanghai，改 `TZ` 环境变量 + `t
 验证，因此**不依赖跑测试机器所在的时区**。
 
 改测试断言逻辑时要保持用例总数，`release.py` 的 `verify_zip` 会交叉核对
-（静态扫 `def test_` vs 实跑 `Ran N tests`）。新增测试文件要**同时**改三处：
-`release.py` 的关键文件清单 + 测试循环、`ci.yml`、`pack.py`。
+（静态扫 `def test_` vs 实跑 `Ran N tests`）。新增测试文件要**同时**改四处：
+`release.py` 的关键文件清单 + 测试循环、`ci.yml`、`release.yml` 的 verify job、
+README / 本文档的用例数。`pack.py` 不用改 —— 它按 `tests/` 整个目录打包。
 
 ---
 
@@ -537,6 +804,7 @@ README 只留最近两版，历史在这里：
 
 | 版本 | 变更 |
 |---|---|
+| v1.4.2 | **发布链路专项**：推送改为 Git Data API 原子提交（blob → tree → commit → ref），N 个文件变化 = 1 个 commit + 1 次 ref 更新，CI 只触发一次；`tools/gh_push_dir.py` 纳入仓库，`--push-code` 不再依赖仓库外脚本，且不再「跳过无权限文件仍返回 0」；绝不强制（force）更新 main（`force: false` 的非强制 fast-forward 保护，冲突即放弃）；支持删除（仅限白名单范围）；无变化不建空 commit、未变文件不重传 blob；`--push-code` 返回 commit SHA，tag 直接绑定它；**消除双 publisher**（`release.yml` 不再监听 `v*` tag push，只保留手动备用入口 + 版本占用检查）；**artifact identity 改为校验实际 zip**（`verify_archive_matches_remote()`：zip 内容 vs 源码 commit 的 tree，工作区漂移不再影响结论），并用 sha256 锁定校验过的 zip、上传前复核；`--resume` 语义写清：只补缺，不能拿新代码补旧版本；token 不再进 curl argv（临时配置文件，用完删除）；附件上传重试真正生效（5xx/网络重试，4xx 立即失败）；白名单抽到 `tools/release_common.py` 三处共用，`docs/` 纳入发布包；新增 CLI smoke 测试（清空 PYTHONPATH 跑真实入口）；**workflow 按 SHA 分工**（ci.yml 只验证 PR HEAD / main·master push HEAD——push 不监听 `**`，feature 分支走 PR 避免 push+PR 双跑；显式 checkout 精确 source SHA + concurrency 取消旧 run；release.yml 改为 existing-tag-only：`git rev-list -n 1` 剥壳锁定 commit SHA、逐 job 复核 verified == packed == tag 指向、绝不读 main、绝不建/挪 tag；**resource identity 封板**（`.download-index.json` 持久身份索引：`identity_key → canonical_path` 成为严格函数——其他资源增删、meta 瞬时失败、排序变化、同 uid 内容更新、进程重启都不改变已分配路径；等大小资源不再可能互相冒领字节；新身份按 dest_for + 最小 uid 分配，`identity_conflict_target()` 守卫保留为无索引存量文件的迁移保护层；索引只含资源 ID / 文件名 / 相对路径，不含任何凭据；**fail-closed**：索引解析失败 → 坏文件改名 `.corrupt-<时间戳>` 保留现场 + 语义化退出码 5 拒绝下载，绝不静默失忆；加载时逐条验证路径（相对 / 无 `..` 逃逸 / 非绝对 / normalize 后必须在 out 内），**单条 path 越界同样整份 fail-closed**（改名保留现场 + 拒绝下载，绝不「丢单条继续」静默遗忘身份）；索引不是任意路径写入入口；顶层信封 `{version, identity_schema, items}` 双版本号分立（结构版本 / 身份键语义版本），未知 version 或 identity_schema 一律拒绝；身份键 = `course:<course_id>:upload:<uid>` / `course:<course_id>:live:<act_id>:camera:<camera_id>`（camera_id 缺失降级 type:，同活动多路无 camera_id 同类型 → 显式 identity ambiguous 不硬合并）、索引 fail-closed 统一到单条 path：越界即整份拒绝、identity_schema 必填且未知即拒绝；**内容损坏与格式不认识分立**（JSON 解析失败 / 顶层结构坏 → `.corrupt-<时间戳>` 隔离保留现场；version 或 identity_schema 不认识 → 原文件字节不动、不改名、不迁移、不修复，直接拒绝退出码 5）；**migration 收紧为结构性的**（`entries` 旧信封 / 裸 map → `items` 且仅当键已带 course namespace；loader 绝不承担任何改变身份含义的迁移，无 course 的旧键拒绝而非猜测归属）；**回放完成判据重写：稳定窗口取代比例容差**（详见「回放完成判据：稳定窗口」一节）。唯一的完成判据 = 「本次实得字节数 == 经稳定窗口确认的远端最终 size」：EOF 后周期探测远端 `(size, ETag/Last-Modified)`，连续 60 秒不变且恰等于本地实得字节数才 rename；远端更大 → 续传追平后重新确认（`TAIL_MAX_ROUNDS` 封顶）；远端更小 / 404 / 超时 → 失败且保留 `.part`，不 rename、不更新索引。探测走 `Range: bytes=0-0` 取 `Content-Range` 总长（同下载路径，比 HEAD 可靠，不读 body 免触发限流）；稳定计时用 `time.monotonic` 时间戳差而非「连续 N 次相同」，测试注入虚拟时钟。`declared` 降级为传输提示（只进 note / 清单）。**删除 `SHORT_TOLERANCE` 与 `already_complete(tolerance=...)`**（含结构断言钉住），增量判据统一为可信 size 精确相等：回放读索引里经确认的 `size`，无索引存量文件用本轮远端探测值精确比对；`.part` 不再因「不小于声明总长」被删，本地比远端长由 416 / `remote_smaller` 显式失败而非截断本地。修正推送器在未传 `--include` 时的崩溃（`release.py` 从不传该参数，真实发布首次执行才暴露），并加回归用例钉住该默认值；离线测试扩到 330 个 |
 | v1.4.1 | 收尾几处 silent failure 与一致性问题：`collect()` 返回 `scan_errors` 并转成清单条目（扫描失败进 FAIL / manifest / 退出码）；抽出 `item_status()` 统一 `--list-only` / `--dry-run` / 正式下载的错误语义，`--list-only` 不再固定返回 0；`already_complete()` 增加 `tolerance`，回放与下载侧共用 `SHORT_TOLERANCE`；回放续传缺口在最后一次重试时保留有效 `.part`；`split_ext()` 放行 `.7z` 等数字开头扩展名；`already_complete()` 对 `os.path.getsize` 的 OSError 做保守兜底；清单增加 `stage` / `err_kind`；离线测试扩到 212 个 |
 | v1.2.1 | 修 `collect()` 的来源②计数（原先用总数相减，把直播回放误算成「正文内嵌」）；`release.py` 包体校验改为上报测试实际执行的用例数并与静态扫描交叉核对；抽取 `download()` 中重复四次的失败处理块；回放下载新增短读判定（对比 `Content-Length`，超阈值告警并写入清单）；README 用例数与文件清单同步 |
 | v1.2.0 | 直播回放下载（`lms_live.py`）；修同一天多个 `lecture_live` 活动 title 相同导致回放互相覆盖的丢数据 bug（文件名加入本地时间戳与机位）；离线测试扩到 79 个 |
@@ -556,9 +824,11 @@ README 只留最近两版，历史在这里：
 | `docs/index.html` | 文档站页面，改它就够了 |
 | `docs/MAINTAINING.md` | 本文件，站点的维护说明 |
 | `push_docs.py` | 推 `docs/` 到 GitHub（在维护者工作区里） |
-| `release.py` | 发版本：版本号自检 → 打包 → 校验 → tag → Release → 附件 |
-| `.github/workflows/ci.yml` / `release.yml` | CI 与自动发版 workflow，随仓库分发（`release.py` 的 `INCLUDE` 含整个 `.github/`） |
-| `.github/scripts/pack.py` | CI 发版用的打包脚本，`INCLUDE` 必须与 `release.py` 保持同步 |
+| `release.py` | 发版本：版本号自检 → 打包 → 校验 → 确定源码 commit → tag → Release → 附件 |
+| `tools/gh_push_dir.py` | 原子推送（Git Data API），随仓库分发，`release.py --push-code` 调它 |
+| `tools/release_common.py` | **发布白名单的唯一定义**（INCLUDE / EXCLUDE / blob sha / 差异比对），三处共用 |
+| `.github/workflows/ci.yml` / `release.yml` | CI（验证开发中的 HEAD）与**手动备用**发版 workflow（release.yml 只发布已存在的 tag，不监听任何 push 事件），随仓库分发（`INCLUDE` 含整个 `.github/`） |
+| `.github/scripts/pack.py` | CI 发版用的打包脚本，白名单直接引用 `tools/release_common.py` |
 | `scripts/lms_selfcheck.py` | 安装后自检；改动它要同步 `tests/test_selfcheck.py` 的 `CORE_SCRIPTS` 断言 |
 
 ### 页面内容与两栏配平的联动

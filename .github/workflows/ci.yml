@@ -1,10 +1,25 @@
 name: CI
 
+# 职责：验证「正在开发的提交」。
+#   pull_request → PR HEAD（不是 GitHub 合成的 merge commit）
+#   push main/master → push 后的分支 HEAD（github.sha）
+# feature 分支的验证一律走 PR —— 若 push 监听 "**"，同一 HEAD 会同时
+# 触发 branch push CI + pull_request CI，3 OS × 3 Python 矩阵直接翻倍。
+# tag 的验证与发布是 release.yml 的职责（按 SHA 分工）。
+
 on:
   push:
-    branches: [main, master]
+    branches:
+      - main
+      - master     # 只监听集成分支；feature 分支 push 由 PR 事件覆盖
   pull_request:
-  workflow_dispatch:
+  workflow_dispatch:   # 手动补测任意分支
+
+# 同一个 PR / 分支来了新 HEAD 就取消旧的 run，少排队；
+# 不同 PR / 不同分支互不影响。
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 # 最小权限：CI 只需要读代码，不需要写任何东西
 permissions:
@@ -25,9 +40,25 @@ jobs:
         python-version: ["3.8", "3.10", "3.12"]
 
     steps:
-      - uses: actions/checkout@v4
+      # ★ PR 事件下 actions/checkout 默认可能拿到 refs/pull/<N>/merge
+      #   （GitHub 临时生成的合成 merge commit）—— 本项目要求验证 PR HEAD 本身，
+      #   所以显式指定 ref，不用默认值。
+      - name: Checkout exact source HEAD
+        uses: actions/checkout@v4
         with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
+
+      - name: Source identity
+        env:
+          EXPECTED: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+        run: |
+          ACTUAL=$(git rev-parse HEAD)
+          echo "expected: $EXPECTED"
+          echo "actual  : $ACTUAL"
+          if [ "$ACTUAL" != "$EXPECTED" ]; then
+            echo "::error::checkout 到的不是预期的 source HEAD"; exit 1
+          fi
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -35,13 +66,14 @@ jobs:
           python-version: ${{ matrix.python-version }}
 
       - name: Byte-compile all scripts
-        run: python -m compileall -q scripts/ tests/
+        run: python -m compileall -q scripts/ tests/ tools/
 
       - name: Run offline tests
         run: |
           python tests/test_organize.py
           python tests/test_fetch.py
           python tests/test_selfcheck.py
+          python tests/test_push.py
 
       - name: Check CLI help works
         run: |
@@ -53,9 +85,20 @@ jobs:
     name: 语法与隐私自检
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout exact source HEAD
+        uses: actions/checkout@v4
         with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
+
+      - name: Source identity
+        env:
+          EXPECTED: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+        run: |
+          ACTUAL=$(git rev-parse HEAD)
+          test "$ACTUAL" = "$EXPECTED" \
+            || { echo "::error::checkout 到的不是预期的 source HEAD"; exit 1; }
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"

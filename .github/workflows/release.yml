@@ -1,33 +1,100 @@
-# 打 tag 即自动发布：校验 → 打包 → 建 Release → 传 zip
+# 手动备用发布路径 —— 只发布「已经冻结的 tag」，不是默认 publisher
 #
-# 触发方式（两种）：
-#   1. 推一个 v* 开头的 tag：       git tag v1.0.3 && git push origin v1.0.3
-#   2. 网页 Actions 页手动触发：    输入版本号即可
+# ★ 职责分离（source identity）：
+#   ci.yml        验证「正在开发的提交」—— PR HEAD / branch HEAD
+#   本 workflow   验证并发布「已经冻结的发布提交」—— tag 的最终 commit SHA
+#   两者不互相替代：CI 覆盖广（3 OS × 3 Python），Release verify 针对
+#   最终 tag SHA 做发布完整性检查。发布不等 branch CI 跑完九宫格。
 #
-# 注意：本工作流的入口是 "推一个 tag"。如果你的网络环境 git push 不通
-# （代理拦截 git 协议），这条路径就用不上 —— 改用 release.py --version X.Y.Z
-# 从本地发布，功能等价。
+# ★ 本 workflow 不监听任何 push 事件，release.py 打 tag 后不会在这里二次发布。
+#   默认 publisher 仍是 release.py（本地一键：原子推送 + archive 校验 +
+#   tag(source_sha) + Release + asset）。
 #
-# 权限说明：verify 只读代码即可；只有真正发布 Release 的 job 需要
-# contents: write。workflow 级默认权限不放开，按 job 最小化声明。
+# 语义（existing tag only）：
+#   输入 version → tag = v<version> **必须已经存在**（不存在直接失败，
+#   绝不自动拿 main 创建 tag）→ 用 `git rev-list -n 1 <tag>` 解析最终
+#   commit SHA（annotated tag 会自动剥掉 tag object）→ checkout 该 SHA
+#   并核对 → verify → pack → 发布这个已有 tag。
+#
+#   为什么不再发布「点击时的 main」：main 是可移动引用，点击与 runner
+#   真正 checkout 之间可能被别人推进新 commit，拿到的是 B 而不是你以为的 A。
+#   tag 是不可变发布身份，天然抗这个 race。
+#
+# 不变量：
+#   verified source SHA == packed source SHA == tag 指向的 commit SHA
+#
+# 防覆盖：Release / 附件已存在即失败。本 workflow 是备用 publisher，
+# 不做 overwrite / replace asset / move tag / delete release。
+#
+# 权限说明：只有真正发布 Release 的 job 需要 contents: write，
+# 其余 job 只读。workflow 级默认权限不放开，按 job 最小化声明。
 
 name: Release
 
 on:
-  push:
-    tags:
-      - "v*"
   workflow_dispatch:
     inputs:
       version:
-        description: "版本号（不带 v，如 1.0.3）"
+        description: "版本号（不带 v，如 1.4.2；对应的 tag 必须已存在）"
         required: true
         type: string
 
 jobs:
-  # 先把测试跑通，测试挂了就不发版 —— 这个 job 不需要任何写权限
+  # 先把 tag 解析成最终 commit —— 这是整个 workflow 唯一的 source identity。
+  # tag 不存在时这里直接失败，不会退化成「拿 main 凑合」。
+  source:
+    name: 锁定发布源
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      sha: ${{ steps.lock.outputs.sha }}
+      tag: ${{ steps.lock.outputs.tag }}
+    steps:
+      - name: tag 必须已存在
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -e
+          TAG="v${{ inputs.version }}"
+          if ! gh api "repos/$REPO/git/ref/tags/$TAG" > /dev/null 2>&1; then
+            echo "::error::tag $TAG 不存在 —— 本 workflow 只发布已冻结的 tag，"
+            echo "::error::绝不自动拿 main 创建。先由 release.py --push-code 冻结源码。"
+            exit 1
+          fi
+          echo "tag $TAG 存在"
+
+      # checkout 指定 tag。annotated tag 在这里表现为 detached HEAD 指向
+      # 它最终指向的 commit；下面用 rev-list 再证明一次。
+      - name: Checkout tag
+        uses: actions/checkout@v4
+        with:
+          ref: "v${{ inputs.version }}"
+          persist-credentials: false
+
+      - name: 解析最终 commit SHA
+        id: lock
+        run: |
+          set -e
+          TAG="v${{ inputs.version }}"
+          # rev-list -n 1 对 lightweight / annotated tag 都返回最终 commit SHA
+          # （annotated 的 tag object 会被剥掉），不依赖 release.py 用哪种 tag。
+          SHA=$(git rev-list -n 1 "$TAG")
+          ACTUAL=$(git rev-parse HEAD)
+          echo "tag          : $TAG"
+          echo "final commit : $SHA"
+          echo "checked out  : $ACTUAL"
+          if [ "$ACTUAL" != "$SHA" ]; then
+            echo "::error::checkout 到的不是 tag 指向的 commit"; exit 1
+          fi
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+  # 对「tag 指向的那份源码」做发布完整性检查 —— 不是对 main。
   verify:
     name: 校验
+    needs: source
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -35,22 +102,36 @@ jobs:
       PYTHONIOENCODING: utf-8
       PYTHONUTF8: "1"
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout exact source SHA
+        uses: actions/checkout@v4
         with:
+          ref: ${{ needs.source.outputs.sha }}
           persist-credentials: false
+
+      - name: Source identity
+        env:
+          EXPECTED: ${{ needs.source.outputs.sha }}
+        run: |
+          ACTUAL=$(git rev-parse HEAD)
+          if [ "$ACTUAL" != "$EXPECTED" ]; then
+            echo "::error::verify 的不是 tag 指向的 commit（$EXPECTED != $ACTUAL）"
+            exit 1
+          fi
+          echo "verify 对象: tag ${{ needs.source.outputs.tag }} -> $ACTUAL"
 
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
       - name: 语法编译
-        run: python -m compileall -q scripts/ tests/
+        run: python -m compileall -q scripts/ tests/ tools/
 
       - name: 离线测试
         run: |
           python tests/test_organize.py
           python tests/test_fetch.py
           python tests/test_selfcheck.py
+          python tests/test_push.py
 
       - name: 隐私自检
         run: |
@@ -68,40 +149,61 @@ jobs:
 
   release:
     name: 打包并发布
-    needs: verify
+    needs: [source, verify]
     runs-on: ubuntu-latest
     permissions:
       contents: write        # 建 Release、传附件必需
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout exact source SHA
+        uses: actions/checkout@v4
         with:
+          ref: ${{ needs.source.outputs.sha }}
           persist-credentials: false
+
+      # 打包之前再核一次：verify 的 SHA == pack 的 SHA == tag 指向的 SHA
+      - name: Source identity
+        env:
+          EXPECTED: ${{ needs.source.outputs.sha }}
+        run: |
+          ACTUAL=$(git rev-parse HEAD)
+          test "$ACTUAL" = "$EXPECTED" \
+            || { echo "::error::打包的不是 tag 指向的 commit"; exit 1; }
+          echo "pack 对象: $ACTUAL"
 
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
-      - name: 确定版本号
-        id: ver
+      # 防覆盖：release.py 是默认 publisher。Release / 附件任一已存在就停。
+      # tag 在 source job 已确认存在（本 workflow 不创建、不移动 tag）。
+      - name: 版本占用检查
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ needs.source.outputs.tag }}
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            V="${{ inputs.version }}"
-          else
-            V="${GITHUB_REF_NAME#v}"
+          set -e
+          if gh release view "$TAG" --repo "$REPO" > /dev/null 2>&1; then
+            echo "::error::Release $TAG 已存在，停止发布（不覆盖）。"
+            exit 1
           fi
-          echo "version=$V" >> "$GITHUB_OUTPUT"
-          echo "tag=v$V" >> "$GITHUB_OUTPUT"
-          echo "版本: v$V"
+          ASSETS=$(gh api "repos/$REPO/releases" --jq \
+            '[.[] | select(.tag_name == "'"$TAG"'")] | length')
+          if [ "$ASSETS" != "0" ]; then
+            echo "::error::已有 $TAG 关联的 Release，停止发布（不覆盖）。"
+            exit 1
+          fi
+          echo "Release $TAG 不存在，可以发布"
 
       - name: 打包
-        run: python .github/scripts/pack.py --version "${{ steps.ver.outputs.version }}"
+        run: python .github/scripts/pack.py --version "${{ inputs.version }}"
 
       # 第三方 action 固定到 commit SHA（v2.6.2），防止 tag 被挪动后引入意外变更
       - name: 发布
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
-          tag_name: ${{ steps.ver.outputs.tag }}
-          name: ${{ steps.ver.outputs.tag }}
+          tag_name: ${{ needs.source.outputs.tag }}
+          name: ${{ needs.source.outputs.tag }}
           files: dist/*.zip
           generate_release_notes: true
           draft: false

@@ -69,12 +69,14 @@ RC_OK = 0
 RC_NO_STATE = 2                   # 没有登录态文件
 RC_EXPIRED = 3                    # 登录态过期
 RC_PARTIAL = 4                    # 有文件下载失败
+RC_BAD_INDEX = 5                  # 身份索引损坏（fail-closed，拒绝下载）
 
 # 取元信息失败时的三类错误。**必须分开**，否则一次接口抖动会被
 # 伪装成「这些文件平台没给权限」而静默跳过，用户还会看到 fail=0。
 ERR_UNAVAILABLE = "unavailable"   # 403 / 404，确实拿不到，可跳过
 ERR_AUTH = "authentication"       # 401，登录态问题，明确失败
 ERR_TRANSIENT = "transient"       # 超时 / 连接错误 / 5xx / JSON 解析失败，算失败
+ERR_IDENTITY = "identity_ambiguous"   # 同活动多路无 camera_id 回放，身份无法区分
 
 # 清单里的条目状态。错误语义只有这一份定义 —— 普通下载 / --dry-run /
 # --list-only 三条路径都走 item_status()，不能各自再写一遍分类规则，
@@ -532,18 +534,20 @@ def has_expected_size(size):
         return False
 
 
-def already_complete(path, size, tolerance=0.0):
-    """判断某个目标文件是否真的已经下载完。
+def already_complete(path, size):
+    """判断某个目标文件是否真的已经下载完 —— **精确比对，没有任何比例容差**。
 
     ★ 以前是 `exists and getsize > 1024` —— 服务器上 100MB 的文件，
     本地只有 20MB（上次下到一半被杀）也会被当成完整文件永远跳过。
     现在：服务端有明确 size 时按大小比对，不等就重下。
 
-    ★ tolerance 必须与「下载时的成功判据」一致。回放允许多达
-    SHORT_TOLERANCE 的自然短读（详见 lms_live），如果这里仍要求严格相等，
-    就会出现「上一轮判成功、下一轮判要重下」——同一个文件在两套判据下
-    反复横跳。所以回放传 lms_live.SHORT_TOLERANCE，**普通附件仍然传 0**：
-    给 PDF / PPTX 放 8% 容差只会掩盖真正的截断。
+    ★ v1.4.2 起删除 `tolerance` 参数，回放也不例外。曾经的 8% 短读容差是
+    「尺寸差不多就相信」的最后一条旁路：它既可能把截断的视频认成完整，
+    又让增量判据和下载判据分家。现在回放的完成真值只有一个 ——
+    「实得字节 == 经稳定窗口确认的远端 size」（lms_live.verify_tail），
+    确认通过后把 size 记进 `.download-index.json`，这里与该值精确比对；
+    没有可信 size 的存量文件则拿本轮远端探测到的 size 精确比对。
+    两侧都不再引入容差，也就不会出现「上一轮判成功、下一轮判要重下」。
 
     拿不到声明大小时（size 为 0 / None）退回「存在且非空」的宽松策略。
     返回 (是否完整, 本地大小, 期望大小)。
@@ -571,19 +575,31 @@ def already_complete(path, size, tolerance=0.0):
     exp = int(size)
     if local > exp:
         return False, local, exp          # 比声明还大，来源可疑，重下
+    return local == exp, local, exp
+
+
+def indexed_size(it, index, course):
+    """这条资源在索引里「经稳定窗口确认」的 size；没有就返回 None。
+
+    ★ 为什么不能继续用本轮探测/响应头里的 size 做增量判据：回放对象在转码
+    期间会持续增长，逐次运行拿到的声明值可能不同，按它比对就会「上一轮判
+    成功、下一轮判要重下」。索引里的 size 是下载侧 verify_tail() 确认过的
+    最终值，才配当完成真值。
+
+    只认「这次下载真的写过 size」的条目：老的索引只有 path / name，
+    或存量文件只被守卫分流过 —— 那是「无可信 size」，返回 None 走
+    远端探测精确比对，不拿猜测值当真。
+    """
+    if not index:
+        return None
+    rec = index.get(identity_key(it, course))
+    if not rec:
+        return None
     try:
-        tol = float(tolerance)
+        n = int(rec.get("size"))
     except (TypeError, ValueError):
-        tol = 0.0
-    shortfall = (exp - local) / float(exp)
-    return shortfall <= tol, local, exp
-
-
-def complete_tolerance(kind):
-    """某个 kind 允许的短读比例 —— 下载判据与增量判据必须共用这一个值。"""
-    if kind == "回放":
-        return lms_live.SHORT_TOLERANCE
-    return 0.0
+        return None
+    return n if n > 0 else None
 
 
 def is_project_pkg(name):
@@ -612,6 +628,61 @@ def dest_for(kind, act, name, args):
     if args.layout == "flat":
         return os.path.join(args.out, kind)
     return os.path.join(args.out, kind, act)
+
+
+def identity_conflict_target(dest, name, size, uid):
+    """resource identity 守卫：目标已有「完整但与本资源不符」的文件时，
+    **绝不覆盖** —— 换确定性后缀另存。
+
+    ★ 为什么必须有：目标路径上的完整文件大小与该资源的声明不符时，
+    可能是 (a) 别的资源占了这个名字（覆盖 = 丢数据），也可能是
+    (b) 平台更新了同名文件 / (c) 本地文件被外部改动（覆盖才是期望行为）。
+    不引入持久状态就无法区分这三种情况，按数据安全优先处理：
+    一律另存，原文件原样保留。
+
+    ★ 大小比对是**精确**的（already_complete 无容差参数）：以前回放走 8%
+    短读容差，于是「差 5% 的截断文件」在这里被当成本资源、直接 use，
+    截断的字节就此固化。现在只有字节数完全一致才算「相符」。
+
+    已知代价（文档已写明）：平台更新同名文件时会得到一份带 ~uid 后缀的
+    新副本，而不是原地更新。确定性与数据安全优先于原地覆盖。
+
+    返回 (action, path)：
+        ("use", path)   —— 用 path 作为下载目标（原名或带后缀）
+        ("skip", path)  —— path 上已经是本资源的完整副本（上次守卫分流的），
+                           直接当 EXISTS 跳过
+
+    ★ 只读文件系统，不创建、不删除、不修改任何东西 —— 三种模式
+    （下载 / --dry-run / --list-only）可以共用同一份判定。
+    """
+    path = os.path.join(dest, name)
+    if not os.path.exists(path):
+        return "use", path
+    # 有 .part 残片 → 是本资源上次下载的断点，交给续传逻辑，不走守卫
+    if os.path.exists(path + ".part"):
+        return "use", path
+    done, local, _ = already_complete(path, size)
+    if done:
+        return "use", path
+    if local <= 0:
+        # 空文件（或大小不可比）：当垃圾处理，原地重下覆盖
+        return "use", path
+    # 到这里：目标是一个完整文件，但大小与该资源不符。
+    stem, ext = split_ext(name)
+    suffix = "~%s" % (uid if uid is not None else "x")
+    alt = safe("%s%s%s" % (stem, suffix, ext))
+    cand = os.path.join(dest, alt)
+    n = 2
+    while True:
+        if not os.path.exists(cand):
+            return "use", cand
+        done, _, _ = already_complete(cand, size)
+        if done:
+            # 上次守卫分流时已经把本资源下到这里了 → 当 EXISTS
+            return "skip", cand
+        alt = safe("%s%s-%d%s" % (stem, suffix, n, ext))
+        cand = os.path.join(dest, alt)
+        n += 1
 
 
 # ---------------------------------------------------------------- 下载
@@ -888,15 +959,27 @@ def main():
     # 扫描失败伪装成条目，之后自动进 fail / manifest / 退出码
     items = items + scan_error_items(scan_errors)
 
-    # ---- 消解目标路径冲突 ----
-    # 必须在列清单和下载之前做，否则第二个同名文件会被静默跳过、悄悄丢文件。
-    items, n_collided = resolve_collisions(items, args)
+    # ---- 分配 canonical path（resource identity 核心） ----
+    # 持久索引记录 identity_key -> 相对路径：已分配的身份直接复用（含本轮
+    # 报错的条目，名字槽不因错误释放），新身份按 dest_for + 最小 uid 分配
+    # 并立即写回索引。下载成败不影响已分配的身份。
+    # ★ fail-closed：索引解析失败时拒绝继续 —— 权威「失忆」比下载失败严重。
+    try:
+        index = load_download_index(args.out)
+    except IndexCorruptError as e:
+        print("!! %s" % e, file=sys.stderr)
+        print("!! 拒绝继续：身份分配的权威不可用。检查 %s 后重跑。"
+              % os.path.join(args.out, INDEX_NAME), file=sys.stderr)
+        return RC_BAD_INDEX
+    items, n_collided = assign_canonical_paths(items, index, args, args.course)
+    # 索引不在这里落盘：下载阶段的 ALT 守卫分流会改写名字，
+    # 统一在各出口（list-only 返回前 / 下载循环后）保存最终值
     if n_collided and not args.quiet:
         print("  检测到 %d 个目标路径冲突，已改用确定性后缀避免覆盖" % n_collided)
 
     # ---- 只列清单 ----
     if args.list_only:
-        rows = build_rows(op, items, excl, args, quiet=args.quiet)
+        rows = build_rows(op, items, excl, args, quiet=args.quiet, index=index)
         write_manifest(args.list_only, rows)
         n_fail = count_fail(rows)
         tag = "（其中 %d 条失败）" % n_fail if n_fail else ""
@@ -906,6 +989,7 @@ def main():
         if any(r.get("err_kind") == ERR_AUTH for r in rows):
             print_auth_hint(sum(1 for r in rows
                                 if r.get("err_kind") == ERR_AUTH), args.course)
+        save_download_index(args.out, index)
         return RC_PARTIAL if n_fail else RC_OK
 
     ok = fail = skip = 0
@@ -943,13 +1027,18 @@ def main():
                          "status": STATUS_EXCLUDED})
             continue
 
-        dest = dest_for(kind, act, name, args)
+        dest = item_dest(it, args)
         path = os.path.join(dest, name)
         rel = os.path.relpath(dest, args.out)
 
-        # 增量判据必须和下载判据用同一个短读容差，否则回放会重复下载
-        complete, local_size, exp = already_complete(
-            path, size, tolerance=complete_tolerance(kind))
+        # 增量判据：回放优先用索引里「经稳定窗口确认」的 size（远端声明值
+        # 在转码期间会变，不可当真值）；没有可信 size 就用本轮探测值，
+        # 一律精确比对 —— v1.4.2 起删除全部比例容差。
+        size_for_check = size
+        trusted = indexed_size(it, index, args.course) if kind == "回放" else None
+        if trusted is not None:
+            size_for_check = trusted
+        complete, local_size, exp = already_complete(path, size_for_check)
         if complete:
             if not args.quiet:
                 print("[%2d] SKIP  %-4s %-30s -> %s" % (i, kind, name[:28], rel))
@@ -957,11 +1046,45 @@ def main():
             rows.append({"i": i, "kind": kind, "activity": act, "name": name,
                          "size": local_size, "dir": rel, "status": STATUS_EXISTS})
             continue
-        if local_size > 0:
-            # 有文件但大小对不上 —— 多半是上次中断留下的，重下（.part 会走续传）
-            print("[%2d] REDO  %-4s %-30s 本地 %s / 期望 %s"
-                  % (i, kind, name[:28], human_size(local_size),
-                     human_size(exp) if exp else "未知"))
+
+        # ★ resource identity 守卫：只对「索引里没有的新身份」生效 ——
+        #   输出目录里的存量文件可能是别的资源（索引时代之前留下的），
+        #   绝不盲目覆盖，换确定性后缀另存。
+        #   索引权威路径（_canon）不走守卫：同 uid 内容更新原地覆盖，身份不漂移。
+        #   --dry-run 与正式下载共用同一判定，计划即所见。
+        if it.get("_canon"):
+            if local_size > 0:
+                print("[%2d] REDO  %-4s %-30s 本地 %s / 期望 %s（内容更新，原地覆盖）"
+                      % (i, kind, name[:28], human_size(local_size),
+                         human_size(exp) if exp else "未知"))
+        else:
+            action, target = identity_conflict_target(
+                dest, name, size, it.get("uid"))
+            if action == "skip":
+                if not args.quiet:
+                    print("[%2d] SKIP  %-4s %-30s -> %s（守卫路径）"
+                          % (i, kind, os.path.basename(target)[:24], rel))
+                skip += 1
+                rows.append({"i": i, "kind": kind, "activity": act,
+                             "uid": it.get("uid"),
+                             "name": os.path.basename(target),
+                             "size": size, "dir": rel, "status": STATUS_EXISTS})
+                continue
+            if target != path:
+                print("[%2d] ALT   %-4s %-30s 避免覆盖已有文件，改存 %s"
+                      % (i, kind, name[:26], os.path.basename(target)))
+                name = os.path.basename(target)
+                path = target
+                it["name"] = name      # 与索引记录保持一致
+                index[identity_key(it, args.course)] = {
+                    "path": _rel_split(os.path.relpath(path, args.out)),
+                    "name": name}
+            elif local_size > 0:
+                # 有残迹但大小对不上且没有可另存的冲突 —— 多半是上次中断留下的
+                # 空文件 / .part，重下（.part 会走续传）
+                print("[%2d] REDO  %-4s %-30s 本地 %s / 期望 %s"
+                      % (i, kind, name[:28], human_size(local_size),
+                         human_size(exp) if exp else "未知"))
 
         if args.dry_run:
             if args.verbose:
@@ -988,20 +1111,34 @@ def main():
             if res.get("exp_sha"):
                 mark += "  sha256✓"
             if kind == "回放":
-                mark += "  (无官方哈希)"
+                if res.get("verified_size"):
+                    mark += "  (远端确认 %s)" % human_size(res["verified_size"])
+                else:
+                    mark += "  (无官方哈希)"
             print("[%2d] OK    %10s  %s%s"
                   % (i, human_size(res["size"]), name[:40], mark))
-            # 回放拿不到官方哈希，短读只能靠声明总长比对暴露出来
+            # 回放：note 只是「响应头声明 vs 实得字节」的诊断说明，
+            # 完成与否已由稳定窗口确认（verified_size == size），不是告警。
             if res.get("note"):
-                print("       !! %s（超出 %.0f%% 阈值，建议复核）"
-                      % (res["note"], lms_live.SHORT_TOLERANCE * 100))
+                print("       ~~ %s" % res["note"])
             ok += 1
+            # ★ 把「经稳定窗口确认」的 size 记进索引 —— 它才是后续增量判据的
+            #   真值（响应头声明值在转码期间会变）。没通过确认的下载不会走到
+            #   这里，所以索引里的 size 天然可信。
+            if kind == "回放" and res.get("verified_size"):
+                key = identity_key(it, args.course)
+                rec = dict(index.get(key) or {})
+                rec.update({"path": _rel_split(os.path.relpath(path, args.out)),
+                            "name": name,
+                            "size": int(res["verified_size"])})
+                index[key] = rec
             rows.append({"i": i, "kind": kind, "activity": act, "name": name,
                          "size": res["size"], "dir": rel, "status": STATUS_OK,
                          "sha256": res["sha256"],
                          "server_sha256": res.get("exp_sha"),
                          "retried": res.get("retried", 0),
                          "declared": res.get("declared"),
+                         "verified_size": res.get("verified_size"),
                          "note": res.get("note")})
         else:
             print("[%2d] FAIL  %s :: %s" % (i, name[:40], res["err"]))
@@ -1014,6 +1151,7 @@ def main():
         write_manifest(args.manifest, rows)
         print("清单已写入 %s" % args.manifest)
 
+    save_download_index(args.out, index)
     tag = " (dry-run)" if args.dry_run else ""
     print("=== done%s ok=%d fail=%d skip=%d ===" % (tag, ok, fail, skip))
     if auth_fail:
@@ -1083,6 +1221,16 @@ def expand_items(op, keys, args):
         if not args.all_cameras:
             reps = [r for r in reps if r["camera_type"] == "encoder"] or reps[:1]
 
+        # ★ 身份歧义检查：同一活动里「无 camera_id 且 camera_type 相同」的
+        #   多路回放无法区分身份 —— 宁可显式失败也不硬合并（硬合并 =
+        #   两路机位互相冒领对方的字节，resource identity 直接破产）。
+        type_counts = {}
+        for r in reps:
+            if not r.get("camera_id"):
+                t = r.get("camera_type") or "unknown"
+                type_counts[t] = type_counts.get(t, 0) + 1
+        ambiguous = {t for t, n in type_counts.items() if n > 1}
+
         # ★ 同一天的多个 lecture_live 活动 title 完全相同（实际遇到过标题
         # 一致的多个活动），只靠 title 命名会互相覆盖。start_time 是唯一能
         # 区分它们的字段（在活动详情顶层），必须进文件名。
@@ -1099,18 +1247,27 @@ def expand_items(op, keys, args):
                 err_kind = (classify_http(p["code"])["kind"]
                             if p.get("code") else ERR_TRANSIENT)
                 err_msg = "回放探测失败: %s" % (p.get("err") or "未知错误")
-            items.append({
+            item = {
                 "kind": kind, "activity": act, "uid": act_id,
                 "name": name, "size": p.get("size") or 0,
                 "url": r["url"], "camera": r["camera_type"],
+                "camera_id": r.get("camera_id"),
                 "error": not p.get("ok"),
                 "err_kind": err_kind, "err_msg": err_msg,
                 "unavailable": err_kind == ERR_UNAVAILABLE,
-            })
+            }
+            if not r.get("camera_id") and \
+                    (r.get("camera_type") or "unknown") in ambiguous:
+                item.update({"error": True, "err_kind": ERR_IDENTITY,
+                             "err_msg": "回放身份歧义：同活动存在多路无 "
+                                        "camera_id 的 %s 机位，无法区分身份"
+                                        % (r.get("camera_type") or "unknown"),
+                             "unavailable": False})
+            items.append(item)
     return items, None
 
 
-def resolve_collisions(items, args):
+def resolve_collisions(items, args, taken0=None):
     """下载计划阶段消解目标路径冲突。
 
     ★ 为什么必须做：不同活动下的同名附件（例如每章都有一份 `讲义.pdf`，
@@ -1118,15 +1275,24 @@ def resolve_collisions(items, args):
     第二个条目会因为「目标已存在」被静默跳过 —— 文件悄悄丢了，日志里只多
     一行 SKIP，用户根本看不出来。
 
-    处理方式：多个不同 uid 撞到同一路径时，从第二个开始改名为
-    `stem~<uid>.ext`。**确定性**的，重复运行得到同一路径 —— 不用随机数，
-    也不加时间戳，否则每次跑都是新文件，磁盘会被灌满。
+    处理方式：多个不同 uid 撞到同一路径时，只保留一个 plain 名，
+    其余改名为 `stem~<uid>.ext`。**确定性**的，重复运行得到同一路径 ——
+    不用随机数，也不加时间戳，否则每次跑都是新文件，磁盘会被灌满。
 
-    仅处理带 error 之外的真实条目；条目会增加 `name` / `_collided` 字段。
+    ★ resource identity（v1.4.2 起）：plain 名的归属由「迭代顺序」改为
+    「最小 uid」。以前谁排在前面谁赢，而顺序是 (kind, safe(act), uid) 的
+    字典序 —— 新增一个排序靠前的活动、或者某条目这轮刚好报错不占位，
+    都会让胜者换人：已下载的文件变孤儿、全部重下，甚至两个 uid 的内容
+    互相换路径。改为最小 uid 后，平台 id 只增不减（追加式增长），
+    已有分配在新增条目时保持不变。
+
+    仅处理带 error 之外的真实条目；条目会增加 `name` / `_collided` / `_dest`
+    字段。`taken0` 允许调用方预占一批 (dest, name)（持久身份索引里已分配的
+    路径），新分配不得撞上去。
     返回 (items, n_fixed)。
     """
-    seen = {}                       # (dest, name) -> 已经用过的条目
-    fixed = 0
+    # 先按 (dest, name) 分组，只收会真实下载的条目
+    groups = {}                     # (dest, name) -> [item, ...] 按出现顺序
     for it in items:
         if it.get("error") or it.get("unavailable"):
             continue                # 这些条目根本不会下载，不参与占位
@@ -1134,33 +1300,301 @@ def resolve_collisions(items, args):
         if not name:
             continue
         dest = dest_for(it["kind"], it["activity"], name, args)
-        key = (dest, name)
-        if key not in seen:
-            seen[key] = it
+        it["_dest"] = dest          # 最终目录以分组时为准（改名不改目录）
+        groups.setdefault((dest, name), []).append(it)
+
+    # 所有 plain 名先全部占位（跨组也要防：改出来的 `~uid` 名可能恰好
+    # 等于另一组条目的原始文件名）
+    taken = set(groups.keys())
+    reserved = set(taken0 or ())
+    taken.update(reserved)
+    fixed = 0
+    for (dest, name), members in groups.items():
+        contested = (dest, name) in reserved
+        if len(members) < 2 and not contested:
             continue
-        # 撞了：换一个带 uid 的确定性后缀
-        prev = seen[key]
-        if prev.get("_collided"):
-            # 前一个已经被改过名，说明新的这个还是撞，直接给它后缀
-            pass
+
+        def _rank(it):
+            # uid 都是 int（回放是负的活动 id）；None 只在残缺数据里出现，
+            # 排最后，同级按出现顺序（sorted 稳定）
+            uid = it.get("uid")
+            return (uid is None, uid if uid is not None else 0)
+
+        ordered = sorted(members, key=_rank)
+        # plain 名的归属：无索引占位时 = 最小 uid；有索引占位时 =
+        # 索引持有者（不在 members 里），fresh 条目全部改名
+        losers = ordered if contested else ordered[1:]
         stem, ext = split_ext(name)
-        uid = it.get("uid")
-        suffix = "~%s" % uid if uid is not None else "~dup"
-        new_name = safe("%s%s%s" % (stem, suffix, ext))
-        # 极少数情况下带上 uid 还是撞（同名不同 kind 落到同一目录底下的
-        # `其他/`），继续加计数把确定性保持住
-        n = 2
-        while (dest, new_name) in seen:
-            new_name = safe("%s%s-%d%s" % (stem, suffix, n, ext))
-            n += 1
-        it["name"] = new_name
-        it["_collided"] = True
-        fixed += 1
-        seen[(dest, new_name)] = it
+        for loser in losers:
+            uid = loser.get("uid")
+            suffix = "~%s" % uid if uid is not None else "~dup"
+            new_name = safe("%s%s%s" % (stem, suffix, ext))
+            # 极少数情况下带上 uid 还是撞（同名不同 kind 落到同一目录
+            # 底下的 `其他/`，或撞上别的组的 plain 名），继续加计数
+            n = 2
+            while (dest, new_name) in taken:
+                new_name = safe("%s%s-%d%s" % (stem, suffix, n, ext))
+                n += 1
+            loser["name"] = new_name
+            loser["_collided"] = True
+            fixed += 1
+            taken.add((dest, new_name))
     return items, fixed
 
 
-def build_rows(op, items, excl, args, quiet=False):
+# ---------------------------------------------------------- resource identity
+
+# 持久身份索引：identity_key -> canonical_path 的唯一权威。
+# 放在输出目录内，本质是一份「下载数据库」：
+#   - 只含资源 ID / 文件名 / 相对路径
+#   - 不含 Cookie、token、任何认证信息（与登录态 state 完全两类东西）
+INDEX_NAME = ".download-index.json"
+
+# 两个版本号职责不同，不要混：
+#   version         —— sidecar 文件结构版本（信封长什么样）
+#   identity_schema —— identity-key 语义版本（键里有哪些命名空间 / 约定）
+# 以后 course namespace / camera 约定再升级时改 identity_schema，
+# 不需要拿 key 字符串格式去猜这份索引属于哪一代。
+INDEX_VERSION = 1
+IDENTITY_SCHEMA = 1
+
+
+def identity_key(it, course):
+    """资源的稳定身份键 = course namespace + 资源类型 + 平台稳定 ID。
+
+    ★ course namespace：upload id 不必押注「全平台全局唯一」这个隐含假设。
+    `--out` 是用户自由指定的，两个课程共用一个输出根目录时身份绝不能串 ——
+    键的作用域和索引的作用域（--out）因此完全一致。
+
+    ★ 回放：一个活动多路机位共用活动 id，键必须带机位。优先 camera_id
+    （同类型多机位也能区分），camera_id 缺失才降级 camera_type ——
+    同活动「无 camera_id 且同类型」的多路回放是身份歧义，由 expand_items
+    显式报 identity ambiguous，不在这里硬合并。
+    """
+    if it.get("kind") == "回放":
+        cid = it.get("camera_id")
+        if cid:
+            return "course:%s:live:%s:camera:%s" % (course, it.get("uid"), cid)
+        return "course:%s:live:%s:type:%s" % (course, it.get("uid"),
+                                              it.get("camera") or "unknown")
+    return "course:%s:upload:%s" % (course, it.get("uid"))
+
+
+class IndexCorruptError(Exception):
+    """身份索引解析失败 —— fail-closed，绝不允许静默当空索引继续下载。"""
+
+
+_DRIVE_RE = re.compile(r"^[A-Za-z]:")
+
+
+def _safe_rel(rel, out_dir):
+    """验证索引里的 path 是落在 --out 之内的相对路径，非法返回 None。
+
+    canonical path 是权威写入目标：一条被手工改成 `../../x` 的记录，
+    就能把索引变成任意路径写入入口。加载时逐条验证：
+    相对路径 / 无 `..` 逃逸 / 非绝对路径 / 非 drive / 非 UNC /
+    normalize 后仍在 out 内。
+    """
+    if not isinstance(rel, str) or not rel:
+        return None
+    if rel.startswith(("/", "\\")) or _DRIVE_RE.match(rel):
+        return None                          # 绝对路径 / drive / UNC
+    parts = rel.split("/")
+    if ".." in parts or "" in parts or "." in parts:
+        return None                          # 逃逸 / 空段 / 自指
+    norm = os.path.normpath(os.path.join(out_dir, *parts))
+    out_abs = os.path.abspath(out_dir)
+    n_abs = os.path.abspath(norm)
+    if n_abs == out_abs:
+        return None
+    try:
+        if os.path.commonpath([out_abs, n_abs]) != out_abs:
+            return None
+    except ValueError:                       # 跨盘（Windows）
+        return None
+    return "/".join(parts)
+
+
+def _refuse(msg):
+    """合法 JSON 但结构 / 版本 / 键不认识 → 拒绝继续，**不改名不动原文件**。"""
+    raise IndexCorruptError("%s（原文件未改动）" % msg)
+
+
+def load_download_index(out_dir):
+    """读输出目录里的身份索引。
+
+    ★ fail-closed，按「内容损坏」与「格式不认识」分两类处理：
+
+    1. **已知格式中的坏数据**（坏 JSON / 顶层不是对象 / item 或 path 违反
+       当前 schema）→ 属于「我知道它应该长什么样，但它坏了」，坏文件改名
+       `.download-index.json.corrupt-<时间戳>` 保留现场，抛 IndexCorruptError。
+    2. **格式不认识**（version / identity_schema 缺失或未知）→ 属于「我不知道
+       怎么解释它」，**原文件不改名、不 migration、不自动修复**，字节级原样
+       保留，直接抛 IndexCorruptError 拒绝下载。
+
+    ★ migration 边界：loader 只做**结构型**迁移（旧信封 `entries` / 顶层裸
+    map → `items`，且键已带 course namespace）；**身份语义型迁移禁止**——
+    `upload:123` → `course:x:upload:123` 需要猜 course 归属，那是在推断
+    身份，遇到旧语义键直接拒绝，绝不自动补。
+
+    单条 path 越界 / 非法：属于已知格式中的坏数据，整份 fail-closed
+    （改名保留现场 + 拒绝下载）——「丢弃单条」等于静默遗忘该身份的
+    canonical_path，违反 fail-closed。
+    """
+    p = os.path.join(out_dir, INDEX_NAME)
+    if not os.path.exists(p):
+        return {}
+
+    def _rename_and_raise(why):
+        ts = time.strftime("%Y%m%d-%H%M%S")
+        bad = "%s.corrupt-%s" % (p, ts)
+        try:
+            os.replace(p, bad)
+        except OSError:
+            bad = p + "（改名失败，原文件保留）"
+        raise IndexCorruptError(
+            "身份索引解析失败，已保留现场：%s（%s）" % (bad, why))
+
+    try:
+        with open(p, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError) as e:
+        _rename_and_raise(str(e)[:80])
+    if not isinstance(data, dict):
+        _rename_and_raise("顶层必须是对象")
+
+    # ---- schema / version 检查（合法 JSON，拒绝时不动原文件） ----
+    if "items" in data:
+        version = data.get("version")
+        if version != INDEX_VERSION:
+            _refuse("未知 version %r —— 未知格式宁可停下，不猜" % (version,))
+        ischema = data.get("identity_schema")
+        if ischema != IDENTITY_SCHEMA:
+            _refuse("未知或缺失 identity_schema %r（当前 %r）—— 身份键语义"
+                    "不确定时宁可停下" % (ischema, IDENTITY_SCHEMA))
+        items = data["items"]
+    elif "entries" in data:
+        items = data["entries"]              # v0 信封：走确定性 migration
+    elif data.get("version") is None:
+        items = data                         # 更早的顶层裸 map：同上
+    else:
+        _refuse("缺少 items 字段")
+    if not isinstance(items, dict):
+        _rename_and_raise("items 必须是对象")
+
+    # ---- 身份键检查：旧键缺 course namespace 时无法确定归属，fail-closed ----
+    for k in items:
+        if not (isinstance(k, str) and k.startswith("course:")):
+            _refuse(
+                "检测到旧格式身份键 %r（无 course namespace）—— 无法确定它属于"
+                "哪门课，不能静默重新分配去抢名字槽。请人工确认输出目录内容后"
+                "删除或手工迁移该索引。" % (k,))
+
+    # ---- canonical path 逐条验证：任何一条非法 → 整份 fail-closed ----
+    # ★ 不能「丢弃单条后继续」：丢一条 = 该身份的 canonical_path 被静默
+    #   遗忘 = 重新参与首次分配去抢名字槽 —— 正是索引要消灭的问题。
+    #   权威要么整份可信，要么本次运行不进行任何可能改变资源落点的下载。
+    out = {}
+    problems = []
+    for k, v in items.items():
+        if not isinstance(v, dict):
+            problems.append("条目 %s 格式非法" % k)
+            continue
+        rel = _safe_rel(v.get("path"), out_dir)
+        if rel is None:
+            problems.append("条目 %s 的 canonical path 越界或非法（%r）"
+                            % (k, v.get("path")))
+            continue
+        out[k] = {"path": rel, "name": str(v.get("name") or "")}
+    if problems:
+        _rename_and_raise("; ".join(problems[:5]))
+    return out
+
+
+def save_download_index(out_dir, entries):
+    p = os.path.join(out_dir, INDEX_NAME)
+    os.makedirs(out_dir, exist_ok=True)
+    tmp = p + ".part"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump({"version": INDEX_VERSION,
+                   "identity_schema": IDENTITY_SCHEMA,
+                   "items": entries}, f,
+                  ensure_ascii=False, indent=1, sort_keys=True)
+    os.replace(tmp, p)
+
+
+def _rel_join(rel):
+    """索引里的相对路径统一用 / 存储，落盘时换回平台分隔符。"""
+    return os.path.join(*rel.split("/"))
+
+
+def _rel_split(path):
+    return path.replace(os.sep, "/")
+
+
+def item_dest(it, args):
+    """条目的落盘目录。分配过身份的条目用记录值（布局切换不影响既有身份），
+    新条目按当前参数计算。"""
+    if it.get("_dest") is not None:
+        return it["_dest"]
+    return dest_for(it["kind"], it["activity"], it["name"], args)
+
+
+def assign_canonical_paths(items, index, args, course):
+    """把「identity → canonical_path」变成严格函数（v1.4.2 起的核心不变量）。
+
+    ★ 为什么必须有持久索引：光靠「本轮可见集合 + 最小 uid」推路径，
+    身份映射仍然依赖环境状态 —— 同名同大小的两个资源在瞬时错误下
+    会互相冒领字节（size 相同连覆盖守卫都分辨不出），同 uid 内容更新
+    会把路径挤到 ~uid 后缀去。canonical_path 一旦分配就记进索引，
+    之后：其他资源增删 / meta 失败 / 排序变化 / 同 uid 更新 / 重启，
+    都不再影响它。
+
+    分配规则：
+      1. 索引里已有的身份（含本轮报错的）→ 直接用记录的 canonical_path，
+         并把该路径占位 —— 报错条目释放不了名字槽，这是堵洞的关键。
+      2. 新身份 → 按 dest_for + 最小 uid 冲突规则分配（索引占位计入）。
+      3. 新分配立即写回索引；下载成败不影响已分配的身份。
+
+    返回 (items, n_fixed)，语义与 resolve_collisions 一致。
+    """
+    reserved = set()                # 已被身份占用的 (dest, name)
+    fresh = []
+    for it in items:
+        if not it.get("uid") and it.get("uid") != 0:
+            continue                # 残缺条目（如扫描错误伪装项）没有身份
+        key = identity_key(it, course)
+        entry = index.get(key)
+        if entry is None:
+            if not (it.get("error") or it.get("unavailable")):
+                fresh.append(it)
+            continue
+        rel = entry.get("path") or ""
+        name = entry.get("name") or ""
+        if not rel or not name:
+            fresh.append(it)        # 索引条目残缺，按新身份重新分配
+            continue
+        # 索引里的 path 相对 args.out；还原成绝对/工作目录无关的落盘目录
+        dest = os.path.dirname(os.path.join(args.out, _rel_join(rel)))
+        if not (it.get("error") or it.get("unavailable")):
+            it["name"] = name
+            it["_dest"] = dest
+            it["_canon"] = True     # 索引权威：同 uid 更新内容也写在原路径
+        reserved.add((dest, name))  # 报错条目同样占位 —— 名字槽不因错误释放
+
+    _, fixed = resolve_collisions(fresh, args, taken0=reserved)
+    for it in fresh:
+        dest = it.get("_dest") or dest_for(
+            it["kind"], it["activity"], it["name"], args)
+        it["_dest"] = dest
+        it["_fresh"] = True        # 下载时走覆盖守卫（防存量文件误伤）
+        rel = _rel_split(os.path.relpath(
+            os.path.join(dest, it["name"]), args.out))
+        index[identity_key(it, course)] = {"path": rel, "name": it["name"]}
+    return items, fixed
+
+
+def build_rows(op, items, excl, args, quiet=False, index=None):
     """三种模式共用：把条目整理成清单行。
 
     ★ 错误语义必须和下载主流程一模一样（都走 item_status）——
@@ -1168,9 +1602,9 @@ def build_rows(op, items, excl, args, quiet=False):
     坏 JSON 全被拍成 N/A，`--list-only` 还固定 return 0，
     接口明显失败时看起来却像一切正常。
 
-    ★ 已有文件的判断也必须用 already_complete（带对应容错），
-    只判 os.path.exists 会让「本地截断文件」在清单里显示成 exists，
-    而主流程里它是要重下的 —— 两种视图对不上。
+    ★ 已有文件的判断也必须用 already_complete（**无任何容差**，回放优先用
+    索引里经稳定窗口确认的 size），只判 os.path.exists 会让「本地截断文件」
+    在清单里显示成 exists，而主流程里它是要重下的 —— 两种视图对不上。
     """
     rows = []
     for i, it in enumerate(items, 1):
@@ -1186,12 +1620,28 @@ def build_rows(op, items, excl, args, quiet=False):
                       % (i, row["status"].upper(), kind,
                          str(it.get("uid"))[:24], row["error"][:44]))
             continue
-        dest = dest_for(kind, act, name, args)
-        done, local, _exp = already_complete(
-            os.path.join(dest, name), size,
-            tolerance=complete_tolerance(kind))
+        dest = item_dest(it, args)
+        path = os.path.join(dest, name)
+        # 与下载主流程同一判据：回放优先用索引里经稳定窗口确认的 size，
+        # 没有可信 size 才用本轮探测值，一律精确比对（无容差）。
+        size_for_check = size
+        trusted = indexed_size(it, index, args.course) if kind == "回放" else None
+        if trusted is not None:
+            size_for_check = trusted
+        done, local, _exp = already_complete(path, size_for_check)
+        # 清单视图必须与下载行为一致：仅「索引里没有的新身份」走覆盖守卫，
+        # 索引权威路径同 uid 更新是原地覆盖，不另存
+        if not done and not it.get("_canon"):
+            action, target = identity_conflict_target(
+                dest, name, size, it.get("uid"))
+            if action == "skip":
+                done = True
+                local = size
+                path = target
+            elif target != path:
+                path = target
         row = {"i": i, "kind": kind, "activity": act, "uid": it.get("uid"),
-               "name": name, "size": size,
+               "name": os.path.basename(path), "size": size,
                "dir": os.path.relpath(dest, args.out),
                "ext": split_ext(name)[1].lstrip(".")}
         if excl and excl.search(name):
