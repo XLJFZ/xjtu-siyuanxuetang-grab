@@ -113,8 +113,9 @@ jobs:
           if git ls-files | grep -Ei '(^|/)profile_[^/]*/'; then
             echo "::error::仓库里出现了浏览器 profile 目录，必须移除"; exit 1
           fi
-          echo "--- 检查是否残留本机绝对路径 ---"
-          if grep -rn --include='*.py' -E 'C:\\\\Users\\\\|/Users/[a-z]|D:\\\\' scripts/ ; then
-            echo "::error::脚本里出现本机绝对路径，应改为相对路径或环境变量"; exit 1
-          fi
+          echo "--- 隐私扫描：本机路径 / 凭据 / 私有主机名 ---"
+          # 扫描范围 = 发布白名单（tools/release_common.py 的 INCLUDE），
+          # 不再手写 `scripts/` —— 白名单新增文件会自动进入扫描，
+          # 不会出现「发了新的公开文件、隐私 gate 却没看它」。
+          python tools/privacy_scan.py --root . --format github --list-noted
           echo "OK"

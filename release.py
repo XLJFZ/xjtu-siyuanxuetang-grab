@@ -63,13 +63,15 @@ if HERE not in sys.path:
 # 打包白名单与推送白名单必须是同一份定义，否则「包里有什么」和
 # 「仓库里有什么」会各自漂移 —— 详见 tools/release_common.py。
 from tools import release_common as RC  # noqa: E402
+# 隐私扫描同样复用那份白名单：扫描范围 = 发布范围，不另立清单。
+from tools import privacy_scan as PS   # noqa: E402
 
 
 def find_src():
     """定位发布源目录。
 
     这个脚本有两种存放位置：
-      A. 工作区根（当前布局）：`D:\\xjtu-siyuanxuetang-grab\\release.py`，
+      A. 工作区根（当前布局）：`<repo>/release.py`，
          源就是脚本自己所在的目录
       B. 仓库同级（历史布局）：`<工作区>/_release/release.py`，
          源在 `<工作区>/_release/xjtu-lms-grab/`
@@ -285,6 +287,16 @@ def verify_zip(zip_path):
         with zipfile.ZipFile(zip_path) as z:
             z.extractall(tmp)
         root = os.path.join(tmp, ZIP_STEM)
+
+        # 隐私扫描 —— 放在最前面。本机绝对路径 / 真实凭据一旦混进公开包就
+        # 收不回来，比「包里缺文件」严重得多，也该尽早报出来。
+        # 扫描范围 = 发布白名单（PS 内部复用 RC.collect），不另立一份清单。
+        pv_findings, _pv_n = PS.scan_tree(root)
+        pv_bad = PS.blocking(pv_findings)
+        if pv_bad:
+            print(PS.format_findings(pv_bad))
+            raise SystemExit("校验失败：包里发现 %d 处疑似本机路径 / 凭据泄漏"
+                             % len(pv_bad))
 
         # 关键文件必须在
         for must in ("README.md", "SKILL.md", "docs/MAINTAINING.md",

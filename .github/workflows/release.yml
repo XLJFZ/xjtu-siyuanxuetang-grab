@@ -142,9 +142,8 @@ jobs:
           if git ls-files | grep -Ei '(^|/)profile_[^/]*/'; then
             echo "::error::仓库里出现浏览器 profile 目录"; exit 1
           fi
-          if grep -rn --include='*.py' -E 'C:\\\\Users\\\\|/Users/[a-z]|D:\\\\' scripts/; then
-            echo "::error::脚本里有本机绝对路径"; exit 1
-          fi
+          # 扫描范围 = 发布白名单，与 CI 共用同一份定义（tools/privacy_scan.py）
+          python tools/privacy_scan.py --root . --format github --list-noted
           echo "OK"
 
   release:

@@ -34,6 +34,7 @@ if ROOT not in sys.path:
 
 from tools import release_common as RC   # noqa: E402
 from tools import gh_push_dir as P       # noqa: E402
+from tools import privacy_scan as PS     # noqa: E402
 import release as R                      # noqa: E402
 
 
@@ -194,6 +195,159 @@ class TestReleaseCommon(PushCase):
         """README 里有 docs/ 的相对链接，包里就必须有 docs/。"""
         for entry in ("tools", "docs"):
             self.assertIn(entry, RC.INCLUDE)
+
+
+class TestPrivacyScan(PushCase):
+    """发布树隐私扫描 —— 「什么不许进公开包」的唯一定义。
+
+    回归背景：v1.5.0 的发布工具文档字符串里写着**转义形式**的本机盘符路径，
+    而当时的检查只匹配单分隔符、CI 又只扫 scripts/，于是这条本机路径随包
+    发布了。下面把这些失败模式分别钉住：
+
+      1) 单分隔符形态命中
+      2) 源码字面量（双反斜杠）形态命中 —— 当年漏掉的就是这个
+      3) URI scheme / 格式化占位不误报
+      4) 白名单新增公开文件后自动进入扫描（扫描范围 = 发布范围）
+      5) 发布校验必须因此失败
+      6) 豁免是逐行的，不是关掉规则
+      7) 当前发布树零阻塞
+    """
+
+    def _zip_with(self, rel, data):
+        """造一个解包后长成 `<ZIP_STEM>/<rel>` 的最小包。"""
+        zpath = os.path.join(self.tmp, "planted.zip")
+        with zipfile.ZipFile(zpath, "w", zipfile.ZIP_DEFLATED) as z:
+            z.writestr("%s/%s" % (R.ZIP_STEM, rel), data)
+        return zpath
+
+    # ---------------------------------------------------------- 命中
+
+    def test_single_separator_drive_path_blocks(self):
+        text = 'ROOT = "D:\\repo\\file.py"'                                # privacy-scan: fixture
+        self.assertTrue(PS.blocking(PS.scan_text("x/sample.py", text)),
+                        "单分隔符的盘符路径必须命中")
+
+    def test_escaped_literal_drive_path_blocks(self):
+        """★ 源码字面量在盘上的真实字节是双反斜杠 —— 当年漏掉的就是这一形态。"""
+        text = 'ROOT = "D:\\\\repo\\\\file.py"'                            # privacy-scan: fixture
+        self.assertTrue(PS.blocking(PS.scan_text("x/sample.py", text)),
+                        "双反斜杠形态必须命中，否则文档字符串里的路径会从 gate 下溜走")
+
+    def test_drive_path_rule_is_generic_not_name_anchored(self):
+        """★ v1.5.0 漏检的真正成因：旧检查把盘符路径**锚定在具体目录名**上，
+        且分隔符只允许一个 —— 于是源码字面量（双反斜杠）形态匹配不到。
+        这里的规则必须是「任意盘符路径」而不是「本项目目录名的路径」。"""
+        for text in ('ROOT = "E:\\\\some-other-repo\\\\note.md"',                # privacy-scan: fixture
+                     'ROOT = "D:\\\\xjtu-siyuanxuetang-grab\\\\release.py"'):    # privacy-scan: fixture
+            self.assertTrue(PS.blocking(PS.scan_text("x/sample.py", text)), text)
+        # 分隔符必须是「一或多个」：这一条直接钉住正则形态，
+        # 因为仅靠命中/不命中区分不出 `[\\/]` 与 `[\\/]+`（尾部类是贪婪的）。
+        self.assertIn("[\\\\/]+", PS._WIN_ABS_PATH.pattern,
+                      "盘符后的分隔符必须允许重复，否则转义形态会漏")
+
+    def test_windows_user_and_posix_home_block(self):
+        for text in ("C:\\Users\\alice\\.lms-grab\\state_common.json",     # privacy-scan: fixture
+                     "/Users/carol/proj/x.py",                             # privacy-scan: fixture
+                     "/home/dave/.lms-grab/state_common.json"):            # privacy-scan: fixture
+            self.assertTrue(PS.blocking(PS.scan_text("x/sample.py", text)), text)
+
+    def test_credential_shapes_block(self):
+        for text in ("github_pat_11BVIJLWA0DKHzeDKyIlvH_H7olQv",           # privacy-scan: fixture
+                     "ghp_AbCdEfGhIjKlMnOpQrStUvWxYz012345",              # privacy-scan: fixture
+                     "?previewToken=9f8e7d6c5b4a39281706f5e4",            # privacy-scan: fixture
+                     "https://rms-v5.xjtu.edu.cn/live/a.m3u8"):           # privacy-scan: fixture
+            self.assertTrue(PS.blocking(PS.scan_text("x/sample.py", text)), text)
+
+    # ---------------------------------------------------------- 不误报
+
+    def test_uri_schemes_are_not_drive_paths(self):
+        for text in ("https://example.com/path/to/thing",
+                     "http://127.0.0.1:4774",
+                     'return "%s://%s%s" % (p.scheme, p.netloc, p.path)',
+                     "s3://bucket/key"):
+            self.assertFalse(PS.blocking(PS.scan_text("x/sample.py", text)),
+                             "URI / 格式化占位不该被当成盘符路径：%s" % text)
+
+    def test_placeholder_and_generic_os_paths_are_noted_not_blocked(self):
+        """占位写法与通用系统目录要**记录**，但不属于泄漏。"""
+        for text in ("C:\\Users\\<你>\\.lms-grab",                          # privacy-scan: fixture
+                     "D:/xxx/state.json",
+                     'r"C:\\Program Files (x86)"'):                         # privacy-scan: fixture
+            findings = PS.scan_text("x/sample.py", text)
+            self.assertFalse(PS.blocking(findings), text)
+            self.assertTrue(findings, "不是泄漏也要留下记录，不能静默吞掉：%s" % text)
+
+    # ---------------------------------------------------------- 扫描范围
+
+    def test_new_whitelisted_file_is_scanned_automatically(self):
+        """白名单里新增一个公开 .py，扫描必须自动覆盖它 —— 不用改任何清单。"""
+        self.write("scripts/brand_new.py",
+                   br'ROOT = "D:\repo\brand.py"')                # privacy-scan: fixture
+        findings, _n = PS.scan_tree(self.src)
+        bad = PS.blocking(findings)
+        self.assertEqual([f.path for f in bad], ["scripts/brand_new.py"],
+                         "新文件里的本机路径必须被发现")
+        self.assertTrue(RC.collect(self.src), "新文件确实落在发布白名单内")
+
+    def test_scan_scope_equals_release_whitelist(self):
+        """扫描范围 == 发布范围：白名单外的文件不看，白名单内的一个不漏。"""
+        self.write("docs/note.md", br"see D:\repo\note.md")             # privacy-scan: fixture
+        self.write("junk/outside.py", br"see D:\repo\outside.py")       # privacy-scan: fixture
+        findings, _n = PS.scan_tree(self.src)
+        paths = {f.path for f in PS.blocking(findings)}
+        self.assertIn("docs/note.md", paths,
+                      "白名单内的 docs/ 必须被扫到")
+        self.assertNotIn("junk/outside.py", paths,
+                         "白名单外的东西不在扫描范围（它也不会进包）")
+
+    def test_scan_tree_uses_the_shared_whitelist(self):
+        """扫描器内部必须复用 RC.collect —— 不许再立一份待扫清单。"""
+        import inspect
+        self.assertIn("RC.collect", inspect.getsource(PS.scan_tree))
+
+    # ---------------------------------------------------------- gate 生效
+
+    def test_release_verification_fails_on_planted_machine_path(self):
+        """★ 发布校验是真闸门：包里带本机路径就必须停下来。"""
+        zpath = self._zip_with("release.py",
+                               br'ROOT = "D:\repo\file.py"' + b"\n")    # privacy-scan: fixture
+        with self.assertRaises(SystemExit) as cm:
+            R.verify_zip(zpath)
+        self.assertIn("泄漏", str(cm.exception),
+                      "失败原因要写明是隐私泄漏，别让人以为是缺文件")
+
+    def test_allowlist_is_per_line_not_a_rule_switch(self):
+        """豁免精确到行：同一文件里没有标记的行照样被拦下。"""
+        literal = 'ROOT = "D:\\repo\\file.py"'                              # privacy-scan: fixture
+        self.assertFalse(
+            PS.blocking(PS.scan_text("tests/test_push.py",
+                                     literal + "  # privacy-scan: fixture")),
+            "带豁免标记的合成夹具不该阻塞")
+        self.assertTrue(
+            PS.blocking(PS.scan_text("tests/test_push.py", literal)),
+            "同一文件里没标记的行必须仍被拦下 —— 豁免不等于关掉规则")
+        for a in PS.ALLOWLIST:
+            self.assertTrue(a.reason.strip(), "每条豁免都要写明理由：%s" % a.path)
+
+    def test_published_tree_has_no_blocking_finding(self):
+        """当前发布树：零阻塞。新增任何真实泄漏都会被这条拦下。"""
+        findings, n = PS.scan_tree(ROOT)
+        bad = PS.blocking(findings)
+        self.assertGreater(n, 10, "得真的扫到了相当数量的文件")
+        self.assertEqual([], bad, "发布树里不该有阻塞项：\n%s"
+                         % PS.format_findings(bad))
+
+    def test_ci_and_release_workflows_run_the_shared_scanner(self):
+        """CI / Release 的隐私自检必须跑共享扫描器，不能退化回手写 grep。"""
+        for name in ("ci.yml", "release.yml"):
+            path = os.path.join(ROOT, ".github", "workflows", name)
+            with open(path, encoding="utf-8") as f:
+                body = f.read()
+            self.assertIn("tools/privacy_scan.py", body,
+                          "%s 的隐私自检要复用共享扫描器" % name)
+            self.assertNotRegex(
+                body, r"grep -rn --include='\*\.py'",
+                "%s 不该再手写只扫 scripts/ 的 grep（范围会漏）" % name)
 
 
 class TestPusherIncludeDefault(PushCase):
