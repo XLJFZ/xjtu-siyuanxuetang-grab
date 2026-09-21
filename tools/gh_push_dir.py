@@ -230,11 +230,14 @@ def push(api, src, branch="main", message=None, include=None, dry_run=False):
 
     # ★ CAS，不是 force。base 已经不是当前 HEAD 时 GitHub 会拒绝，
     #   此时必须停下——覆盖别人的提交比发布晚几分钟严重得多。
+    #   ★ 这里绝不能传 allow=_CONFLICT：allow 的语义是「这个状态码算正常响应」，
+    #   会把 409/422 吞成 (code, body) 返回值，Api.req 里的 ConflictError
+    #   翻译逻辑永远走不到，异常最后退化成 TransientError（被当成可重试的
+    #   网络抖动）。409/422 必须由 Api.req 按协议语义翻译成 ConflictError。
     try:
         api.req("PATCH", "/repos/%s/%s/git/refs/heads/%s"
                 % (api.owner, api.repo, branch),
-                {"sha": new_sha, "force": False}, expect=(200,),
-                allow=_CONFLICT)
+                {"sha": new_sha, "force": False}, expect=(200,))
     except ConflictError:
         try:
             _c2, cur = api.req("GET", "/repos/%s/%s/git/ref/heads/%s"

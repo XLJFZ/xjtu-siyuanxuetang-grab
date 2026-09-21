@@ -1,8 +1,14 @@
 # 登录态与凭据 —— 绝对不能提交
+# .tmp 后缀：登录态落盘走「写 <state>.tmp 再原子替换」，写入中途崩溃会留下
+# 同样带 cookie 的半成品，必须和正主一起排除。
 state_*.json
 *.state.json
 storage_state.json
 cookies*.json
+state_*.json.tmp
+*.state.json.tmp
+storage_state.json.tmp
+cookies*.json.tmp
 *.har
 .env
 *.env
@@ -14,6 +20,7 @@ lms_profile/
 profile_*/
 profile_*
 activities_*.json
+activities_*.json.tmp
 .lms-grab/
 
 # 运行产物
@@ -70,3 +77,6 @@ _local_backup/
 # 归档：从旧工作区（CV 课目录下的 _release/）整体搬来的历史痕迹。
 # 纯存放，不参与构建、不参与发布。
 _archive/
+
+# 工作记忆（agent 的项目日志与长期笔记）—— 本机工作区专用，不进仓库
+.workbuddy/

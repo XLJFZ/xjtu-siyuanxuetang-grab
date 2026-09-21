@@ -632,6 +632,30 @@ class TestApiRetry(unittest.TestCase):
         with self.assertRaises(P.ConflictError):
             self._api([self._http(409)])
 
+    def test_422_is_conflict(self):
+        """★ 真实 urllib → HTTPError(422) → ConflictError。
+
+        回归背景：ref PATCH 曾错误地传 allow=_CONFLICT，把 409/422 当成
+        「正常响应」吞掉，ConflictError 翻译逻辑永远走不到，异常最后退化成
+        TransientError 被盲目重试 —— FakeApi 手工抛 ConflictError 掩盖了
+        这条真实协议路径。这里必须用 mock urlopen 抛 HTTPError 来测。
+        """
+        calls = []
+
+        def fake_urlopen(req, timeout=None):
+            calls.append(1)
+            raise self._http(422)
+
+        old = P.urllib.request.urlopen
+        P.urllib.request.urlopen = fake_urlopen
+        try:
+            api = P.Api("t", "O", "R", retries=3, sleep=lambda _s: None)
+            with self.assertRaises(P.ConflictError):
+                api.req("PATCH", "/repos/O/R/git/refs/heads/main")
+        finally:
+            P.urllib.request.urlopen = old
+        self.assertEqual(len(calls), 1, "冲突不该重试")
+
     def test_network_error_retries_then_gives_up(self):
         calls = []
 
@@ -651,6 +675,249 @@ class TestApiRetry(unittest.TestCase):
 
 
 # ---------------------------------------------------------------- release.py
+
+class _Resp:
+    """urlopen 成功响应的最小模拟（带上下文管理器协议）。"""
+
+    def __init__(self, code, body):
+        self._code, self._body = code, body
+
+    def read(self):
+        return self._body
+
+    def getcode(self):
+        return self._code
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+def _scripted_urlopen(entries):
+    """按 (method, URL 后缀, action) 依次回应真实 urllib 请求。
+
+    action:
+        dict        -> 200 + JSON body
+        (code, dict)-> 指定状态码 + JSON body（blobs/trees/commits 真实
+                       服务端回 201，Api.req 的 expect 也按 201 校验，
+                       回 200 会被当作异常响应进入重试）
+        int         -> HTTPError(code)
+        Exception   -> 原样抛出
+        callable    -> f(payload_dict) -> dict / (code, dict) / int / Exception
+    命中即弹出；重复请求或脚本外的请求直接 AssertionError —— 不静默。
+    """
+    state = {"entries": list(entries)}
+
+    def fake(req, timeout=None):
+        method = req.get_method()
+        url = req.full_url
+        payload = None
+        if req.data:
+            try:
+                payload = json.loads(req.data.decode("utf-8"))
+            except ValueError:
+                payload = None
+        for i, (m, suffix, action) in enumerate(state["entries"]):
+            if m != method or not url.endswith(suffix):
+                continue
+            del state["entries"][i]
+            if callable(action):
+                action = action(payload)
+            if isinstance(action, Exception):
+                raise action
+            if isinstance(action, int):
+                raise urllib.error.HTTPError(url, action, "err", {},
+                                             io.BytesIO(b"{}"))
+            code = 200
+            if isinstance(action, tuple):
+                code, action = action
+            return _Resp(code, json.dumps(action).encode("utf-8"))
+        raise AssertionError("脚本外的请求: %s %s" % (method, url))
+
+    return fake, state
+
+
+class TestRealApiRefConflict(PushCase):
+    """★ 全流程走真实 Api.req()：urllib → HTTPError(409) → ConflictError。
+
+    FakeApi.conflict_ref 是「手工抛异常」，绕开了 Api.req 的协议翻译层；
+    这条用例 mock urlopen，让 PATCH /git/refs/heads/main 真的收到
+    HTTPError 409 / 422，验证 push() 的冲突报告语义（fail-closed、
+    不用 force、输出 base / 新 commit / 当前远端 SHA）。
+    """
+
+    BASE_SHA = "B" * 40
+    NEW_SHA = "N" * 40
+    OTHER_SHA = "C" * 40
+
+    def _run_conflict(self, patch_code):
+        self.write("scripts/a.py", b"new")
+        seen_patch = {}
+
+        def patch_payload(pl):
+            seen_patch.update(pl or {})
+            return patch_code
+
+        entries = [
+            ("GET", "/git/ref/heads/main",
+             {"object": {"sha": self.BASE_SHA}}),
+            ("GET", "/git/commits/" + self.BASE_SHA,
+             {"sha": self.BASE_SHA, "tree": {"sha": "TREE1"}}),
+            ("GET", "/git/trees/TREE1?recursive=1",
+             {"truncated": False, "tree": []}),
+            ("POST", "/git/blobs",
+             lambda pl: (201, {"sha": RC.git_blob_sha(
+                 base64.b64decode(pl["content"]))})),
+            ("POST", "/git/trees", (201, {"sha": "T2"})),
+            ("POST", "/git/commits", (201, {"sha": self.NEW_SHA})),
+            ("PATCH", "/git/refs/heads/main", patch_payload),
+            # push() 报告冲突时会回读当前远端 ref
+            ("GET", "/git/ref/heads/main",
+             {"object": {"sha": self.OTHER_SHA}}),
+        ]
+        fake, state = _scripted_urlopen(entries)
+
+        old = P.urllib.request.urlopen
+        P.urllib.request.urlopen = fake
+        try:
+            api = P.Api("t", "O", "R", sleep=lambda _s: None)
+            cm = self.assertRaises(P.ConflictError)
+            with cm:
+                P.push(api, self.src, branch="main", message="m")
+        finally:
+            P.urllib.request.urlopen = old
+        self.assertEqual(state["entries"], [],
+                         "脚本里的每个请求都必须被真实流程消费掉")
+        return str(cm.exception), seen_patch
+
+    def test_409_conflict_reports_shas(self):
+        msg, patch = self._run_conflict(409)
+        self.assertIn("未使用 force", msg)
+        self.assertIn("重新", msg)
+        self.assertIn(self.BASE_SHA, msg, "报告要给出推送基线 base SHA")
+        self.assertIn(self.NEW_SHA, msg, "报告要给出本次新 commit SHA")
+        self.assertIn(self.OTHER_SHA, msg, "报告要给出当前远端 branch SHA")
+        self.assertFalse(patch.get("force", True), "ref 更新必须 force=False")
+
+    def test_422_conflict_reports_shas(self):
+        """GitHub 对非 fast-forward 也可能回 422 —— 语义必须与 409 一致。"""
+        msg, _patch = self._run_conflict(422)
+        self.assertIn("未使用 force", msg)
+        self.assertIn(self.BASE_SHA, msg)
+        self.assertIn(self.NEW_SHA, msg)
+        self.assertIn(self.OTHER_SHA, msg)
+
+
+class TestWorkflowShellCompatibility(unittest.TestCase):
+    """★ Windows CI 全红的回归：windows-latest 的默认 run shell 是
+    PowerShell，`ACTUAL=$(git rev-parse HEAD)` 这类 Bash 语法在它下面
+    直接跑不通 —— 三个 Windows job 曾全红在 Source identity，Python
+    测试一次都没跑。
+
+    契约（不用 YAML 解析器，按缩进切 step）：
+      ① ci.yml 里任何含 Bash 专属语法的 step 都必须显式 `shell: bash`；
+      ② 两个 Source identity step 必须各自显式声明；
+      ③ release.yml 所有 job 只跑 ubuntu（那是它敢裸写 Bash 的前提，
+        将来有人加 Windows runner 时这条会提醒他补 shell）。
+    """
+
+    CI = os.path.join(ROOT, ".github", "workflows", "ci.yml")
+    REL = os.path.join(ROOT, ".github", "workflows", "release.yml")
+    BASH_ONLY_MARKERS = ("$(", "if [ ", "[ \"$", "; then", "|| {", "set -e")
+
+    def _steps(self, path):
+        """把 workflow 拆成 [(step_name, step_text)]，按缩进切，不引依赖。"""
+        steps = []
+        cur_name, cur = None, []
+        with open(path, encoding="utf-8") as f:
+            for raw in f:
+                line = raw.rstrip("\n")
+                if re.match(r"^      - ", line):          # 新 step（缩进 6）
+                    if cur_name is not None:
+                        steps.append((cur_name, "\n".join(cur)))
+                    m = re.match(r"^      - name:\s*(.+)$", line)
+                    cur_name = m.group(1).strip() if m else "(unnamed)"
+                    cur = [line]
+                elif cur_name is not None and line.startswith("        "):
+                    cur.append(line)
+        if cur_name is not None:
+            steps.append((cur_name, "\n".join(cur)))
+        return steps
+
+    def _uses_bash_syntax(self, text):
+        return any(mk in text for mk in self.BASH_ONLY_MARKERS)
+
+    def test_every_bash_step_declares_shell_bash(self):
+        offenders = [name for name, text in self._steps(self.CI)
+                     if self._uses_bash_syntax(text) and "shell: bash" not in text]
+        self.assertEqual(offenders, [],
+                         "这些 step 用了 Bash 语法却没声明 shell: bash，"
+                         "在 windows runner 上会跑不通：%s" % offenders)
+
+    def test_both_source_identity_steps_declare_bash(self):
+        declared = [text for name, text in self._steps(self.CI)
+                    if name == "Source identity"]
+        self.assertEqual(len(declared), 2,
+                         "test 与 lint 两个 job 都要有 Source identity")
+        for text in declared:
+            self.assertIn("shell: bash", text,
+                          "Source identity 必须显式 shell: bash —— 删掉它"
+                          " Windows CI 会全红")
+
+    def test_release_workflow_is_ubuntu_only(self):
+        """release.yml 裸写 Bash 的前提是「只在 ubuntu 跑」，钉住这个前提。"""
+        with open(self.REL, encoding="utf-8") as f:
+            body = f.read()
+        runs_on = re.findall(r"runs-on:\s*(\S+)", body)
+        self.assertTrue(runs_on, "release.yml 里必须有 job")
+        self.assertEqual(set(runs_on), {"ubuntu-latest"},
+                         "release.yml 出现非 ubuntu runner 时，含 Bash 语法的"
+                         " step 必须补 shell: bash")
+
+
+class TestCredentialGateConsistency(unittest.TestCase):
+    """登录态凭据排除必须四处同频：release_common（打包/推送）、
+    .gitignore、ci.yml、release.yml。任何一处漏掉 .tmp 形态，
+    用户 --state 指到仓库内路径时，写入中途崩溃留下的
+    `state_xxx.json.tmp` 半成品就可能被 Git 跟踪 / 进发布包。
+    """
+
+    TMP_NAMES = ("state_123.json.tmp", "x.state.json.tmp",
+                 "storage_state.json.tmp", "cookies_x.json.tmp")
+
+    def test_release_common_covers_tmp(self):
+        for rel in self.TMP_NAMES:
+            self.assertTrue(RC.rel_excluded("scripts/" + rel),
+                            "EXCLUDE_STATE 必须拦下 %s" % rel)
+        # 命中不能以牺牲原有排除为代价
+        for rel in ("scripts/state_1.json", "scripts/storage_state.json",
+                    "scripts/a.state.json", "scripts/cookies_x.json",
+                    "scripts/activities_1.json", "scripts/dump.har"):
+            self.assertTrue(RC.rel_excluded(rel), rel)
+        # 不许矫枉过正：正常的 .tmp 之外内容不该被误伤
+        self.assertFalse(RC.rel_excluded("scripts/a.py"))
+
+    def test_gitignore_covers_tmp(self):
+        with open(os.path.join(ROOT, ".gitignore"), encoding="utf-8") as f:
+            gi = f.read()
+        for pat in ("state_*.json.tmp", "*.state.json.tmp",
+                    "storage_state.json.tmp", "cookies*.json.tmp"):
+            self.assertIn(pat, gi, ".gitignore 缺 %s" % pat)
+
+    def test_workflows_cover_tmp(self):
+        for name in ("ci.yml", "release.yml"):
+            path = os.path.join(ROOT, ".github", "workflows", name)
+            with open(path, encoding="utf-8") as f:
+                body = f.read()
+            self.assertIn(r"(\.tmp)?", body,
+                          "%s 的登录态文件名检查必须覆盖 .tmp 形态" % name)
+            self.assertIn(r".*\.state\.json", body,
+                          "%s 的登录态检查漏了 *.state.json 家族" % name)
+
+
+# ---------------------------------------------------------------- release.py（续）
 
 class TestPushCodeReturnsSha(PushCase):
 

@@ -130,14 +130,15 @@ jobs:
         run: |
           python tests/test_organize.py
           python tests/test_fetch.py
+          python tests/test_login.py
           python tests/test_selfcheck.py
           python tests/test_push.py
 
       - name: 隐私自检
         run: |
           set -e
-          if git ls-files | grep -Ei '(^|/)(state_.*\.json|storage_state\.json|cookies.*\.json|activities_.*\.json)$'; then
-            echo "::error::仓库里出现登录态或活动清单文件"; exit 1
+          if git ls-files | grep -Ei '(^|/)(state_.*\.json|.*\.state\.json|storage_state\.json|cookies.*\.json|activities_.*\.json)(\.tmp)?$'; then
+            echo "::error::仓库里出现登录态（含 .tmp 半成品）或活动清单文件"; exit 1
           fi
           if git ls-files | grep -Ei '(^|/)profile_[^/]*/'; then
             echo "::error::仓库里出现浏览器 profile 目录"; exit 1

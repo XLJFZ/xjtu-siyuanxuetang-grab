@@ -210,23 +210,38 @@ def check_cache(rep):
 
 
 def check_online(rep, state):
-    """可选的在线探测：确认登录态在服务端还认。"""
+    """可选的在线探测：确认登录态在服务端还认。
+
+    ★ 三态语义（对应 lms_fetch.api_status）：
+        valid    -> PASS   服务端确认登录态有效
+        invalid  -> FAIL   服务端明确拒绝（登录页 / 401/403）——
+                            唯一该让用户重新登录的形态
+        unknown  -> WARN   无法判定（网关拦页 / 非 401/403 的 HTTP 错误 /
+                            网络异常 / 本地脚本问题）
+
+    ★ unknown 绝不能报 PASS：探测通道本身故障不等于登录态失效，
+    报 PASS 会让用户带着过期登录态白跑一趟下载；也不报 FAIL ——
+    网络抖一次就把用户赶去重新登录，同样是在制造错误结论。
+    """
     if not state:
         rep.warned("登录态探测", "跳过（没有登录态文件）")
         return
     try:
         sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-        from lms_fetch import api_ok, opener
-        valid, why = api_ok(opener(state))
+        from lms_fetch import api_status, opener
+        status, why = api_status(opener(state))
     except Exception as e:
         rep.warned("登录态探测", "无法执行: %s" % str(e)[:50],
                    "先确认基础脚本没问题，再单独跑 --online")
         return
-    if valid:
+    if status == "valid":
         rep.passed("登录态探测", why)
-    else:
+    elif status == "invalid":
         rep.failed("登录态探测", why,
                    "重新登录: python scripts/lms_login.py --course <课程ID>")
+    else:
+        rep.warned("登录态探测", "%s（无法判定，不作为通过）" % why,
+                   "稍后重跑 --online；连续 unknown 再查网络 / 代理")
 
 
 # ---------------------------------------------------------------- 主流程

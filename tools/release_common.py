@@ -38,9 +38,11 @@ EXCLUDE_NAMES = {
 EXCLUDE_SUFFIX = (".pyc", ".pyo", ".pyd", ".log", ".swp")
 
 # 登录态 / 活动清单 / 浏览器 profile 绝不能进包或进仓库（与 .gitignore 同步）
+# (\.tmp)? —— lms_login 落盘走「写 <state>.tmp 再原子替换」，进程中途死掉
+# 会留下 state_xxx.json.tmp 半成品；它同样带着 cookie，必须和正主一样拦。
 EXCLUDE_STATE = re.compile(
     r"(^|/)(state_.*\.json|.*\.state\.json|storage_state\.json|cookies.*\.json"
-    r"|activities_.*\.json|.*\.har)$", re.I)
+    r"|activities_.*\.json)(\.tmp)?$|(^|/).*\.har$", re.I)
 EXCLUDE_PROFILE = re.compile(r"(^|/)profile_[^/]+(/|$)")
 
 

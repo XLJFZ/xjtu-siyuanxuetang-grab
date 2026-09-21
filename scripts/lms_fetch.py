@@ -400,28 +400,30 @@ def get_json(op, url, timeout=60, retries=3):
     raise last
 
 
-def api_ok(op):
-    """探测登录态是否仍然有效。返回 (是否有效, 说明)。
+def _api_probe(op):
+    """发一次探测请求，按响应形态分类。返回 (kind, why)。
 
-    ★ 旧实现是 `if r.status == 200 and b'"courses"' in body: ... ;
-    return True, "接口可达"` —— 而登录页恰恰是 200 且不含 courses，
-    于是落进兜底分支返回 True：**过期被报成「接口可达」**，
-    `main()` 里那句「别让『过期』伪装成『平台没权限』」的预检自己失效。
-    现在按响应体判断，并且**把两件事分开说**：
-      · 登录页（统一身份认证特征）→ 「登录态已过期」，请重新登录；
-      · 其它非 JSON 的 200 → 「接口返回的不是 JSON」，多半是网关/代理拦了。
-    两种情况都不再往下跑（继续只会得到一屏 JSON 解析错），但提示不同 ——
-    否则用户会被支去白做一次重新登录。
+    kind 取值:
+        login_page   服务端把请求转到了统一身份认证登录页
+        non_json     HTTP 200 但响应不是 JSON（多半被网关/代理拦截）
+        courses      合法 JSON 且含 courses
+        json         合法 JSON（不含 courses）
+        http_auth    HTTP 401/403
+        http_other   其它 HTTP 错误（限流 / 5xx 等）
+        net_error    网络异常或本地错误
 
-    仍然**故意宽容**的两种情况（不该因为一次抖动就把用户赶去重新登录）：
-    非 401/403 的 HTTP 错误、以及网络异常。
+    为什么先分类、再由不同调用方各自映射：lms_fetch 的预检和
+    lms_selfcheck --online 对同一次探测的**解释不同** —— 下载器只关心
+    「能不能继续跑」（非 401/403 的一切都放行，别因一次抖动把用户赶去
+    重新登录）；自检关心「登录态到底还有没有效」，无法判定的情况必须
+    如实报 unknown，绝不能伪装成 PASS。
     """
     try:
         r = op.open(_json_request(op, "%s/api/my-courses?sub_course_id=0" % BASE),
                     timeout=30)
         body = r.read()
         if _is_login_page(r, body):
-            return False, "登录态已过期（被转到统一身份认证登录页）"
+            return "login_page", "登录态已过期（被转到统一身份认证登录页）"
         try:
             json.loads(body)
             parsed = True
@@ -431,17 +433,62 @@ def api_ok(op):
             # 不是登录页、但也不是 JSON —— 继续跑只会让后面每个请求都抛
             # 「Expecting value: line 1 column 1」，所以在这里停住；
             # 但**不要说成「登录过期」**，否则用户会白做一次重新登录。
-            return False, ("接口返回的不是 JSON（HTTP 200），可能被网关/代理拦截，"
-                           "先不继续")
+            return "non_json", ("接口返回的不是 JSON（HTTP 200），可能被网关/代理拦截，"
+                                "先不继续")
         if b'"courses"' in body:
-            return True, "登录态有效"
-        return True, "接口可达（响应里没有 courses，但是合法 JSON）"
+            return "courses", "登录态有效"
+        return "json", "接口可达（响应里没有 courses，但是合法 JSON）"
     except urllib.error.HTTPError as e:
         if e.code in (401, 403):
-            return False, "服务端返回 %d，登录态已失效" % e.code
-        return True, "接口返回 %d，按可达处理" % e.code
+            return "http_auth", "服务端返回 %d，登录态已失效" % e.code
+        return "http_other", "接口返回 %d，按可达处理" % e.code
     except Exception as e:
-        return True, "探测失败（%s），跳过" % str(e)[:40]
+        return "net_error", "探测失败（%s），跳过" % str(e)[:40]
+
+
+def api_ok(op):
+    """探测登录态是否仍然有效。返回 (是否有效, 说明)。
+
+    ★ 旧实现是 `if r.status == 200 and b'"courses"' in body: ... ;
+    return True, "接口可达"` —— 而登录页恰恰是 200 且不含 courses，
+    于是落进兜底分支返回 True：**过期被报成「接口可达」**，
+    `main()` 里那句「别让『过期』伪装成『平台没权限』」的预检自己失效。
+    现在按响应形态判断（_api_probe）：
+
+      · 登录页（统一身份认证特征）→ False，请重新登录；
+      · 其它非 JSON 的 200 → False（多半是网关/代理拦了，但不说成登录过期）。
+
+    仍然**故意宽容**的两种情况（不该因为一次抖动就把用户赶去重新登录）：
+    非 401/403 的 HTTP 错误、以及网络异常。
+    """
+    kind, why = _api_probe(op)
+    if kind in ("login_page", "non_json", "http_auth"):
+        return False, why
+    return True, why
+
+
+# api_status 的三态取值 —— selfcheck --online 的输出语义
+API_VALID, API_INVALID, API_UNKNOWN = "valid", "invalid", "unknown"
+
+
+def api_status(op):
+    """探测登录态的三态结果，供 lms_selfcheck --online 使用。
+
+    返回 (status, why)：
+        valid    服务端确认登录态有效                    —— selfcheck PASS
+        invalid  服务端明确拒绝（登录页 / 401/403）       —— 唯一报 FAIL 的形态
+        unknown  无法判定（网关拦页 / 非 401/403 的 HTTP 错误 /
+                 网络异常 / 本地脚本问题）               —— selfcheck WARN
+
+    ★ unknown 绝不许伪装成 PASS：探测通道本身故障和登录态失效是两回事，
+    报 PASS 会让用户带着过期登录态白跑一趟下载。
+    """
+    kind, why = _api_probe(op)
+    if kind in ("courses", "json"):
+        return API_VALID, why
+    if kind in ("login_page", "http_auth"):
+        return API_INVALID, why
+    return API_UNKNOWN, why
 
 
 # ---------------------------------------------------------------- 收集
@@ -1931,8 +1978,10 @@ def csv_guard(v):
 
 
 def write_manifest(path, rows):
-    """按扩展名决定写 JSON 还是 CSV"""
+    """按扩展名决定写 JSON 还是 CSV。经 .part + os.replace 原子落盘，
+    避免进程被杀时留下半截 manifest 被后续整理当成完整结果。"""
     ext = os.path.splitext(path)[1].lower()
+    tmp = path + ".part"
     if ext == ".csv":
         import csv
         # err_kind / stage 必须进 CSV：只留一个 N/A 会把「平台没给」
@@ -1940,15 +1989,16 @@ def write_manifest(path, rows):
         cols = ["i", "status", "kind", "activity", "name", "size", "dir",
                 "ext", "sha256", "server_sha256", "uid", "stage",
                 "err_kind", "error"]
-        with open(path, "w", newline="", encoding="utf-8-sig") as f:
+        with open(tmp, "w", newline="", encoding="utf-8-sig") as f:
             w = csv.DictWriter(f, fieldnames=cols, extrasaction="ignore")
             w.writeheader()
             for r in sorted(rows, key=lambda x: x.get("i", 0)):
                 w.writerow({k: csv_guard(v) for k, v in r.items()})
     else:
-        with open(path, "w", encoding="utf-8") as f:
+        with open(tmp, "w", encoding="utf-8") as f:
             json.dump({"count": len(rows), "files": rows}, f,
                       ensure_ascii=False, indent=2)
+    os.replace(tmp, path)
 
 
 if __name__ == "__main__":

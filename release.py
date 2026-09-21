@@ -300,9 +300,10 @@ def verify_zip(zip_path):
 
         # 关键文件必须在
         for must in ("README.md", "SKILL.md", "docs/MAINTAINING.md",
-                     "scripts/lms_fetch.py",
+                     "scripts/lms_fetch.py", "scripts/lms_login.py",
                      "scripts/lms_organize.py", "scripts/lms_selfcheck.py",
                      "tests/test_organize.py", "tests/test_fetch.py",
+                     "tests/test_login.py",
                      "tests/test_selfcheck.py", "tests/test_push.py",
                      "tools/gh_push_dir.py", "tools/release_common.py",
                      ".github/workflows/ci.yml", ".github/workflows/release.yml",
@@ -319,8 +320,8 @@ def verify_zip(zip_path):
         # 跑离线测试（每个文件都要跑，别只跑一个）
         n_files = 0
         total_ran = 0
-        for t in ("test_organize.py", "test_fetch.py", "test_selfcheck.py",
-                  "test_push.py"):
+        for t in ("test_organize.py", "test_fetch.py", "test_login.py",
+                  "test_selfcheck.py", "test_push.py"):
             r = subprocess.run([sys.executable,
                                 os.path.join(root, "tests", t)],
                                capture_output=True, text=True)

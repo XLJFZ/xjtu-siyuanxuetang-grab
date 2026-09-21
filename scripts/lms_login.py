@@ -20,9 +20,32 @@ import json
 import os
 import sys
 import time
+from urllib.parse import urlparse
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from lms_common import BASE, HOST, find_browser, profile_path, require_playwright, state_path
+
+
+class StateNotSaved(Exception):
+    """登录态没有落盘（没有可用 cookie / 写入失败）—— 调用方按失败退出。"""
+
+
+def is_lms_url(url):
+    """页面 URL 是否真的落在 LMS 站内。
+
+    ★ 必须用 urlparse 取 hostname 做精确 / 子域匹配，禁止字符串包含式判断
+    （`HOST in url` 会被 `?service=https://lms.xjtu.edu.cn/...` 这类**出现在
+    查询参数里的 HOST** 骗过 —— CAS 登录页 URL 恰恰都带这个参数，
+    旧实现因此把「没登录」误判成「已有登录态」）。
+    """
+    try:
+        h = (urlparse(url).hostname or "").lower()
+    except ValueError:
+        return False
+    if not h:
+        return False
+    t = HOST.lower()
+    return h == t or h.endswith("." + t)
 
 
 def save_state(ctx, state, course):
@@ -38,8 +61,17 @@ def save_state(ctx, state, course):
         {"version": 1, "base": ..., "host": ..., "course": ...,
          "created_at": ..., "cookies": [...]}
 
-    POSIX 下把文件权限收成 0600（只有本人可读）。Windows 不做模拟 ——
-    它靠 ACL 而不是 mode 位，chmod 上去没有实际意义。
+    落盘前有硬门禁：**一个适用于当前 HOST 的 cookie 都没有就拒绝写**。
+    「URL 看起来对」不等于「登录成功了」—— SSO 中间页 / 部分跳转都可能
+    骗过 URL 判断，此时落盘只会产生一份 describe_state 判为 empty/partial
+    的废文件，还可能覆盖掉原本正常的历史登录态。
+
+    临时文件安全（fail-closed）：
+      POSIX 上 .tmp 从**创建那一刻**就是 0600（os.open(mode=0o600)），
+      不做「先普通 open 写完再 chmod」—— 那样默认 umask 宽的机器上，
+      带 cookie 的 .tmp 会以 0644 短暂存在；写入中途异常退出时残留在盘上。
+      任何一步失败都会删掉 .tmp 再抛出，绝不留下半成品。
+      Windows 不伪造 POSIX mode 语义（它靠 ACL，chmod 没有实际意义）。
     """
     cookies = ctx.cookies([BASE])
     # 只留当前 host 的 cookie（ctx.cookies(urls) 已按 URL 过滤，这里再兜一层）
@@ -48,6 +80,11 @@ def save_state(ctx, state, course):
         dom = str(c.get("domain") or "").lstrip(".").lower()
         if not dom or HOST.lower() == dom or HOST.lower().endswith("." + dom):
             keep.append(c)
+
+    if not keep:
+        raise StateNotSaved(
+            "没有获取到任何属于 %s 的 cookie —— 登录未真正完成，"
+            "未写入 %s（已有登录态保持不动）" % (HOST, state))
 
     payload = {
         "version": 1,
@@ -58,11 +95,27 @@ def save_state(ctx, state, course):
         "cookies": keep,
     }
     tmp = state + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, state)
+    try:
+        if os.name == "posix":
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            f = os.fdopen(fd, "w", encoding="utf-8")
+        else:
+            f = open(tmp, "w", encoding="utf-8")
+        with f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, state)
+    except BaseException:
+        # 半成品里是 cookie —— 任何失败路径都不许把它留在盘上
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
     if os.name == "posix":
         try:
+            # os.replace 保留了 .tmp 的 0600；这里兜底，防御 umask 之外的意外
             os.chmod(state, 0o600)
         except OSError:
             pass
@@ -101,7 +154,10 @@ def main():
         page.goto(url, timeout=90000, wait_until="domcontentloaded")
         print("已打开:", page.url)
 
-        logged = "login" not in (page.url or "").lower()
+        # ★ 登录成功 = 页面 host 真的回到 LMS 域（is_lms_url 做 hostname
+        #   精确 / 子域匹配）。落盘前 save_state 还会再验一次「有适用的
+        #   cookie」，两道门都过才算数 —— 单看 URL 会被 SSO 中间页骗过。
+        logged = is_lms_url(page.url)
         if logged:
             print("profile 里已有登录态, 跳过手动登录")
         else:
@@ -113,7 +169,7 @@ def main():
             if el // 20 != last // 20:
                 last = el
                 print("  等待 %3ds  url=%s" % (el, u[:90]), flush=True)
-            if HOST in u and "login" not in u.lower():
+            if is_lms_url(u):
                 logged = True
             else:
                 time.sleep(2)
@@ -123,7 +179,18 @@ def main():
             return 1
         print("登录成功:", page.url[:100])
 
-        cookies = save_state(ctx, state, args.course)
+        try:
+            cookies = save_state(ctx, state, args.course)
+        except StateNotSaved as e:
+            # URL 在 LMS 域内但一个适用 cookie 都没有：视为登录未完成。
+            # 不写盘、不覆盖旧登录态，按失败退出（exit 1）。
+            print("!! %s" % e, file=sys.stderr)
+            print("   请在这个窗口里完成登录后重跑本命令", file=sys.stderr)
+            try:
+                ctx.close()
+            except Exception:
+                pass
+            return 1
         print("登录态已保存: %s (%d cookies)" % (state, len(cookies)))
         print("  注意: 该文件等同于你的登录凭据, 不要分享或提交到 Git")
 

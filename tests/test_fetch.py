@@ -1699,6 +1699,35 @@ class TestAuthDetection(Base):
         valid, _why = self._api_ok(OSError("connection reset"))
         self.assertTrue(valid)
 
+    # ------------------------------------------------ api_status（三态）
+
+    def _api_status(self, resp):
+        return F.api_status(FakeOpener([resp]))
+
+    def test_api_status_valid_on_json(self):
+        status, _why = self._api_status(FakeResponse(
+            b'{"courses":[{"id":1}]}', {"Content-Type": "application/json"}))
+        self.assertEqual(status, F.API_VALID)
+
+    def test_api_status_invalid_on_login_page(self):
+        status, _why = self._api_status(FakeResponse(LOGIN_PAGE, {}))
+        self.assertEqual(status, F.API_INVALID)
+
+    def test_api_status_invalid_on_401_403(self):
+        for code in (401, 403):
+            status, _why = self._api_status(http_err(code))
+            self.assertEqual(status, F.API_INVALID, "HTTP %d 应判 invalid" % code)
+
+    def test_api_status_unknown_never_masks_as_pass_or_fail(self):
+        """★ 无法判定的三种形态（网关拦页 / 5xx / 网络异常）都必须是
+        unknown —— selfcheck --online 靠它报 WARN，绝不能静默 PASS，
+        也不能把网络抖动误报成「登录态失效」。"""
+        for resp in (FakeResponse(b"<html>gateway error</html>", {}),
+                     http_err(502),
+                     OSError("connection reset")):
+            status, _why = self._api_status(resp)
+            self.assertEqual(status, F.API_UNKNOWN, repr(resp))
+
     def test_api_ok_sends_json_accept(self):
         """必须显式声明 Accept: application/json —— 声明后服务端会回 401，
         而不是用 HTML 200 打哑谜；这也是让上面这些判断成立的前提。"""

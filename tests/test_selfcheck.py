@@ -16,12 +16,14 @@ import shutil
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, "..", "scripts"))
 
 import lms_common as C   # noqa: E402
 import lms_selfcheck as S  # noqa: E402
+import lms_fetch as LF   # noqa: E402
 
 
 class ReportCase(unittest.TestCase):
@@ -198,6 +200,53 @@ class OfflineSafetyCase(unittest.TestCase):
         src = inspect.getsource(S.main)
         self.assertIn('"--online"', src)
         self.assertIn("action=\"store_true\"", src)
+
+
+class OnlineProbeCase(unittest.TestCase):
+    """--online 三态：只有服务端明确拒绝才 FAIL；无法判定必须 WARN。
+
+    ★ 旧实现把 api_ok 的布尔值直接映射 PASS/FAIL —— 网络异常会被报成
+    「登录态有效」（PASS），网关拦页会被报成「重新登录」（FAIL）。
+    探测通道本身故障和登录态失效是两回事，级别必须分开。
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="selfcheck_online_")
+        self._old_cache = os.environ.get("LMS_CACHE")
+        os.environ["LMS_CACHE"] = self.tmp
+        with open(S.state_path("1"), "w", encoding="utf-8") as f:
+            json.dump({"cookies": [{"name": "s", "value": "1",
+                                    "domain": C.HOST}]}, f)
+
+    def tearDown(self):
+        if self._old_cache is None:
+            os.environ.pop("LMS_CACHE", None)
+        else:
+            os.environ["LMS_CACHE"] = self._old_cache
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _check(self, status):
+        rep = S.Report()
+        with mock.patch.object(LF, "api_status",
+                               return_value=(status, "probe-why")):
+            S.check_online(rep, S.state_path("1"))
+        return [r["status"] for r in rep.rows]
+
+    def test_valid_passes(self):
+        self.assertIn(S._PASS, self._check("valid"))
+
+    def test_invalid_fails_with_relogin_hint(self):
+        lv = self._check("invalid")
+        self.assertIn(S._FAIL, lv)
+        self.assertNotIn(S._PASS, lv)
+
+    def test_unknown_warns_never_passes_or_fails(self):
+        """★ 网络异常 / 网关故障必须 WARN —— 不许伪装成 PASS，
+        也不许抖一次就把用户赶去重新登录。"""
+        lv = self._check("unknown")
+        self.assertIn(S._WARN, lv)
+        self.assertNotIn(S._PASS, lv)
+        self.assertNotIn(S._FAIL, lv)
 
 
 class LayoutCase(unittest.TestCase):

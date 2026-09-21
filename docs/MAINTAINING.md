@@ -501,7 +501,7 @@ python release.py --version 1.1.0 --title "下载可靠性" --yes       # 正式
 1. **版本号自检** —— tag 已存在就报错退出。已发布的版本内容不可变，要改就发新版本号。
    （这条是踩过坑换来的：v1.0.0 曾被原地覆盖过。）
 2. **包体校验** —— 上传前解压到临时目录，确认关键文件齐全、没混进登录态、
-   离线测试能过（四个测试文件，共 387 个用例；用例数由测试自己报出，并与
+   离线测试能过（五个测试文件，共 417 个用例；用例数由测试自己报出，并与
    静态扫描的 `def test_` 数量交叉核对，对不上就告警）。校验不过就不发。
 3. **artifact identity 校验**（v1.4.2 起）—— `verify_archive_matches_remote()`
    把**实际 zip** 的每个文件算成 Git blob sha，与源码 commit 的 tree 逐条比对，
@@ -628,10 +628,10 @@ release job：再核 SHA → 版本占用检查（Release/附件已存在 → �
  │ ci.yml（3 OS × 3 Python） │         commit SHA（source job 锁定）
  │ checkout 精确 source SHA  │                  │
  │ （≠ GitHub 合成的 merge）  │                  ▼
- │ compileall + 387 用例     │      ┌────────────────────────────┐
+ │ compileall + 417 用例     │      ┌────────────────────────────┐
  │ 隐私自检（contents: read）│      │ release.yml（仅手动触发）   │
  └───────────────────────────┘      │ checkout 精确 commit SHA    │
-                                    │ verify（387 用例）→ pack    │
+                                    │ verify（417 用例）→ pack    │
    同一 PR/分支出新 HEAD             │ → Release + 附件            │
    → 取消旧 run（concurrency）      └────────────────────────────┘
 ```
@@ -811,21 +811,23 @@ v1.4.2 起一次同步只产生一个 commit，CI 也只触发一次，所以不
 
 ## 测试矩阵与覆盖明细
 
-全部离线，不需要网络与登录态，共 **387 个用例**：
+全部离线，不需要网络与登录态，共 **417 个用例**：
 
 ```bash
 python tests/test_organize.py     # 22 个用例
-python tests/test_fetch.py        # 267 个用例
-python tests/test_selfcheck.py    # 20 个用例
-python tests/test_push.py         # 78 个用例
+python tests/test_fetch.py        # 271 个用例
+python tests/test_login.py        # 14 个用例
+python tests/test_selfcheck.py    # 23 个用例
+python tests/test_push.py         # 87 个用例
 ```
 
 | 文件 | 覆盖 |
 |---|---|
 | `test_organize.py` | 中文数字转换、括号剥离、六种章节写法、假章号排除、目录名去重、目录名不带扩展名 |
-| `test_fetch.py` | 下载成功/重试/403 不重试/5xx 重试/空响应/HTML 响应/sha256 不符/etag 不符、断点续传与 Range 对齐四情形（正常/忽略/向前扩大/缺口，含最后一次缺口保留 `.part`）、**回放稳定窗口**（等长也要过窗口、稳定语义按时间差而不是探测次数、短读不再被容差放行、声明值小于/大于远端的两向情形、ETag 变化重置计时、远端更小 / 404 / 探测异常 / 无 size 头 → 失败且保留 `.part`、远端增长驱动续传后接受、增长轮数受上限约束、416 → 不截断本地；探测走 `Range: bytes=0-0`，416 带 `Content-Range: bytes */N` 时按 RFC 7233 回填长度；`.part` 等于声明总长时不再被删掉重下）、元信息错误分类（403/404→N/A，401→登录态，5xx/超时/坏 JSON→FAIL）、**扫描阶段失败记账**（page / lecture_live 详情的 500/超时/坏 JSON/403/404/401）、`item_status()` 统一状态语义、`--list-only` 退出码（真跑 `main()`）、已有文件精确比对（**无任何容差**：`tolerance` 参数与 `SHORT_TOLERANCE` 已删除并有结构断言钉住、回放 944/1000 同样算不完整、索引可信 size 精确命中、清单视图与主流程同判据）、`.7z` 冲突改名保扩展名与项目包判定、新旧登录态格式兼容、Cookie 安全属性还原、文件名安全（含 Windows 保留名）、路径冲突消解、项目包判定、CSV 公式注入防护、时间戳固定 UTC+8（跨时区一致）、清单导出（`stage` / `err_kind` 入 CSV）、多来源计数、**resource identity**（**持久身份索引** `.download-index.json`：等大小瞬时错误不冒领 plain 名、报错条目经索引占位、新增同身份资源拿独立后缀、同 uid 内容更新原地覆盖路径不漂移、布局切换不移动已分配身份、索引无凭据且损坏可重建、回放机位并入身份键、dry-run 两次运行分配逐字节一致、**等大小三轮收敛封板回归**、course namespace（多课程共用 --out 不串身份）、camera_id 优先的同活动多机位键、同活动多路无 camera_id 同类型显式 identity ambiguous、索引损坏 fail-closed（坏文件改名保留现场 + RC_BAD_INDEX 拒绝下载）、索引路径越界 / 绝对路径条目丢弃；min-uid 冲突规则与 `identity_conflict_target()` 覆盖守卫作为新身份分配与存量迁移保护层；**内容损坏 vs 格式不认识分立**（拒绝路径字节原样保留、不建 `.corrupt-`；结构信封 `entries` → `items` 迁移放行且仅限键已带 course namespace；无 course 旧键的身份语义迁移一律拒绝））、**Round 13 —— `--exclude` 优先级**（被排除条目零媒体请求、带 error 的排除项仍判 `excluded`、匹配语义不变、同一 lecture_live 详情只取一次、被排除条目 502 / 403 / 超时整轮仍 `rc=0` 且有不排除的对照组判 `rc=4`）、**Round 13 —— 回放地址 JIT**（条目不带 `url`、伪造过期凭据 → 真 403 → 重解析 → 成功且 `refreshes==1`、`.part` 续传起点等于残片长度、连续 403 到上限 `url_refresh_exhausted` 且保留 `.part`、刷新后 size 变 / `etag` 变均 `identity_conflict` fail-closed 不拼接、身份一致时不误判冲突、解析器按 camera_id / camera_type 选择且失败消息不含 URL、不经 HEAD、异常文本与返回值 / 日志不含 token） |
-| `test_selfcheck.py` | 登录态五种状态判定、检查级别（警告 vs 失败）、退出码、默认不联网、自检清单与 `scripts/` 实际文件一致 |
-| `test_push.py` | 发布链路（全部 mock / subprocess，不联网）：N 个文件变化只产生 1 个 commit / 1 次 ref 更新、一次 tree POST 装下全部变化、未变文件不重传 blob、删除用 `sha: null`、**绝不 force**（`force: false` + 冲突时放弃且不动 main）、ref 更新后复核、无变化不建空 commit、删除只在白名单范围内、blob sha 算法（空文件常量）、登录态/profile/缓存被过滤、`release.py` 用的是仓库内推送器且带版本化 commit message、`push_code()` 返回 commit SHA、**tag 绑定推送返回的 SHA 而不是回读 main**、`--resume` 绑定已存在 tag 的 SHA 且不再推代码、附件上传 502 重试而 400 不重试、**artifact identity**（zip==commit 通过 / 工作区漂移不影响 / 旧 zip 拦下 / 缺文件与多文件均失败 / 顶层目录不对拒绝）、**sha256 锁**（校验后被替换必须停上传）、**双 publisher 已消除**（release.yml 无 `push: tags`、手动入口与占用检查保留）、**CLI smoke**（清空 PYTHONPATH 后真实跑 `tools/gh_push_dir.py --help` 与 `pack.py`）、**workflow source identity**（ci.yml 只验证 PR HEAD / 分支 HEAD 且不触发 tag、checkout 精确 source SHA、concurrency 取消旧 run；release.yml 是 existing-tag-only：tag 缺失即失败、绝不建/挪 tag、绝不 checkout main、verify 与 pack 复核同一 SHA、`rev-list -n 1` 剥 annotated tag）、**tag 剥壳实测**（真实 git 验证 lightweight / annotated 都解析到 commit） |
+| `test_fetch.py` | 下载成功/重试/403 不重试/5xx 重试/空响应/HTML 响应/sha256 不符/etag 不符、断点续传与 Range 对齐四情形（正常/忽略/向前扩大/缺口，含最后一次缺口保留 `.part`）、**回放稳定窗口**（等长也要过窗口、稳定语义按时间差而不是探测次数、短读不再被容差放行、声明值小于/大于远端的两向情形、ETag 变化重置计时、远端更小 / 404 / 探测异常 / 无 size 头 → 失败且保留 `.part`、远端增长驱动续传后接受、增长轮数受上限约束、416 → 不截断本地；探测走 `Range: bytes=0-0`，416 带 `Content-Range: bytes */N` 时按 RFC 7233 回填长度；`.part` 等于声明总长时不再被删掉重下）、元信息错误分类（403/404→N/A，401→登录态，5xx/超时/坏 JSON→FAIL）、**扫描阶段失败记账**（page / lecture_live 详情的 500/超时/坏 JSON/403/404/401）、`item_status()` 统一状态语义、`--list-only` 退出码（真跑 `main()`）、已有文件精确比对（**无任何容差**：`tolerance` 参数与 `SHORT_TOLERANCE` 已删除并有结构断言钉住、回放 944/1000 同样算不完整、索引可信 size 精确命中、清单视图与主流程同判据）、`.7z` 冲突改名保扩展名与项目包判定、新旧登录态格式兼容、Cookie 安全属性还原、文件名安全（含 Windows 保留名）、路径冲突消解、项目包判定、CSV 公式注入防护、时间戳固定 UTC+8（跨时区一致）、清单导出（`stage` / `err_kind` 入 CSV）、多来源计数、**resource identity**（**持久身份索引** `.download-index.json`：等大小瞬时错误不冒领 plain 名、报错条目经索引占位、新增同身份资源拿独立后缀、同 uid 内容更新原地覆盖路径不漂移、布局切换不移动已分配身份、索引无凭据且损坏可重建、回放机位并入身份键、dry-run 两次运行分配逐字节一致、**等大小三轮收敛封板回归**、course namespace（多课程共用 --out 不串身份）、camera_id 优先的同活动多机位键、同活动多路无 camera_id 同类型显式 identity ambiguous、索引损坏 fail-closed（坏文件改名保留现场 + RC_BAD_INDEX 拒绝下载）、索引路径越界 / 绝对路径条目丢弃；min-uid 冲突规则与 `identity_conflict_target()` 覆盖守卫作为新身份分配与存量迁移保护层；**内容损坏 vs 格式不认识分立**（拒绝路径字节原样保留、不建 `.corrupt-`；结构信封 `entries` → `items` 迁移放行且仅限键已带 course namespace；无 course 旧键的身份语义迁移一律拒绝））、**Round 13 —— `--exclude` 优先级**（被排除条目零媒体请求、带 error 的排除项仍判 `excluded`、匹配语义不变、同一 lecture_live 详情只取一次、被排除条目 502 / 403 / 超时整轮仍 `rc=0` 且有不排除的对照组判 `rc=4`）、**Round 13 —— 回放地址 JIT**（条目不带 `url`、伪造过期凭据 → 真 403 → 重解析 → 成功且 `refreshes==1`、`.part` 续传起点等于残片长度、连续 403 到上限 `url_refresh_exhausted` 且保留 `.part`、刷新后 size 变 / `etag` 变均 `identity_conflict` fail-closed 不拼接、身份一致时不误判冲突、解析器按 camera_id / camera_type 选择且失败消息不含 URL、不经 HEAD、异常文本与返回值 / 日志不含 token）、**登录态探测三态**（`api_status`：登录页/401/403 → invalid，courses 正常 → valid，网关拦页/非 401/403 HTTP 错/网络异常 → unknown，`api_ok` 行为不变） |
+| `test_selfcheck.py` | 登录态五种状态判定、检查级别（警告 vs 失败）、退出码、默认不联网、`--online` 三态探测（valid→PASS / invalid→FAIL / unknown→WARN，探测通道故障绝不报 PASS）、自检清单与 `scripts/` 实际文件一致 |
+| `test_login.py` | 登录成功判定（host 按 `urlparse().hostname` 判定：LMS host 通过、兄弟域名不误判）、LMS host + 0 cookie 不落盘并显式报错、登录失败不覆盖旧 state 且不输出成功、失败清理无残片、临时文件从创建起 0600（POSIX） |
+| `test_push.py` | 发布链路（全部 mock / subprocess，不联网）：N 个文件变化只产生 1 个 commit / 1 次 ref 更新、一次 tree POST 装下全部变化、未变文件不重传 blob、删除用 `sha: null`、**绝不 force**（`force: false` + 冲突时放弃且不动 main）、ref 更新后复核、无变化不建空 commit、删除只在白名单范围内、blob sha 算法（空文件常量）、登录态/profile/缓存被过滤、`release.py` 用的是仓库内推送器且带版本化 commit message、`push_code()` 返回 commit SHA、**tag 绑定推送返回的 SHA 而不是回读 main**、`--resume` 绑定已存在 tag 的 SHA 且不再推代码、附件上传 502 重试而 400 不重试、**artifact identity**（zip==commit 通过 / 工作区漂移不影响 / 旧 zip 拦下 / 缺文件与多文件均失败 / 顶层目录不对拒绝）、**sha256 锁**（校验后被替换必须停上传）、**双 publisher 已消除**（release.yml 无 `push: tags`、手动入口与占用检查保留）、**CLI smoke**（清空 PYTHONPATH 后真实跑 `tools/gh_push_dir.py --help` 与 `pack.py`）、**workflow source identity**（ci.yml 只验证 PR HEAD / 分支 HEAD 且不触发 tag、checkout 精确 source SHA、concurrency 取消旧 run；release.yml 是 existing-tag-only：tag 缺失即失败、绝不建/挪 tag、绝不 checkout main、verify 与 pack 复核同一 SHA、`rev-list -n 1` 剥 annotated tag）、**tag 剥壳实测**（真实 git 验证 lightweight / annotated 都解析到 commit）、**ref 冲突 409/422 分类**（ref PATCH 冲突翻成 `ConflictError` 停下而不是当瞬时错误重试、mock 真实 `urlopen` HTTPError 路径验证）、**workflow shell 兼容**（ci.yml 的 Bash 语法步骤显式声明 `shell: bash`，Windows runner 默认 PowerShell 不会误执行）、**凭据 gate 一致性**（CI / Release / `.gitignore` / `release_common.EXCLUDE_STATE` 四处登录态模式覆盖 `.tmp` 与 `*.state.json`） |
 
 `test_push.py` 用 **`FakeApi`**（模拟 Git Data API 的 ref / commit / tree / blob
 四个端点）与假 `subprocess.run`（模拟推送器写出结果 JSON），
@@ -861,15 +863,15 @@ README / 本文档的用例数。`pack.py` 不用改 —— 它按 `tests/` 整�
 |---|---|
 | 顶层 | `README.md` `SKILL.md` `prompt.md` `LICENSE` `release.py` |
 | `scripts/` | 全部 `*.py` |
-| `tests/` | 全部 `*.py`（**四个文件都要带**） |
+| `tests/` | 全部 `*.py`（**五个文件都要带**） |
 | `tools/` | `release_common.py` `gh_push_dir.py` `privacy_scan.py` |
 | `.github/` | `scripts/pack.py`、`workflows/ci.yml`、`workflows/release.yml` |
 
 `tools/` + `release.py` + `.github/` 是 v1.5.0 起才纳入的 —— 它们是 `tests/test_push.py`
 的三个真实路径依赖：`import release as R`、`from tools import …`、
 exec `.github/scripts/pack.py`、读 workflow 的 `on:` 块。不带上这些，副本里的
-`test_push` 必然 `ModuleNotFoundError` —— 同一个 `tests/`，在仓库 / 发布包跑 **387**，
-在副本只能跑 **309**。
+`test_push` 必然 `ModuleNotFoundError` —— 同一个 `tests/`，在仓库 / 发布包跑 **417**，
+在副本只能跑 **330**。
 
 `docs/` **不需要**：`test_tools_and_docs_are_in_release_package` 只断言
 `release_common.INCLUDE` 里含 `"docs"` 字符串，不读真实目录。
@@ -887,7 +889,7 @@ exec `.github/scripts/pack.py`、读 workflow 的 `on:` 块。不带上这些，
 
 1. 模块来源断言：`lms_live.__file__` / `lms_fetch.__file__` 必须落在副本目录里；
 2. `compileall` 副本里的全部脚本与测试；
-3. **四个测试文件全跑 → 387**（与仓库、发布包同一个数字）；
+3. **五个测试文件全跑 → 417**（与仓库、发布包同一个数字）；
 4. 不下载媒体的真实 smoke：`--list-only`；目标 replay 的 index / skip（索引里存着经稳定
    窗口确认的 `size`，所以第二轮必然是 `SKIP`，媒体字节数不变）；JIT 现解析 +
    `probe_remote` 复核 size；
@@ -899,12 +901,12 @@ exec `.github/scripts/pack.py`、读 workflow 的 `on:` 块。不带上这些，
 ### 顺带：发布包本地校验要绕过 `--dry-run`
 
 `release.py --dry-run` 在**第 2 步（打包）就 return**，**不跑 `verify_zip`**。
-要本地校验包体（结构 / 无登录态 / 四个测试文件 / 静态-实跑用例数交叉核对），
+要本地校验包体（结构 / 无登录态 / 五个测试文件 / 静态-实跑用例数交叉核对），
 直接调它自己的两个函数即可，全程不碰 GitHub：
 
 ```python
 zip_path, files = release.build_zip(release.SRC, "1.5.0")   # 只写本地 zip
-release.verify_zip(zip_path)                                # 校验 + 跑 387 用例
+release.verify_zip(zip_path)                                # 校验 + 跑 417 用例
 ```
 
 ---

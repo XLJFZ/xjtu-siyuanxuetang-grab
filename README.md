@@ -313,7 +313,7 @@ Windows 保留设备名（`CON.pdf` / `NUL.txt`）统一加下划线前缀，三
 | `scripts/lms_fetch.py` | 下载主体：列清单 / 下载 / 归类，支持续传、重试、干跑与增量 |
 | `scripts/lms_organize.py` | 章节解析：中文数字转换、多写法匹配、假章号排除 |
 | `scripts/lms_live.py` | 直播回放下载：串行请求、按响应长度校正偏移 |
-| `tests/` | 离线测试，共 387 个用例（无需网络与登录态） |
+| `tests/` | 离线测试，共 417 个用例（无需网络与登录态） |
 | `tools/gh_push_dir.py` | 原子推送：一次源码同步 = 一个 commit（Git Data API） |
 | `tools/release_common.py` | 发布白名单的唯一定义（打包 / 推送 / CI 共用） |
 | `tools/privacy_scan.py` | 发布前隐私扫描：本机路径 / 凭据 / 私有主机名，范围 = 发布白名单 |
@@ -325,9 +325,10 @@ Windows 保留设备名（`CON.pdf` / `NUL.txt`）统一加下划线前缀，三
 
 ```bash
 python tests/test_organize.py     # 22 个用例
-python tests/test_fetch.py        # 267 个用例
-python tests/test_selfcheck.py    # 20 个用例
-python tests/test_push.py         # 78 个用例（发布链路，全部用 mock / 子进程）
+python tests/test_fetch.py        # 271 个用例
+python tests/test_login.py        # 14 个用例（登录判定与登录态落盘）
+python tests/test_selfcheck.py    # 23 个用例
+python tests/test_push.py         # 87 个用例（发布链路，全部用 mock / 子进程）
 ```
 
 `test_fetch.py` 用假 opener 脚本化服务端行为，能测「第一次超时第二次成功」
