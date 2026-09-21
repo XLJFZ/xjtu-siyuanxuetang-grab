@@ -252,11 +252,41 @@ class TestPrivacyScan(PushCase):
             self.assertTrue(PS.blocking(PS.scan_text("x/sample.py", text)), text)
 
     def test_credential_shapes_block(self):
-        for text in ("github_pat_11BVIJLWA0DKHzeDKyIlvH_H7olQv",           # privacy-scan: fixture
-                     "ghp_AbCdEfGhIjKlMnOpQrStUvWxYz012345",              # privacy-scan: fixture
-                     "?previewToken=9f8e7d6c5b4a39281706f5e4",            # privacy-scan: fixture
-                     "https://rms-v5.xjtu.edu.cn/live/a.m3u8"):           # privacy-scan: fixture
+        # 凭据夹具一律**运行时构造** —— 绝不把真实凭据（或其前缀）写进源码。
+        # v1.5.1 的教训：从真实 token 截前缀当夹具，等于亲手把泄漏写进发布包。
+        fake_pat = "github_pat_" + "A" * 40
+        fake_oauth = "ghp_" + "AbCdEfGh" * 5
+        fake_preview = "?previewToken=" + "9f8e" * 6
+        for text in (fake_pat,
+                     fake_oauth,
+                     fake_preview,
+                     "https://rms-v5.xjtu.edu.cn/live/a.m3u8"):   # privacy-scan: fixture
             self.assertTrue(PS.blocking(PS.scan_text("x/sample.py", text)), text)
+
+    def test_credential_rules_reject_line_exemption(self):
+        """凭据类规则拒绝任何行级豁免 —— 带夹具标记的凭据字形照样拦截。"""
+        line = ("github_pat_" + "A" * 40) + "  # privacy-scan: fixture"
+        self.assertTrue(PS.blocking(PS.scan_text("tests/test_push.py", line)),
+                        "凭据规则必须拒绝行级豁免（豁免不是安全边界）")
+        self.assertIsNone(PS._allow_reason("secret-token", "tests/test_push.py", line))
+        self.assertIsNone(PS._allow_reason("preview-token", "tests/test_push.py", line))
+
+    def test_only_path_rules_are_exemptable(self):
+        """规则层面钉死：凭据类 exemptable=False，路径/主机类为 True。"""
+        for rule in PS.RULES:
+            if rule.name in ("secret-token", "preview-token"):
+                self.assertFalse(rule.exemptable, rule.name)
+            else:
+                self.assertTrue(rule.exemptable, rule.name)
+
+    def test_no_literal_credential_in_test_source(self):
+        """本测试源码自身不得含凭据字面量 —— 夹具必须运行时构造（v1.5.2 教训）。"""
+        with open(os.path.join(HERE, "test_push.py"), encoding="utf-8") as f:
+            src = f.read()
+        hits = [f for f in PS.scan_text("tests/test_push.py", src)
+                if f.rule in ("secret-token", "preview-token")]
+        self.assertEqual(hits, [],
+                         "测试源码里不得出现凭据字面量，夹具一律运行时构造")
 
     # ---------------------------------------------------------- 不误报
 

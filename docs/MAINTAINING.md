@@ -501,7 +501,7 @@ python release.py --version 1.1.0 --title "下载可靠性" --yes       # 正式
 1. **版本号自检** —— tag 已存在就报错退出。已发布的版本内容不可变，要改就发新版本号。
    （这条是踩过坑换来的：v1.0.0 曾被原地覆盖过。）
 2. **包体校验** —— 上传前解压到临时目录，确认关键文件齐全、没混进登录态、
-   离线测试能过（四个测试文件，共 384 个用例；用例数由测试自己报出，并与
+   离线测试能过（四个测试文件，共 387 个用例；用例数由测试自己报出，并与
    静态扫描的 `def test_` 数量交叉核对，对不上就告警）。校验不过就不发。
 3. **artifact identity 校验**（v1.4.2 起）—— `verify_archive_matches_remote()`
    把**实际 zip** 的每个文件算成 Git blob sha，与源码 commit 的 tree 逐条比对，
@@ -628,10 +628,10 @@ release job：再核 SHA → 版本占用检查（Release/附件已存在 → �
  │ ci.yml（3 OS × 3 Python） │         commit SHA（source job 锁定）
  │ checkout 精确 source SHA  │                  │
  │ （≠ GitHub 合成的 merge）  │                  ▼
- │ compileall + 384 用例     │      ┌────────────────────────────┐
+ │ compileall + 387 用例     │      ┌────────────────────────────┐
  │ 隐私自检（contents: read）│      │ release.yml（仅手动触发）   │
  └───────────────────────────┘      │ checkout 精确 commit SHA    │
-                                    │ verify（384 用例）→ pack    │
+                                    │ verify（387 用例）→ pack    │
    同一 PR/分支出新 HEAD             │ → Release + 附件            │
    → 取消旧 run（concurrency）      └────────────────────────────┘
 ```
@@ -811,13 +811,13 @@ v1.4.2 起一次同步只产生一个 commit，CI 也只触发一次，所以不
 
 ## 测试矩阵与覆盖明细
 
-全部离线，不需要网络与登录态，共 **384 个用例**：
+全部离线，不需要网络与登录态，共 **387 个用例**：
 
 ```bash
 python tests/test_organize.py     # 22 个用例
 python tests/test_fetch.py        # 267 个用例
 python tests/test_selfcheck.py    # 20 个用例
-python tests/test_push.py         # 74 个用例
+python tests/test_push.py         # 78 个用例
 ```
 
 | 文件 | 覆盖 |
@@ -868,7 +868,7 @@ README / 本文档的用例数。`pack.py` 不用改 —— 它按 `tests/` 整�
 `tools/` + `release.py` + `.github/` 是 v1.5.0 起才纳入的 —— 它们是 `tests/test_push.py`
 的三个真实路径依赖：`import release as R`、`from tools import …`、
 exec `.github/scripts/pack.py`、读 workflow 的 `on:` 块。不带上这些，副本里的
-`test_push` 必然 `ModuleNotFoundError` —— 同一个 `tests/`，在仓库 / 发布包跑 **384**，
+`test_push` 必然 `ModuleNotFoundError` —— 同一个 `tests/`，在仓库 / 发布包跑 **387**，
 在副本只能跑 **309**。
 
 `docs/` **不需要**：`test_tools_and_docs_are_in_release_package` 只断言
@@ -887,7 +887,7 @@ exec `.github/scripts/pack.py`、读 workflow 的 `on:` 块。不带上这些，
 
 1. 模块来源断言：`lms_live.__file__` / `lms_fetch.__file__` 必须落在副本目录里；
 2. `compileall` 副本里的全部脚本与测试；
-3. **四个测试文件全跑 → 384**（与仓库、发布包同一个数字）；
+3. **四个测试文件全跑 → 387**（与仓库、发布包同一个数字）；
 4. 不下载媒体的真实 smoke：`--list-only`；目标 replay 的 index / skip（索引里存着经稳定
    窗口确认的 `size`，所以第二轮必然是 `SKIP`，媒体字节数不变）；JIT 现解析 +
    `probe_remote` 复核 size；
@@ -904,7 +904,7 @@ exec `.github/scripts/pack.py`、读 workflow 的 `on:` 块。不带上这些，
 
 ```python
 zip_path, files = release.build_zip(release.SRC, "1.5.0")   # 只写本地 zip
-release.verify_zip(zip_path)                                # 校验 + 跑 384 用例
+release.verify_zip(zip_path)                                # 校验 + 跑 387 用例
 ```
 
 ---
@@ -949,6 +949,12 @@ v1.5.0 的发布工具文档字符串里写着本机工作区路径，而当时�
 豁免**精确到行**：每条都要写明「哪个文件的哪一行、为什么」，且必须命中行内正则 ——
 所以同一个文件里新出现的真实路径照样会被拦下。**豁免不等于关掉规则。**
 
+还有一条 v1.5.2 起的不可协商边界：**凭据类规则（`secret-token` / `preview-token`）
+不接受任何行级豁免**，`rule="*"` 的通配豁免也不覆盖。v1.5.1 的教训：一条真实 PAT 的
+前缀被截下来当「合成夹具」写进测试源码，恰好被通配豁免放行、随包发布。修正分两层 ——
+测试里的凭据夹具一律**运行时构造**（如 `"github_pat_" + "A" * 40`，字形不出现在源码
+字面量里），凭据规则在扫描器内部直接拒绝豁免（双保险）。路径 / 主机名类规则不受影响。
+
 ### 扫描范围 = 发布范围
 
 扫描的文件集直接调 `release_common.collect()`，不另立清单。白名单新增一个公开文件，
@@ -972,6 +978,7 @@ README 只留最近两版，历史在这里：
 
 | 版本 | 变更 |
 |---|---|
+| v1.5.2 | **凭据夹具与豁免边界收紧。** 测试里的凭据合成夹具改为**运行时构造**（如 `"github_pat_" + "A" * 40`），源码不再出现任何凭据字面量 —— v1.5.1 曾把真实 token 的前缀截下来当夹具写进发布包；隐私扫描器新增边界：**凭据类规则（secret-token / preview-token）不接受任何行级豁免**，`rule="*"` 的通配豁免也不覆盖（路径 / 主机名类不受影响），`_allow_reason()` 与 `scan_text()` 双保险执行；新增回归用例钉死「夹具必须运行时构造、凭据规则零豁免」，变异检验（清空非豁免集）确认用例非空洞。离线测试扩到 387 个 |
 | v1.5.1 | **发布前隐私 gate 硬化。** 移除发布工具文档里的本机工作区路径；新增 `tools/privacy_scan.py`，路径检测改为覆盖**任意**盘符路径（不再锚定具体目录名），且分隔符允许一或多个 —— 旧检查只允许一个分隔符、且锚在本项目目录名上，源码字面量里的双反斜杠形态因此匹配不到，命中项分四类：真实泄漏 / 占位写法 / 通用系统目录 / 逐行豁免，后三类只记录不失败；扫描范围复用发布白名单（`release_common.INCLUDE`）而非手写目录列表，白名单新增的公开文件自动进入扫描；CI 与 Release 两个 workflow 共用同一份扫描器（不再只扫 `scripts/`）；`release.py` 的 `verify_zip()` 解包后先跑隐私扫描，命中即停止发布。离线测试扩到 384 个 |
 | v1.5.0 | **回放地址 JIT + `--exclude` 优先级**（见上文两节）。`--exclude` 提前到任何远端探测 / 地址解析 / 稳定窗口之前：命中即标 `excluded` 并跳过，零媒体请求，网络状态无法把它升级成 `FAIL`、也不影响退出码，清单里新增独立的 `excluded` 状态；回放地址改为下载前现取，401 / 403 时重新解析后从 `.part` 续传（刷新次数封顶、不消耗重试预算），刷新前后用 `(size, etag)` 复核身份，冲突即 fail-closed；新增 `redact_url()` / `redact_text()` 封住「urllib 异常自带完整 URL」这条真实泄漏通道；登录态探测按响应体内容区分「登录页」与「网关拦截」，不再把登录态过期误报成接口可达；修掉索引 `size` 在每轮加载时被抹掉的回归（`load_download_index` 只保留 path/name，使可信 size 路径成为死代码）。离线测试扩到 370 个 |
 | v1.4.2 | **发布链路专项**：推送改为 Git Data API 原子提交（blob → tree → commit → ref），N 个文件变化 = 1 个 commit + 1 次 ref 更新，CI 只触发一次；`tools/gh_push_dir.py` 纳入仓库，`--push-code` 不再依赖仓库外脚本，且不再「跳过无权限文件仍返回 0」；绝不强制（force）更新 main（`force: false` 的非强制 fast-forward 保护，冲突即放弃）；支持删除（仅限白名单范围）；无变化不建空 commit、未变文件不重传 blob；`--push-code` 返回 commit SHA，tag 直接绑定它；**消除双 publisher**（`release.yml` 不再监听 `v*` tag push，只保留手动备用入口 + 版本占用检查）；**artifact identity 改为校验实际 zip**（`verify_archive_matches_remote()`：zip 内容 vs 源码 commit 的 tree，工作区漂移不再影响结论），并用 sha256 锁定校验过的 zip、上传前复核；`--resume` 语义写清：只补缺，不能拿新代码补旧版本；token 不再进 curl argv（临时配置文件，用完删除）；附件上传重试真正生效（5xx/网络重试，4xx 立即失败）；白名单抽到 `tools/release_common.py` 三处共用，`docs/` 纳入发布包；新增 CLI smoke 测试（清空 PYTHONPATH 跑真实入口）；**workflow 按 SHA 分工**（ci.yml 只验证 PR HEAD / main·master push HEAD——push 不监听 `**`，feature 分支走 PR 避免 push+PR 双跑；显式 checkout 精确 source SHA + concurrency 取消旧 run；release.yml 改为 existing-tag-only：`git rev-list -n 1` 剥壳锁定 commit SHA、逐 job 复核 verified == packed == tag 指向、绝不读 main、绝不建/挪 tag；**resource identity 封板**（`.download-index.json` 持久身份索引：`identity_key → canonical_path` 成为严格函数——其他资源增删、meta 瞬时失败、排序变化、同 uid 内容更新、进程重启都不改变已分配路径；等大小资源不再可能互相冒领字节；新身份按 dest_for + 最小 uid 分配，`identity_conflict_target()` 守卫保留为无索引存量文件的迁移保护层；索引只含资源 ID / 文件名 / 相对路径，不含任何凭据；**fail-closed**：索引解析失败 → 坏文件改名 `.corrupt-<时间戳>` 保留现场 + 语义化退出码 5 拒绝下载，绝不静默失忆；加载时逐条验证路径（相对 / 无 `..` 逃逸 / 非绝对 / normalize 后必须在 out 内），**单条 path 越界同样整份 fail-closed**（改名保留现场 + 拒绝下载，绝不「丢单条继续」静默遗忘身份）；索引不是任意路径写入入口；顶层信封 `{version, identity_schema, items}` 双版本号分立（结构版本 / 身份键语义版本），未知 version 或 identity_schema 一律拒绝；身份键 = `course:<course_id>:upload:<uid>` / `course:<course_id>:live:<act_id>:camera:<camera_id>`（camera_id 缺失降级 type:，同活动多路无 camera_id 同类型 → 显式 identity ambiguous 不硬合并）、索引 fail-closed 统一到单条 path：越界即整份拒绝、identity_schema 必填且未知即拒绝；**内容损坏与格式不认识分立**（JSON 解析失败 / 顶层结构坏 → `.corrupt-<时间戳>` 隔离保留现场；version 或 identity_schema 不认识 → 原文件字节不动、不改名、不迁移、不修复，直接拒绝退出码 5）；**migration 收紧为结构性的**（`entries` 旧信封 / 裸 map → `items` 且仅当键已带 course namespace；loader 绝不承担任何改变身份含义的迁移，无 course 的旧键拒绝而非猜测归属）；**回放完成判据重写：稳定窗口取代比例容差**（详见「回放完成判据：稳定窗口」一节）。唯一的完成判据 = 「本次实得字节数 == 经稳定窗口确认的远端最终 size」：EOF 后周期探测远端 `(size, ETag/Last-Modified)`，连续 60 秒不变且恰等于本地实得字节数才 rename；远端更大 → 续传追平后重新确认（`TAIL_MAX_ROUNDS` 封顶）；远端更小 / 404 / 超时 → 失败且保留 `.part`，不 rename、不更新索引。探测走 `Range: bytes=0-0` 取 `Content-Range` 总长（同下载路径，比 HEAD 可靠，不读 body 免触发限流）；稳定计时用 `time.monotonic` 时间戳差而非「连续 N 次相同」，测试注入虚拟时钟。`declared` 降级为传输提示（只进 note / 清单）。**删除 `SHORT_TOLERANCE` 与 `already_complete(tolerance=...)`**（含结构断言钉住），增量判据统一为可信 size 精确相等：回放读索引里经确认的 `size`，无索引存量文件用本轮远端探测值精确比对；`.part` 不再因「不小于声明总长」被删，本地比远端长由 416 / `remote_smaller` 显式失败而非截断本地。修正推送器在未传 `--include` 时的崩溃（`release.py` 从不传该参数，真实发布首次执行才暴露），并加回归用例钉住该默认值；离线测试扩到 330 个 |

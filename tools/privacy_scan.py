@@ -25,11 +25,16 @@
 
 后三类只记录、不失败。
 
-豁免必须精确到行
-----------------
+豁免必须精确到行，且凭据类规则禁止豁免
+--------------------------------------
 ALLOWLIST 的每条都要写明「哪个文件的哪一行、为什么」。文件用相对路径，
 另配一条必须命中该行的正则 —— 因此同一个文件里新出现的真实路径照样会被
 拦下。**豁免不等于关掉规则**。
+
+此外有一条不可协商的边界：**凭据类规则（secret-token / preview-token）
+不接受任何行级豁免**。v1.5.1 踩过的坑：`rule="*"` 的通配豁免把一条真实
+PAT 前缀当「合成夹具」放行了。教训是 —— 路径写错顶多是难看，凭据放出去
+就是事故；豁免机制只对「形态本身无害」的规则（路径 / 主机名）开放。
 
 跑法
 ----
@@ -158,6 +163,13 @@ class Rule(object):
         self.severity = severity       # 未命中 classify 时的默认分类
         self.classify = classify
         self.note = note
+        # 凭据类规则不接受行级豁免（见模块 docstring 的边界说明）。
+        self.exemptable = name not in _NON_EXEMPTABLE_RULES
+
+
+# 凭据一旦放出去就是事故，不存在「这行是夹具所以没事」—— 夹具必须运行时
+# 构造，让凭据字形根本不出现在源码字面量里，而不是靠豁免放行。
+_NON_EXEMPTABLE_RULES = frozenset(("secret-token", "preview-token"))
 
 
 RULES = [
@@ -179,10 +191,14 @@ RULES = [
 # ---------------------------------------------------------------- 逐行豁免
 
 class Allow(object):
-    """一行豁免：`path` 下的某一行，命中 `line` 正则才放行。"""
+    """一行豁免：`path` 下的某一行，命中 `line` 正则才放行。
+
+    `rule` 填规则名，或 `"*"` 表示任意**可豁免**规则 —— 凭据类规则
+    （secret-token / preview-token）即使写了 `"*"` 也不会被覆盖。
+    """
 
     def __init__(self, rule, path, line, reason):
-        self.rule = rule                 # 规则名，或 "*" 表示任意规则
+        self.rule = rule                 # 规则名，或 "*"（仅覆盖可豁免规则）
         self.path = path                 # 发布树内相对路径（精确匹配）
         self.line = re.compile(line)
         self.reason = reason
@@ -190,9 +206,11 @@ class Allow(object):
 
 # 每条都必须精确到「哪个文件、哪一行、为什么」。
 # 新增豁免要同时在这里写清理由 —— 否则就是变相关掉规则。
+# 凭据类规则在这里写也没用：_allow_reason 对它们一律返回 None。
 ALLOWLIST = [
-    # 扫描器自身只在这些行上放行合成夹具（盘符路径 / 凭据值 / 私有主机名 /
+    # 扫描器自身只在这些行上放行合成夹具（盘符路径 / 私有主机名 /
     # POSIX 用户目录各有一处）。豁免精确到行：标记缺失的行照样会被拦下。
+    # 注意：本条**不含**凭据类 —— 凭据夹具必须运行时构造，不得靠豁免放行。
     Allow("*", "tests/test_push.py",
           r"# privacy-scan: fixture$",
           "测试合成夹具：本行用于验证扫描器能命中该类形态，不是真实泄漏；"
@@ -201,6 +219,9 @@ ALLOWLIST = [
 
 
 def _allow_reason(rule_name, rel, line):
+    # 双保险：即使将来有人误把凭据规则写进 ALLOWLIST，这里也直接拒绝。
+    if rule_name in _NON_EXEMPTABLE_RULES:
+        return None
     for a in ALLOWLIST:
         if a.rule not in (rule_name, "*"):
             continue
@@ -243,7 +264,7 @@ def scan_text(rel, text):
                 else:
                     kind = rule.severity
                 reason = ""
-                if kind == BLOCK:
+                if kind == BLOCK and rule.exemptable:
                     reason = _allow_reason(rule.name, rel, raw) or ""
                     if reason:
                         kind = ALLOWED
