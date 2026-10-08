@@ -48,6 +48,37 @@ def is_lms_url(url):
     return h == t or h.endswith("." + t)
 
 
+def _live_url(page):
+    """读一个 page 的当前 URL；页面已关闭 / 上下文已销毁时返回空串。"""
+    try:
+        return page.url or ""
+    except Exception:
+        return ""
+
+
+def any_logged_page(ctx):
+    """遍历**所有**标签页，返回 (page, url) —— 第一个已落在 LMS 域的。
+
+    ★ 为什么不能只看 ctx.pages[0]：认证跳转可能发生在**新标签页**里
+    （身份提供方 window.open，或用户自己开了新页去认证），而被盯着的
+    那个 tab 会一直停在登录页。表现是「等满 --wait 仍报超时」，但
+    profile 里的 cookie 其实早已写全 —— 实测踩过：用户明明认证成功，
+    脚本却报「登录超时、未保存登录态」，逼着人再认证一次。
+
+    命中时把 page 一起返回：后续抓活动清单必须用**登录成功的那个标签页**，
+    否则会在停在 CAS 页的 tab 上 inner_text，什么也抓不到。
+    """
+    try:
+        pages = list(ctx.pages)
+    except Exception:
+        return None, None
+    for p in pages:
+        u = _live_url(p)
+        if is_lms_url(u):
+            return p, u
+    return None, None
+
+
 def save_state(ctx, state, course):
     """只保存下载真正需要的登录态，并收紧文件权限。
 
@@ -154,30 +185,37 @@ def main():
         page.goto(url, timeout=90000, wait_until="domcontentloaded")
         print("已打开:", page.url)
 
-        # ★ 登录成功 = 页面 host 真的回到 LMS 域（is_lms_url 做 hostname
-        #   精确 / 子域匹配）。落盘前 save_state 还会再验一次「有适用的
-        #   cookie」，两道门都过才算数 —— 单看 URL 会被 SSO 中间页骗过。
-        logged = is_lms_url(page.url)
-        if logged:
+        # ★ 登录成功 = **任意一个标签页**的 host 回到 LMS 域（is_lms_url 做
+        #   hostname 精确 / 子域匹配）。落盘前 save_state 还会再验一次
+        #   「有适用的 cookie」，两道门都过才算数 —— 单看 URL 会被 SSO 中间页骗过。
+        #   ⚠️ 必须遍历全部标签页：认证跳转若发生在新标签页，只盯
+        #   ctx.pages[0] 会让 URL 永远不变，把「已登录」误报成「超时」。
+        hit_page, logged_url = any_logged_page(ctx)
+        if hit_page is not None:
+            page = hit_page
+        if logged_url:
             print("profile 里已有登录态, 跳过手动登录")
         else:
             print(">>> 请在弹出的浏览器窗口里完成统一身份认证 <<<")
         t0, last = time.time(), -1
-        while (not logged) and time.time() - t0 < args.wait:
-            u = page.url or ""
+        while (not logged_url) and time.time() - t0 < args.wait:
             el = int(time.time() - t0)
             if el // 20 != last // 20:
                 last = el
-                print("  等待 %3ds  url=%s" % (el, u[:90]), flush=True)
-            if is_lms_url(u):
-                logged = True
+                print("  等待 %3ds  url=%s" % (el, _live_url(page)[:90]),
+                      flush=True)
+            hit_page, hit_url = any_logged_page(ctx)
+            if hit_url:
+                page, logged_url = hit_page, hit_url
             else:
                 time.sleep(2)
-        if not logged:
+        if not logged_url:
             print("!! 登录超时, 未保存登录态", file=sys.stderr)
+            print("   已尝试的标签页数: %d" % len(list(ctx.pages)),
+                  file=sys.stderr)
             ctx.close()
             return 1
-        print("登录成功:", page.url[:100])
+        print("登录成功:", logged_url[:100])
 
         try:
             cookies = save_state(ctx, state, args.course)

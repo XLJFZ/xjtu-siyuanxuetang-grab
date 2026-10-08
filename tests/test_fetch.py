@@ -527,7 +527,7 @@ class TestCollectKinds(Base):
             return R(raw)
 
     def _run_full(self, acts, details, want_video=True):
-        """跑一次真实的 collect()，返回 (keys, n1, n2, scan_errors)，输出静音。"""
+        """跑一次真实的 collect()，返回 (keys, n1, n2, n3, scan_errors)，输出静音。"""
         import contextlib
         op = self._Op(acts, details)
         with contextlib.redirect_stdout(io.StringIO()):
@@ -613,7 +613,7 @@ class TestCollectKinds(Base):
                 {"type": "lesson", "title": "L", "uploads": [{"id": 3}]}]
         det = {777: {"data": {"external_live_detail": {"replay_videos": [
             {"camera_id": 1, "camera_type": "encoder", "url": "http://r/x"}]}}}}
-        keys, n1, n2, _scan = self._run_full(acts, det, want_video=True)
+        keys, n1, n2, _n3, _scan = self._run_full(acts, det, want_video=True)
 
         self.assertEqual(n1, 1)                     # 来源①：只有 L 的那个附件
         self.assertEqual(n2, 0)                     # 正文内嵌：没有
@@ -626,11 +626,95 @@ class TestCollectKinds(Base):
         acts = [{"id": 5, "type": "page", "title": "第1讲", "uploads": None}]
         det = {5: {"data": {"content":
                             '<img src="/api/uploads/8811"><a href="/api/uploads/8812">'}}}
-        keys, n1, n2, _scan = self._run_full(acts, det, want_video=False)
+        keys, n1, n2, _n3, _scan = self._run_full(acts, det, want_video=False)
 
         self.assertEqual(n1, 0)
         self.assertEqual(n2, 2)
         self.assertEqual(sorted(keys), [("课件", "第1讲", 8811), ("课件", "第1讲", 8812)])
+
+    # ---- 来源③：附件挂在活动详情 other_resources 里 ----
+
+    def test_homework_other_resources_collected(self):
+        """★ 核心回归：作业附件挂在**活动详情**的 other_resources 里，
+        而列表接口给 homework 活动的 uploads 是空数组 —— 只看 uploads
+        字段会把作业附件整个漏掉，且不报任何错：清单里没有、fail 里也
+        没有、程序照样 exit 0。实测一个 132 MB 的作业附件就这么消失过。
+
+        真实数据形态（课程 32102「小作业2：看视频回答问题」）：
+            activities[].uploads == []
+            detail.data.other_resources == [{"id": 35387,
+                "name": "宋清斗栱区别-李浈.mp4", "size": 138538216,
+                "type": "video", "url": None}]
+        """
+        acts = [{"id": 1459610, "type": "homework",
+                 "title": "小作业2：看视频回答问题", "uploads": []}]
+        det = {1459610: {"data": {"other_resources": [
+            {"id": 35387, "name": "宋清斗栱区别-李浈.mp4",
+             "size": 138538216, "type": "video", "url": None}]}}}
+        keys, n1, n2, n3, _scan = self._run_full(acts, det, want_video=False)
+
+        self.assertEqual(n1, 0, "列表接口 uploads 是空的 —— 正是漏采的前提")
+        self.assertEqual(n2, 0)
+        self.assertEqual(n3, 1, "来源③必须把这条捞出来")
+        self.assertEqual(keys, [("作业", "小作业2：看视频回答问题", 35387)])
+
+    def test_other_resources_external_url_ignored(self):
+        """url 非空的是外部链接而不是 upload —— 收进来只会让下载阶段
+        拿着一个不存在的 upload id 去请求，然后判成 fail。"""
+        acts = [{"id": 7, "type": "homework", "title": "H", "uploads": []}]
+        det = {7: {"data": {"other_resources": [
+            {"id": 901, "name": "外链", "url": "https://example.com/a.pdf"},
+            {"id": 902, "name": "附件", "url": None}]}}}
+        keys, _n1, _n2, n3, _scan = self._run_full(acts, det, want_video=False)
+
+        self.assertEqual(n3, 1)
+        self.assertEqual(keys, [("作业", "H", 902)])
+
+    def test_other_resources_dedup_against_uploads(self):
+        """同一个 upload 既在 uploads 又在 other_resources 里只能算一次，
+        否则会重复下载、计数虚高。"""
+        acts = [{"id": 8, "type": "homework", "title": "H",
+                 "uploads": [{"id": 55}]}]
+        det = {8: {"data": {"other_resources": [{"id": 55, "url": None}]}}}
+        keys, n1, _n2, n3, _scan = self._run_full(acts, det, want_video=False)
+
+        self.assertEqual(n1, 1)
+        self.assertEqual(n3, 0, "与来源①撞了同一 (kind, 活动, uid) → 不算来源③增量")
+        self.assertEqual(keys, [("作业", "H", 55)])
+
+    def test_other_resources_malformed_entries_survive(self):
+        """other_resources 里混进 None / 字符串 / 空 dict / id=0 不能崩。
+        （真实场景：API 偶发返回残缺对象。）"""
+        acts = [{"id": 9, "type": "homework", "title": "H", "uploads": []}]
+        det = {9: {"data": {"other_resources": [
+            None, "garbage", {}, {"id": 0, "url": None},
+            {"id": 66, "url": None}]}}}
+        keys, _n1, _n2, n3, _scan = self._run_full(acts, det, want_video=False)
+
+        self.assertEqual(n3, 1)
+        self.assertEqual(keys, [("作业", "H", 66)])
+
+    def test_homework_detail_failure_is_recorded(self):
+        """★ 作业详情取不到时不能静默：那几个附件根本没被发现，
+        必须进 scan_errors（进而进 fail / 退出码）。"""
+        acts = [{"id": 5, "type": "homework", "title": "作业X", "uploads": []}]
+        _keys, _n1, _n2, _n3, scan = self._run_full(
+            acts, {5: http_err(500)}, want_video=False)
+
+        self.assertEqual(len(scan), 1)
+        self.assertEqual(scan[0]["stage"], "activity_detail")
+        self.assertEqual(scan[0]["activity_id"], 5)
+
+    def test_non_detail_kinds_do_not_fetch_detail(self):
+        """只有 homework / exam 才为 other_resources 取详情 ——
+        material / lesson 的附件本来就在 uploads 里，多取详情纯属白跑请求。"""
+        import contextlib
+        acts = [{"type": "material", "title": "M", "uploads": [{"id": 1}]}]
+        op = self._Op(acts, {})
+        with contextlib.redirect_stdout(io.StringIO()):
+            F.collect(op, "1", acts, want_video=False)
+        detail_hits = [u for u in op.urls if "/activities/" in u]
+        self.assertEqual(detail_hits, [])
 
 
 class TestReplayNaming(Base):
@@ -2687,8 +2771,8 @@ class TestCollectScanFailure(Base):
         try:
             with contextlib.redirect_stdout(buf):
                 with contextlib.redirect_stderr(buf):
-                    keys, _n1, _n2, errs = F.collect(op, "1", acts,
-                                                     want_video=want_video)
+                    keys, _n1, _n2, _n3, errs = F.collect(op, "1", acts,
+                                                          want_video=want_video)
         finally:
             F.time.sleep = old_sleep
         return keys, errs

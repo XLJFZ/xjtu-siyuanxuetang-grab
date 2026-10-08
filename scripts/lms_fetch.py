@@ -503,6 +503,7 @@ def scan_error(stage, activity_id, title, exc):
 
     stage 取值:
         page_detail          —— page 类型活动正文里的内嵌附件（课件 PDF 主要来源）
+        activity_detail      —— homework / exam 活动详情 other_resources 里的附件
         lecture_live_detail  —— lecture_live 活动的回放列表
     """
     if isinstance(exc, urllib.error.HTTPError):
@@ -516,8 +517,14 @@ def scan_error(stage, activity_id, title, exc):
             "error": "%s: %s" % (type(exc).__name__, str(exc)[:60])}
 
 
+# 附件只挂在活动详情 other_resources 里的活动类型。
+# ★ 实测：homework 活动在**列表接口**里的 uploads 是空数组，附件全在活动详情
+#   的 other_resources 里 —— 不取详情，就等于这门课的作业附件根本不存在。
+DETAIL_RESOURCE_KINDS = ("homework", "exam")
+
+
 def collect(op, course, activities=None, want_video=True, detail_cache=None):
-    """返回 ([(kind, 活动标题, upload_id)], 来源①数量, 来源②数量, 扫描错误列表)
+    """返回 ([(kind, 活动标题, upload_id)], 来源①数, 来源②数, 来源③数, 扫描错误列表)
 
     kind 取值:
         课件   —— 讲义 / PDF / 附件
@@ -525,14 +532,14 @@ def collect(op, course, activities=None, want_video=True, detail_cache=None):
         录像   —— online_video 类型活动的课堂录像
         回放   —— lecture_live 类型活动的直播回放（走校外录播系统，另一套端点）
 
-    前三类走相同的附件下载机制，平台支持分片请求，
-    断点续传 / etag 校验原样可用。第四类要单独实现，详见 lms_live.py。
+    课件 / 作业 / 录像三类走相同的附件下载机制，平台支持分片请求，
+    断点续传 / etag 校验原样可用。回放要单独实现，详见 lms_live.py。
 
-    第四类的 upload_id 位放的是「活动 id」，不是 upload id —— 它根本不是附件。
-    下载时按 kind 分流，不会走到附件端点上去。
+    回放条目的 upload_id 位放的是「活动 id」的负数，不是 upload id —— 它根本
+    不是附件。下载时按 kind 分流，不会走到附件端点上去。
 
-    两个计数都是「进 plan 的去重增量」，来源③（回放）不计入其中，
-    想拿回放条数请按 kind == "回放" 数。用 len(keys) 相减推来源②会把回放算进去。
+    三个计数都是「进 plan 的去重增量」，回放不计入其中，想拿回放条数请按
+    kind == "回放" 数。用 len(keys) 相减推来源②③会把回放算进去。
 
     detail_cache : 可选 dict。传入时，成功取到的活动详情会写进它，
     `expand_items()` 可以复用，省掉「同一份详情取两次」的第二次请求
@@ -588,7 +595,41 @@ def collect(op, course, activities=None, want_video=True, detail_cache=None):
     # 就不会进 plan，用减法会把它算错。回放条目也在这里被排除。
     n2 = len(plan) - n1
 
-    # 来源 ③：lecture_live 回放。replay_videos 只在活动详情里有，列表接口拿不到。
+    # 来源 ③：活动详情里的 other_resources
+    #   ★ 作业（homework）附件基本只挂在这里，而**列表接口给该活动的 uploads
+    #   是空数组** —— 只看 uploads 字段会把它整个漏掉，而且不报任何错：清单里
+    #   没有、fail 里也没有、程序照样 exit 0（实测一个 132 MB 的作业附件就这么
+    #   消失过，最后靠人肉比对作业页面截图才发现）。
+    #   other_resources[].id 就是标准 upload id，下载端点与普通附件完全一致，
+    #   所以这里只补「发现」这一环，下载链路原样复用。
+    #   url 非空的是外部链接而不是 upload，只收 url 为空的条目。
+    for a in activities:
+        if a.get("type") not in DETAIL_RESOURCE_KINDS:
+            continue
+        aid = a.get("id")
+        if not aid:
+            continue                        # 残缺数据，跳过而不是崩
+        d = (detail_cache or {}).get(str(aid))
+        if d is None:
+            try:
+                d = get_json(op, "%s/api/activities/%s?sub_course_id=0"
+                                 % (BASE, aid))
+            except Exception as e:
+                # 详情取不到 = 这个活动下有没有附件根本没问清楚，必须记账
+                scan_errors.append(scan_error("activity_detail", aid,
+                                              a.get("title"), e))
+                continue
+            if detail_cache is not None:
+                detail_cache[str(aid)] = d
+        for r in ((d.get("data") or {}).get("other_resources") or []):
+            if not isinstance(r, dict):
+                continue
+            uid = r.get("id")
+            if uid and not r.get("url"):
+                add(kind_of(a) or "作业", a.get("title"), uid)
+    n3 = len(plan) - n1 - n2
+
+    # 来源 ④：lecture_live 回放。replay_videos 只在活动详情里有，列表接口拿不到。
     if want_video:
         lives = [x for x in activities if x.get("type") == "lecture_live"]
         if lives:
@@ -613,7 +654,7 @@ def collect(op, course, activities=None, want_video=True, detail_cache=None):
                 continue
             # uid 用负数存活动 id —— 它不是 upload，走不了 uploads 端点
             add("回放", a.get("title"), -(int(aid)))
-    return sorted(plan.keys()), n1, n2, scan_errors
+    return sorted(plan.keys()), n1, n2, n3, scan_errors
 
 
 def scan_error_items(scan_errors):
@@ -628,9 +669,11 @@ def scan_error_items(scan_errors):
         act = e.get("activity") or "未知活动"
         aid = e.get("activity_id")
         label = {"page_detail": "活动正文",
+                 "activity_detail": "活动详情",
                  "lecture_live_detail": "直播回放"}.get(stage, stage)
         out.append({
-            "kind": "回放" if stage == "lecture_live_detail" else "课件",
+            "kind": {"lecture_live_detail": "回放",
+                     "activity_detail": "作业"}.get(stage, "课件"),
             "activity": act,
             "uid": aid,
             "name": "%s-%s" % (act, label),
@@ -1086,11 +1129,12 @@ def main():
 
     print("扫描课程 %s ..." % args.course)
     detail_cache = {}
-    keys, n1, n2, scan_errors = collect(op, args.course, acts,
-                                        want_video=not args.no_video,
-                                        detail_cache=detail_cache)
-    print("  来源① uploads 字段: %d" % n1)
-    print("  来源② 正文内嵌:     %d" % n2)
+    keys, n1, n2, n3, scan_errors = collect(op, args.course, acts,
+                                            want_video=not args.no_video,
+                                            detail_cache=detail_cache)
+    print("  来源① uploads 字段:   %d" % n1)
+    print("  来源② 正文内嵌:       %d" % n2)
+    print("  来源③ 活动详情附件:   %d" % n3)
     n_vid = sum(1 for k in keys if k[0] == "录像")
     n_live = sum(1 for k in keys if k[0] == "回放")
     if n_vid:

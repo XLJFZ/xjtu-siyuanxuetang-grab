@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """lms_login 的离线测试 —— 不需要 playwright、不需要网络、不开浏览器。
 
-覆盖两块收紧后的语义：
+覆盖三块收紧后的语义：
 
   ① 登录成功判定：必须 urlparse 取 hostname 做精确 / 子域匹配。
      字符串包含式判断（`HOST in url`）会被 CAS 登录页查询参数里的
@@ -74,6 +74,72 @@ class IsLmsUrlCase(unittest.TestCase):
         self.assertFalse(L.is_lms_url(""))
         self.assertFalse(L.is_lms_url(None))
         self.assertFalse(L.is_lms_url("not a url"))
+
+
+class FakePage:
+    """只实现 url 属性的假标签页。"""
+
+    def __init__(self, url):
+        self.url = url
+
+
+class FakePagesCtx:
+    """只实现 pages 属性的假上下文。"""
+
+    def __init__(self, urls):
+        self.pages = [FakePage(u) for u in urls]
+
+
+class AnyLoggedPageCase(unittest.TestCase):
+    """★ 登录检测必须遍历**所有**标签页，而不是只看 ctx.pages[0]。
+
+    回归背景：认证跳转发生在**新标签页**时（身份提供方 window.open，
+    或用户自己开新页去认证），被盯着的那个 tab URL 永远不变 ——
+    明明 cookie 已写全，脚本却报「登录超时、未保存登录态」，逼用户
+    重复认证一次。实测踩过一次（课程 32102）。
+    """
+
+    def test_first_tab_hit(self):
+        ctx = FakePagesCtx(["%s/course/1/index" % C.BASE,
+                            "https://auth.example.edu.cn/cas/login"])
+        p, u = L.any_logged_page(ctx)
+        self.assertEqual(u, "%s/course/1/index" % C.BASE)
+        self.assertIs(p, ctx.pages[0])
+
+    def test_hit_on_later_tab(self):
+        """★ 核心回归：第一个 tab 停在 CAS 登录页，第二个 tab 才是 LMS。"""
+        ctx = FakePagesCtx([
+            "https://authserver.example.edu.cn/cas/login?service=" + C.BASE,
+            "%s/course/1/index" % C.BASE,
+        ])
+        p, u = L.any_logged_page(ctx)
+        self.assertEqual(u, "%s/course/1/index" % C.BASE)
+        self.assertIs(p, ctx.pages[1],
+                      "必须返回命中的那个 page —— 后续抓活动清单要用它")
+
+    def test_no_hit_returns_none(self):
+        ctx = FakePagesCtx(["https://authserver.example.edu.cn/cas/login"])
+        p, u = L.any_logged_page(ctx)
+        self.assertIsNone(p)
+        self.assertIsNone(u)
+
+    def test_empty_pages(self):
+        p, u = L.any_logged_page(FakePagesCtx([]))
+        self.assertIsNone(p)
+        self.assertIsNone(u)
+
+    def test_closed_page_does_not_crash(self):
+        """标签页被关掉后读 .url 会抛异常 —— 不能把整轮登录拖崩。"""
+        class Boom:
+            @property
+            def url(self):
+                raise RuntimeError("page closed")
+
+        ctx = FakePagesCtx([])
+        ctx.pages = [Boom(), FakePage("%s/course/2/index" % C.BASE)]
+        p, u = L.any_logged_page(ctx)
+        self.assertEqual(u, "%s/course/2/index" % C.BASE)
+        self.assertIs(p, ctx.pages[1])
 
 
 class SaveStateCase(unittest.TestCase):
