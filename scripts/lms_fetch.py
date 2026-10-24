@@ -29,6 +29,7 @@
     只需要标准库 + 已跑过 lms_login.py 生成的登录态 JSON，不依赖浏览器。
 """
 import argparse
+import calendar
 import hashlib
 import http.cookiejar
 import json
@@ -38,6 +39,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from html.parser import HTMLParser
 from urllib.parse import urlparse, quote
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -841,6 +843,265 @@ def dest_for(kind, act, name, args):
     return os.path.join(args.out, kind, act)
 
 
+# ---------------------------------------------------------------- 作业说明存档
+#
+# 附件下来之后，光有 `第2章习题.doc` 是读不出「交什么、怎么交、什么时候截止」的 ——
+# 这些要求写在活动详情的 data.description 富文本里，页面上不下载就看不到。
+# 所以作业类活动除了附件，再落一份 `说明.md`：正文转纯文本 + 截止时间 + 附件清单。
+# 纯文本而不是 HTML：它是给人读、给 md 编辑器接着写的，还要能进版本库看 diff。
+
+NOTE_NAME = "说明.md"
+
+# 这些标签在富文本里代表「换行 / 新块」；不处理会把整段说明挤成一行
+_NL_TAGS = frozenset((
+    "p", "div", "br", "tr", "li", "ul", "ol", "table", "section", "article",
+    "h1", "h2", "h3", "h4", "h5", "h6", "blockquote", "pre",
+))
+
+
+class _RichText(HTMLParser):
+    """把平台富文本压成纯文本（保留段落边界，丢掉标签与脚本）。
+
+    ★ 不用 `re.sub(r"<[^>]+>", "", html)`：那样 `<div>a</div><div>b</div>`
+    会粘成 `ab`，而作业要求几乎是一行一条 div —— 粘完之后「1. 不要纸质作业
+    2. md 文件命名…」全糊在一行，人读着难受，diff 也没法看。
+    """
+
+    def __init__(self):
+        HTMLParser.__init__(self, convert_charrefs=True)
+        self.parts = []
+        self._skip = 0
+
+    def handle_starttag(self, tag, attrs):
+        if tag in ("script", "style"):
+            self._skip += 1
+        if tag in _NL_TAGS:
+            self.parts.append("\n")
+        if tag == "li":
+            self.parts.append("- ")
+
+    def handle_endtag(self, tag):
+        if tag in ("script", "style") and self._skip:
+            self._skip -= 1
+        if tag in _NL_TAGS:
+            self.parts.append("\n")
+
+    def handle_data(self, data):
+        if not self._skip:
+            self.parts.append(data)
+
+
+def html_to_text(html):
+    """富文本 → 纯文本。空输入返回空串（调用方据此判断「平台没填说明」）。"""
+    if not html:
+        return ""
+    p = _RichText()
+    try:
+        p.feed(str(html))
+        p.close()
+    except Exception:
+        # 畸形 HTML 不该让整轮扫描失败 —— 退回最粗的剥标签
+        return re.sub(r"<[^>]+>", "", str(html)).strip()
+    text = "".join(p.parts)
+    text = re.sub(r"[ \t\u00a0]+", " ", text)
+    text = re.sub(r" *\n *", "\n", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+def local_time(iso):
+    """平台给的是 UTC（`2026-11-07T15:59:00Z`）→ 本地时间字符串。
+
+    解析不了就原样返回：时间只是方便人读，不值得为它中断整轮扫描。
+    """
+    s = str(iso or "").strip()
+    if not s:
+        return ""
+    try:
+        t = calendar.timegm(time.strptime(s[:19], "%Y-%m-%dT%H:%M:%S"))
+        return time.strftime("%Y-%m-%d %H:%M", time.localtime(t))
+    except Exception:
+        return s
+
+
+def note_filename(act, args):
+    """说明文档的文件名。
+
+    默认布局下每个活动独占 `作业/<活动标题>/`，文件名再重复一遍标题是噪音；
+    `--organize` / `--layout flat` 会把多个活动塞进同一个目录，必须带标题才不撞名。
+    """
+    if args.organize or args.layout == "flat":
+        return safe("%s-说明.md" % (act or "活动"))
+    return NOTE_NAME
+
+
+def note_markdown(act, detail, course):
+    """把一次作业活动的详情整理成 Markdown。
+
+    ★ 文件里不写「抓取时间」：那样每次跑都会变更内容、把 mtime 刷成新的，
+    幂等判定就永远命中不了。文件的 mtime 本身就是抓取时间；
+    平台上真正的更新时间用 `updated_at`（有就写）。
+    来源行保留课程号与活动号，任何时候都能回到平台上对一遍。
+    """
+    d = detail if isinstance(detail, dict) else {}
+    data = d.get("data") or {}
+    title = act.get("title") or d.get("title") or "（无标题）"
+    t = act.get("type") or d.get("type") or ""
+    kind_cn = {"homework": "作业", "exam": "测验"}.get(t, t or "活动")
+
+    out = ["# %s" % title, ""]
+    meta = [("类型", kind_cn)]
+    if d.get("start_time"):
+        meta.append(("开放时间", local_time(d["start_time"])))
+    if d.get("end_time"):
+        meta.append(("截止时间", local_time(d["end_time"])))
+    if d.get("is_closed"):
+        state = "已关闭"
+    elif d.get("is_in_progress"):
+        state = "进行中"
+    elif d.get("is_started"):
+        state = "已开放（未开始？）"
+    else:
+        state = ""
+    if state:
+        meta.append(("状态", state))
+    score = data.get("score_percentage")
+    if score not in (None, "", "0"):
+        meta.append(("分值占比", "%s%%" % score))
+    hw = data.get("homework_type")
+    if hw:
+        meta.append(("提交方式", {"file_upload": "文件上传"}.get(hw, str(hw))))
+    if d.get("updated_at"):
+        meta.append(("平台更新时间", local_time(d["updated_at"])))
+    meta.append(("来源", "%s · 课程 %s · 活动 %s"
+                 % (BASE, course, act.get("id") or d.get("id") or "?")))
+    for k, v in meta:
+        out.append("- %s：%s" % (k, v))
+
+    out += ["", "## 作业说明", ""]
+    body = html_to_text(data.get("description"))
+    out.append(body if body else "_（平台未填写文字说明）_")
+
+    files = []
+    for u in (d.get("uploads") or act.get("uploads") or []):
+        if isinstance(u, dict) and u.get("name"):
+            files.append((u["name"], u.get("size")))
+    for r in (data.get("other_resources") or []):
+        if not isinstance(r, dict):
+            continue
+        nm = r.get("name") or r.get("file_name") or ""
+        if nm and all(nm != n for n, _ in files):
+            files.append((nm, r.get("size")))
+    if files:
+        out += ["", "## 附件（平台登记）", ""]
+        for nm, sz in files:
+            out.append("- `%s`%s" % (nm, "  (%s)" % human_size(sz) if sz else ""))
+
+    ref = data.get("reference_answer")
+    ref_txt = html_to_text(ref) if ref else ""
+    if ref_txt:
+        out += ["", "## 参考答案（平台发布）", "", ref_txt]
+
+    return "\n".join(out).rstrip() + "\n"
+
+
+def collect_notes(op, course, activities=None, detail_cache=None, args=None):
+    """收集作业说明，返回 [{activity, kind, filename, text, aid}]。
+
+    ★ 只处理 homework / exam：说明文字挂在这些活动的 `data.description` 里。
+      `page` 类活动的正文已经在来源②被用过（抽附件），再产一份「说明」
+      就是同一份内容的第二个副本，只会让目录变脏。
+    ★ 详情取不到**不在这里记账** —— `collect()` 已经为同一批活动记过
+      `activity_detail` 失败，同一件事记两遍会让 fail 数量虚高。
+    """
+    if activities is None:
+        activities = get_json(op, "%s/api/courses/%s/activities?sub_course_id=0"
+                              % (BASE, course))["activities"]
+    out = []
+    for a in activities:
+        if a.get("type") not in DETAIL_RESOURCE_KINDS:
+            continue
+        aid = a.get("id")
+        if not aid:
+            continue
+        detail = (detail_cache or {}).get(str(aid))
+        if detail is None:
+            continue                    # 取失败的已在 collect() 记过账
+        act = a.get("title") or "（无标题）"
+        fn = note_filename(act, args) if args is not None else NOTE_NAME
+        # --exclude 对说明同样生效，且要拿「目录 + 文件名」整条相对路径去匹配：
+        # 默认布局的文件名只有 说明.md，只比文件名的话「排除第2章」永远不会命中。
+        if args is not None and getattr(args, "exclude", None):
+            try:
+                if re.search(args.exclude, os.path.join(act, fn)):
+                    continue
+            except re.error:
+                pass
+        out.append({
+            "activity": safe(act),
+            # 作业与测验都归到 `作业/` 下 —— 不给「测验」另开一层目录，
+            # 否则同一门课的材料会散在两个顶层目录里
+            "kind": "作业",
+            "filename": fn,
+            "text": note_markdown(a, detail, course),
+            "aid": str(aid),
+        })
+    return out
+
+
+def write_notes(notes, args, quiet=False):
+    """把说明文档落盘，返回 (新建, 更新, 未变)。
+
+    ★ 幂等判据是**内容比对**，不是大小/etag：说明文档没有 upload id，
+      不参与断点续传与 identity 分配；内容没变就不动文件，免得每跑一次
+      都把 mtime 刷新、把 git 工作区搅成「有改动」。
+    ★ dry-run 只打印计划，不建目录、不写文件。
+    """
+    new = upd = same = 0
+    for n in notes:
+        dest = dest_for(n["kind"], n["activity"], n["filename"], args)
+        path = os.path.join(dest, n["filename"])
+        rel = os.path.relpath(path, args.out)
+        if args.dry_run:
+            if not quiet:
+                print("[说明] %-4s %-28s -> %s"
+                      % (n["kind"], n["activity"][:26], rel))
+            continue
+        old = None
+        if os.path.isfile(path):
+            try:
+                with open(path, encoding="utf-8") as f:
+                    old = f.read()
+            except OSError:
+                old = None
+        if old == n["text"]:
+            same += 1
+            if not quiet:
+                print("[说明] SAME  %-28s %s" % (n["activity"][:26], rel))
+            continue
+        os.makedirs(dest, exist_ok=True)
+        tmp = path + ".tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8", newline="\n") as f:
+                f.write(n["text"])
+            os.replace(tmp, path)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+        if old is None:
+            new += 1
+            if not quiet:
+                print("[说明] NEW   %-28s %s" % (n["activity"][:26], rel))
+        else:
+            upd += 1
+            if not quiet:
+                print("[说明] UPD   %-28s %s" % (n["activity"][:26], rel))
+    return new, upd, same
+
+
 def identity_conflict_target(dest, name, size, uid):
     """resource identity 守卫：目标已有「完整但与本资源不符」的文件时，
     **绝不覆盖** —— 换确定性后缀另存。
@@ -1206,6 +1467,16 @@ def main():
                                 if r.get("err_kind") == ERR_AUTH), args.course)
         save_download_index(args.out, index)
         return RC_PARTIAL if n_fail else RC_OK
+
+    # ---- 作业说明存档：附件之外的另一半（交什么 / 怎么交 / 什么时候截止） ----
+    # 与附件下载完全解耦：不进 ok/fail/skip 计数、不进 identity 索引，
+    # 写失败也只影响这一份文档，不该把整轮下载判成失败。
+    notes = collect_notes(op, args.course, acts, detail_cache=detail_cache, args=args)
+    if notes:
+        n_new, n_upd, n_same = write_notes(notes, args, quiet=args.quiet)
+        if not args.dry_run:
+            print("  说明文档 %d 份：新建 %d / 更新 %d / 未变 %d"
+                  % (len(notes), n_new, n_upd, n_same))
 
     ok = fail = skip = 0
     auth_fail = 0

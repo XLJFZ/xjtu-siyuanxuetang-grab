@@ -3806,5 +3806,190 @@ class TestReplayUrlJit(Base):
         self.assertNotIn("previewToken", blob, blob)
 
 
+class TestNoteArchive(unittest.TestCase):
+    """作业说明存档（v1.7.0）：附件之外还要留下「交什么、怎么交、什么时候截止」。
+
+    这些要求只写在活动详情的 `data.description` 富文本里，不落一份文档，
+    下次打开目录就只剩一个 `第2章习题.doc`，看不出提交格式与截止时间。
+    """
+
+    # ---- 富文本 → 纯文本 ----
+
+    def test_block_tags_become_newlines(self):
+        """★ 核心回归：一行一条 <div> 是最常见的写法。
+        用 re.sub 剥标签会把 `1. 不要纸质作业` 和 `2. md 命名…` 粘成一行。
+
+        注意判据是「各占一行」而不是「相邻无空行」：块边界在 Markdown 里
+        要落成空行才算两段，粘成一段反而是错的。
+        """
+        html = "<div>1. 不使用纸质作业</div><div>2. md 命名规范</div>"
+        lines = [x for x in F.html_to_text(html).split("\n") if x.strip()]
+        self.assertEqual(lines, ["1. 不使用纸质作业", "2. md 命名规范"])
+
+    def test_list_items_keep_bullets(self):
+        out = F.html_to_text("<ul><li>甲</li><li>乙</li></ul>")
+        self.assertIn("- 甲", out)
+        self.assertIn("- 乙", out)
+
+    def test_entities_are_decoded(self):
+        out = F.html_to_text("<p>A&nbsp;&amp;&nbsp;B</p>")
+        self.assertEqual(out, "A & B")
+
+    def test_script_and_style_dropped(self):
+        out = F.html_to_text("<style>p{color:red}</style><div>正文</div>"
+                             "<script>var x=1</script>")
+        self.assertEqual(out, "正文")
+
+    def test_empty_returns_empty(self):
+        self.assertEqual(F.html_to_text(""), "")
+        self.assertEqual(F.html_to_text(None), "")
+
+    def test_malformed_html_does_not_raise(self):
+        self.assertIn("abc", F.html_to_text("<div>abc<span></div>"))
+
+    # ---- 时间换算 ----
+
+    def test_utc_converted_to_local(self):
+        import calendar
+        import time as _t
+        got = F.local_time("2026-11-07T15:59:00Z")
+        want = _t.strftime("%Y-%m-%d %H:%M", _t.localtime(
+            calendar.timegm(_t.strptime("2026-11-07T15:59:00",
+                                        "%Y-%m-%dT%H:%M:%S"))))
+        self.assertEqual(got, want)
+
+    def test_garbage_time_passthrough(self):
+        self.assertEqual(F.local_time("下周三"), "下周三")
+        self.assertEqual(F.local_time(""), "")
+
+    # ---- 文件名 ----
+
+    def _args(self, **kw):
+        import argparse
+        base = dict(out="X", organize=False, layout="activity",
+                    split_projects=False, dry_run=False, quiet=True,
+                    exclude=None)
+        base.update(kw)
+        return argparse.Namespace(**base)
+
+    def test_note_filename_default_is_plain(self):
+        """默认布局下活动已独占一个目录，文件名不必再重复标题。"""
+        self.assertEqual(F.note_filename("【第2章】作业", self._args()),
+                         "说明.md")
+
+    def test_note_filename_carries_title_when_shared_dir(self):
+        """--organize / --layout flat 会把多个活动塞进同一目录，必须带标题。"""
+        for kw in ({"organize": True}, {"layout": "flat"}):
+            fn = F.note_filename("【第2章】作业", self._args(**kw))
+            self.assertIn("第2章", fn)
+            self.assertTrue(fn.endswith(".md"))
+
+    # ---- 文档内容 ----
+
+    ACT = {"id": 1001, "title": "【第2章】作业", "type": "homework"}
+    DETAIL = {"id": 1001, "title": "【第2章】作业", "type": "homework",
+              "end_time": "2026-11-07T15:59:00Z", "is_in_progress": True,
+              "data": {"description": "<div>写关系代数表达式</div>",
+                       "score_percentage": "1.5",
+                       "homework_type": "file_upload",
+                       "other_resources": []},
+              "uploads": [{"name": "第2章习题.doc", "size": 63488}]}
+
+    def test_markdown_has_title_deadline_and_body(self):
+        md = F.note_markdown(self.ACT, self.DETAIL, "33590")
+        self.assertIn("# 【第2章】作业", md)
+        self.assertIn("截止时间", md)
+        self.assertIn("写关系代数表达式", md)
+        self.assertIn("第2章习题.doc", md)
+        self.assertIn("课程 33590", md)
+
+    def test_markdown_has_no_fetch_timestamp(self):
+        """★ 文件里不能写「抓取时间」：每跑一次都会变 → 幂等判定永远失效，
+        git 工作区天天显示「有改动」。"""
+        md = F.note_markdown(self.ACT, self.DETAIL, "33590")
+        self.assertNotIn("抓取时间", md)
+
+    def test_markdown_placeholder_when_no_description(self):
+        d = json.loads(json.dumps(self.DETAIL))
+        d["data"]["description"] = ""
+        md = F.note_markdown(self.ACT, d, "33590")
+        self.assertIn("未填写", md)
+
+    def test_markdown_survives_missing_detail(self):
+        """详情结构残缺（data 为 None）不该抛，只能少写几行。"""
+        md = F.note_markdown(self.ACT, {"data": None}, "33590")
+        self.assertIn("# 【第2章】作业", md)
+
+    # ---- 收集 ----
+
+    def test_collect_only_homework_like(self):
+        acts = [{"id": 1, "title": "课件页", "type": "page"},
+                {"id": 2, "title": "作业A", "type": "homework"},
+                {"id": 3, "title": "录像", "type": "online_video"}]
+        cache = {str(a["id"]): {"data": {"description": "x"}} for a in acts}
+        got = F.collect_notes(None, "33590", acts, detail_cache=cache,
+                              args=self._args())
+        self.assertEqual([n["activity"] for n in got], ["作业A"])
+        self.assertEqual(got[0]["kind"], "作业")
+
+    def test_collect_skips_activities_without_detail(self):
+        """详情没取到的活动已在 collect() 记过账，这里不能再崩、也不能重记。"""
+        acts = [{"id": 9, "title": "作业B", "type": "homework"}]
+        self.assertEqual(F.collect_notes(None, "33590", acts,
+                                         detail_cache={}, args=self._args()), [])
+
+    def test_collect_honours_exclude(self):
+        acts = [{"id": 2, "title": "作业A", "type": "homework"}]
+        cache = {"2": {"data": {"description": "x"}}}
+        got = F.collect_notes(None, "33590", acts, detail_cache=cache,
+                              args=self._args(exclude="作业"))
+        self.assertEqual(got, [])
+
+    # ---- 落盘 ----
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="notes_")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+
+    def _note(self, text="正文\n"):
+        return {"activity": "作业A", "kind": "作业",
+                "filename": "说明.md", "text": text, "aid": "1"}
+
+    def test_write_creates_file(self):
+        args = self._args(out=self.tmp)
+        new, upd, same = F.write_notes([self._note()], args, quiet=True)
+        self.assertEqual((new, upd, same), (1, 0, 0))
+        path = os.path.join(self.tmp, "作业", "作业A", "说明.md")
+        with open(path, encoding="utf-8") as f:
+            self.assertEqual(f.read(), "正文\n")
+        self.assertFalse(os.path.exists(path + ".tmp"))
+
+    def test_write_is_idempotent_and_keeps_mtime(self):
+        """★ 内容没变就绝不重写 —— 否则每跑一次都刷新 mtime，工作区永远「有改动」。"""
+        args = self._args(out=self.tmp)
+        F.write_notes([self._note()], args, quiet=True)
+        path = os.path.join(self.tmp, "作业", "作业A", "说明.md")
+        before = os.stat(path).st_mtime_ns
+        new, upd, same = F.write_notes([self._note()], args, quiet=True)
+        self.assertEqual((new, upd, same), (0, 0, 1))
+        self.assertEqual(os.stat(path).st_mtime_ns, before)
+
+    def test_write_updates_when_platform_text_changes(self):
+        args = self._args(out=self.tmp)
+        F.write_notes([self._note()], args, quiet=True)
+        new, upd, same = F.write_notes([self._note("改过了\n")], args,
+                                       quiet=True)
+        self.assertEqual((new, upd, same), (0, 1, 0))
+        path = os.path.join(self.tmp, "作业", "作业A", "说明.md")
+        with open(path, encoding="utf-8") as f:
+            self.assertEqual(f.read(), "改过了\n")
+
+    def test_dry_run_writes_nothing(self):
+        args = self._args(out=self.tmp, dry_run=True)
+        F.write_notes([self._note()], args, quiet=True)
+        self.assertEqual(os.listdir(self.tmp), [],
+                         "dry-run 不许建目录、不许写文件")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
