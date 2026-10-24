@@ -254,7 +254,17 @@ def state_host(path):
 
 
 def opener(state):
-    """按登录态建一个 opener。
+    """按登录态**文件**建一个 opener。"""
+    return opener_from_cookies(load_state(state).get("cookies") or [])
+
+
+def opener_from_cookies(cookies):
+    """按一批 cookie 建一个 opener。
+
+    ★ 为什么要从 opener() 里拆出来：lms_login 要拿「浏览器 cookie 罐里
+    刚取到的 cookie」直接打接口判断登录是否完成。如果那边另写一套 cookie
+    重建逻辑，登录判定与下载预检就会对同一次会话给出不同结论 ——
+    「登录说成功、下载说 401」这类自相矛盾全是从这种分叉里长出来的。
 
     ★ Cookie 重建必须保留安全语义：domain / path / secure / expires。
     以前这些位置被硬编码（secure=True, expires=None），会导致
@@ -263,7 +273,6 @@ def opener(state):
     现在：domain 与 expires 按原样还原，secure 也按原样还原；
     只装载适用于当前目标 host 的 cookie。
     """
-    st = load_state(state)
     target = HOST.lower()
 
     def applies(c):
@@ -275,7 +284,7 @@ def opener(state):
         return target == dom or target.endswith("." + dom)
 
     cj = http.cookiejar.CookieJar()
-    for c in st.get("cookies") or []:
+    for c in cookies or []:
         if not c.get("name"):
             continue
         if not applies(c):

@@ -108,23 +108,34 @@ ID 从 URL 里取：`/course/<课程ID>/` → `<课程ID>`。
 
 ### 2. 登录（只需一次）
 ```bash
-python scripts/lms_login.py --course <ID>
+python scripts/lms_login.py --course <ID>     # 有效就不开浏览器，失效才弹窗
+python scripts/lms_login.py --course <ID> --check   # 只探测，绝不弹窗
 ```
-- 会弹出浏览器窗口，用户手动完成统一身份认证。
-- 登录态落到 `~/.lms-grab/state_<ID>.json`，顺带存活动清单。
+- **既有登录态还有效时不开浏览器**（v1.7.0 起）：先用已落盘的 cookie 打一次接口，
+  有效就直接退出（约 3~5s，省掉浏览器启动 + 导航的 15~25s）；失效才弹窗让用户认证。
+- 会弹出浏览器窗口时，用户手动完成统一身份认证；登录态落到
+  `~/.lms-grab/state_<ID>.json`，顺带存活动清单。
 - **profile 目录也保留登录态**，第二次跑会直接跳过登录。
+- 登录判定有两条通道，先免费后付费：① 任一标签页的 URL 回到 LMS 域；
+  ② **拿浏览器 cookie 罐里的凭据打一次接口、被服务端认**（v1.7.0 起）。
+  只靠 ① 会漏 —— 认证若发生在别处（另一个窗口 / 身份提供方自己开的页），
+  被盯着的标签页 URL 永远不动；只靠 ② 会多花请求。两条任一命中即成功。
 - 登录检测**遍历所有标签页**（v1.6.0 起）：认证跳转若发生在**新标签页**，只盯第一个
   标签页会永远看不到变化，把「已登录」误报成「超时」。
 - 浏览器自动探测顺序：环境变量 `LMS_BROWSER` → Edge → Chrome → playwright 自带 chromium
   （Windows / macOS / Linux 三条分支都写了）。
+- `--force`：即便登录态仍有效也强制重登（换账号、怀疑凭据异常时用）。
 
 > [!tip] 报「登录超时」时，先别急着让用户重登
 > 看一眼 `~/.lms-grab/profile_<ID>/Default/Network/Cookies` 的修改时间是否落在等待窗口内 ——
 > 落在窗口内就说明凭据其实**已经落盘**，此时**直接重跑本命令会命中 profile 登录态、秒过**，
 > 不需要用户再认证一次。
+> v1.7.0 起脚本自己也会每 3s 拿 profile 里的 cookie 探一次接口，认证一落地就结束等待，
+> 不用再靠人看 mtime。
 
 > [!warning] 启动 URL 不要带 `#/`
 > 带 hash 会让 SPA 卡成 `index#/#%2F`，渲染进程假死。脚本里用的是 `/course/<ID>/index`。
+
 
 ### 3. 先干跑看清单
 ```bash

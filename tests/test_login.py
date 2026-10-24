@@ -265,5 +265,180 @@ class PosixModeCase(unittest.TestCase):
                          ".tmp 在替换那一刻就必须已经是 0600")
 
 
+class CookiesForHostCase(unittest.TestCase):
+    """三处调用方（落盘门禁 / 运行中探针 / --check）共用同一个过滤口径。"""
+
+    def test_keeps_host_and_subdomain_and_parent(self):
+        host = C.HOST
+        parent = host.split(".", 1)[1] if "." in host else host
+        ck = [_cookie(host), _cookie("." + host, name="a"),
+              _cookie(parent, name="b"), _cookie("other.example", name="c")]
+        names = [c["name"] for c in L.cookies_for_host(ck)]
+        self.assertIn("session", names)
+        self.assertIn("a", names)
+        self.assertIn("b", names)
+        self.assertNotIn("c", names)
+
+    def test_empty_and_none(self):
+        self.assertEqual(L.cookies_for_host([]), [])
+        self.assertEqual(L.cookies_for_host(None), [])
+
+    def test_domainless_cookie_kept(self):
+        """没写 domain 的按当前 host 处理（与 lms_fetch.opener 一致）。"""
+        self.assertEqual(len(L.cookies_for_host([{"name": "n", "value": "v"}])), 1)
+
+
+class CookieSigCase(unittest.TestCase):
+    """指纹只用来判「集合变没变」，绝不能因为顺序不同而误判成变化。"""
+
+    def test_order_independent(self):
+        a = [_cookie(name="x"), _cookie(name="y")]
+        b = [_cookie(name="y"), _cookie(name="x")]
+        self.assertEqual(L.cookie_sig(a), L.cookie_sig(b))
+
+    def test_value_change_detected(self):
+        a = [{"name": "s", "value": "1", "domain": C.HOST}]
+        b = [{"name": "s", "value": "2", "domain": C.HOST}]
+        self.assertNotEqual(L.cookie_sig(a), L.cookie_sig(b))
+
+    def test_new_cookie_detected(self):
+        a = [_cookie(name="x")]
+        b = [_cookie(name="x"), _cookie(name="session")]
+        self.assertNotEqual(L.cookie_sig(a), L.cookie_sig(b))
+
+    def test_empty(self):
+        self.assertEqual(L.cookie_sig([]), L.cookie_sig(None))
+
+
+class ShouldProbeCase(unittest.TestCase):
+    """探针频率控制 —— 写错了要么打爆接口，要么认证完成也发现不了。"""
+
+    CK = [_cookie()]
+
+    def test_no_cookies_never_probe(self):
+        self.assertFalse(L.should_probe([], None, 0.0, 100.0))
+
+    def test_too_soon_never_probe(self):
+        """★哪怕 cookie 已经变了：距上次不足 PROBE_MIN_GAP 也不许发。"""
+        sig = L.cookie_sig(self.CK)
+        self.assertFalse(L.should_probe(self.CK, "different", 100.0,
+                                        100.0 + L.PROBE_MIN_GAP / 2))
+
+    def test_sig_changed_after_gap_probes(self):
+        now = 100.0 + L.PROBE_MIN_GAP
+        self.assertTrue(L.should_probe(self.CK, "different", 100.0, now))
+
+    def test_unchanged_before_heartbeat_skips(self):
+        sig = L.cookie_sig(self.CK)
+        now = 100.0 + L.PROBE_HEARTBEAT / 2
+        if L.PROBE_HEARTBEAT / 2 < L.PROBE_MIN_GAP:
+            self.skipTest("心跳小于最小间隔，本用例无意义")
+        self.assertFalse(L.should_probe(self.CK, sig, 100.0, now))
+
+    def test_unchanged_after_heartbeat_probes(self):
+        sig = L.cookie_sig(self.CK)
+        self.assertTrue(L.should_probe(self.CK, sig, 100.0,
+                                       100.0 + L.PROBE_HEARTBEAT))
+
+
+class StateAgeCase(unittest.TestCase):
+    """「几天前创建」只是给用户的判断依据，不能因为格式异常就崩。"""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="age_")
+        self.path = os.path.join(self.tmp, "state_1.json")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _write(self, obj):
+        with open(self.path, "w", encoding="utf-8") as f:
+            json.dump(obj, f)
+
+    def test_tz_offset_format(self):
+        """★ 落盘用的是 %z（'+0800'），strptime 只读前 19 位，别被偏移噎住。"""
+        self._write({"created_at": "2026-10-20T10:00:00+0800"})
+        age = L.state_age_days(self.path)
+        self.assertIsNotNone(age)
+        self.assertGreater(age, 0)
+
+    def test_garbage_returns_none(self):
+        self._write({"created_at": "not a date"})
+        self.assertIsNone(L.state_age_days(self.path))
+
+    def test_missing_file_returns_none(self):
+        self.assertIsNone(L.state_age_days(os.path.join(self.tmp, "nope.json")))
+
+
+class ApiStatusOfCase(unittest.TestCase):
+    """探针的三态必须原样透传，不能把「无法判定」说成「已失效」。"""
+
+    def setUp(self):
+        self._real = L.F.api_status
+
+    def tearDown(self):
+        L.F.api_status = self._real
+
+    def _stub(self, status, why):
+        L.F.api_status = lambda op: (status, why)
+
+    def test_no_host_cookie_short_circuits_to_invalid(self):
+        status, _ = L.api_status_of([_cookie("other.example")])
+        self.assertEqual(status, L.F.API_INVALID)
+
+    def test_valid_passthrough(self):
+        self._stub(L.F.API_VALID, "ok")
+        self.assertEqual(L.api_status_of([_cookie()])[0], L.F.API_VALID)
+
+    def test_invalid_passthrough(self):
+        self._stub(L.F.API_INVALID, "过期")
+        self.assertEqual(L.api_status_of([_cookie()])[0], L.F.API_INVALID)
+
+    def test_unknown_passthrough(self):
+        self._stub(L.F.API_UNKNOWN, "网关拦页")
+        self.assertEqual(L.api_status_of([_cookie()])[0], L.F.API_UNKNOWN)
+
+    def test_nameless_cookie_is_invalid_not_a_crash(self):
+        """（{domain} 但没有 name 的）坏 cookie 没法发出去 —— opener 会跳过它，
+        于是请求等于匿名，服务端回登录页 → invalid。
+        「没有可发送的凭据」判成 invalid 是诚实的结论（该去重新登录了），
+        但**绝不能抛异常**把整个登录流程打断。
+        """
+        status, why = L.api_status_of([{"domain": C.HOST}])
+        self.assertEqual(status, L.F.API_INVALID)
+        self.assertIsInstance(why, str)
+
+
+class WritePayloadCase(unittest.TestCase):
+    """探针命中那条写盘路径 —— 与 save_state 必须一字不差。"""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="payload_")
+        self.path = os.path.join(self.tmp, "state_1.json")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_writes_same_shape_as_save_state(self):
+        L._write_payload(self.path, "9", [_cookie()])
+        with open(self.path, encoding="utf-8") as f:
+            st = json.load(f)
+        self.assertEqual(st["version"], 1)
+        self.assertEqual(st["course"], "9")
+        self.assertEqual(st["host"], C.HOST)
+        self.assertEqual(len(st["cookies"]), 1)
+        self.assertFalse(os.path.exists(self.path + ".tmp"))
+
+    def test_empty_refuses(self):
+        with self.assertRaises(L.StateNotSaved):
+            L._write_payload(self.path, "9", [])
+        self.assertFalse(os.path.exists(self.path))
+
+    @unittest.skipUnless(os.name == "posix", "Windows 靠 ACL，不测 POSIX mode")
+    def test_mode_0600(self):
+        L._write_payload(self.path, "9", [_cookie()])
+        self.assertEqual(stat.S_IMODE(os.stat(self.path).st_mode), 0o600)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
