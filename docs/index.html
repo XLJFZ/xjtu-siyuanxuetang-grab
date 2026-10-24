@@ -272,11 +272,12 @@ footer a { color: var(--fg-2); }
 
       <div class="sec">
         <h2>命令行用法</h2>
-        <p>登录只需做一次，之后反复跑都会自动跳过已下载的文件。</p>
+        <p>登录只需做一次。登录态还有效时不会再弹浏览器，只花一次接口探测的时间（3~5s）；失效才让你重新认证。</p>
 <pre><code>pip install playwright
 
 python scripts/lms_selfcheck.py --course &lt;课程ID&gt;
-python scripts/lms_login.py --course &lt;课程ID&gt;
+python scripts/lms_login.py --course &lt;课程ID&gt;        # 有效就不开浏览器
+python scripts/lms_login.py --course &lt;课程ID&gt; --check  # 只探测，绝不弹窗
 
 python scripts/lms_fetch.py --course &lt;课程ID&gt; --out "./课程资料" --dry-run
 python scripts/lms_fetch.py --course &lt;课程ID&gt; --out "./课程资料"</code></pre>
@@ -297,6 +298,23 @@ python scripts/lms_fetch.py --course &lt;课程ID&gt; --out "./课程资料"</co
           </div>
         </div>
         <p style="margin-top:18px">回放默认只下「屏幕录制」机位；加 <code>--all-cameras</code> 连教师机位一起下。</p>
+      </div>
+
+      <div class="sec">
+        <h2>作业说明也会存一份</h2>
+        <p>作业附件只是题目。「交什么、怎么交、什么时候截止」写在平台的活动详情里，不下载就看不到——所以每个作业 / 实验活动除附件外，再落一份 <code>说明.md</code>。</p>
+<pre><code># 【第4章】作业
+
+- 截止时间：2026-11-21 23:59
+- 状态：进行中
+- 分值占比：1.5%
+- 提交方式：文件上传
+- 来源：lms.xjtu.edu.cn · 课程 33590 · 活动 1595036
+
+## 作业说明
+课本题目：5.1、5.4、5.6、5.13
+本次作业涉及提交 E-R 图……</code></pre>
+        <p style="margin-top:18px">富文本按段落转成纯文本，不是把标签剥掉——否则「1. 不要纸质作业 2. md 命名……」会糊成一行。内容没变就不动文件，<code>--exclude</code> 对说明同样生效。</p>
       </div>
 
       <div class="sec">
@@ -327,7 +345,7 @@ python scripts/lms_fetch.py --course &lt;课程ID&gt; --out "./课程资料"</co
           </div>
           <div class="q">
             <b>登录态多久过期？</b>
-            <span>没有固定时限。下载前会自动探测，过期会明确提示重跑登录。</span>
+            <span>没有固定时限。登录命令会先用已落盘的凭据打一次接口：有效就直接跳过（3~5s，不开浏览器），失效才弹窗；下载前也会自动探测，并明确提示重跑登录。</span>
           </div>
           <div class="q">
             <b>能用于别的学校吗？</b>
@@ -355,6 +373,8 @@ python scripts/lms_fetch.py --course &lt;课程ID&gt; --out "./课程资料"</co
           <div class="feat"><b>串行请求</b><span>不并发，避免给平台造成额外压力</span></div>
           <div class="feat"><b>课件·作业·录像·回放</b><span>四类自动分流到各自目录</span></div>
           <div class="feat"><b>完整性校验</b><span>sha256 + 大小交叉验证，支持增量</span></div>
+          <div class="feat"><b>登录秒过</b><span>登录态有效时不开浏览器，3~5s 判定</span></div>
+          <div class="feat"><b>作业说明归档</b><span>截止时间、提交格式、平台原文存成 md</span></div>
         </div>
       </div>
 
@@ -406,7 +426,7 @@ python scripts/lms_fetch.py --course &lt;课程ID&gt; --out "./课程资料"</co
         <div class="paths">
           <div><span class="who">Skill 入口</span><code>SKILL.md —— 流程、边界、注意事项</code></div>
           <div><span class="who">脚本</span><code>scripts/ —— 自检 / 登录 / 下载 / 归类 / 回放</code></div>
-          <div><span class="who">离线测试</span><code>tests/ —— 417 个用例，不需要网络</code></div>
+          <div><span class="who">离线测试</span><code>tests/ —— 472 个用例，不需要网络</code></div>
           <div><span class="who">替代用法</span><code>prompt.md —— 贴进对话的通用 Prompt</code></div>
         </div>
         <p style="margin-top:18px">也可以用 Release 里的 zip 包，解压后同样是这个文件夹结构。</p>
